@@ -1,0 +1,112 @@
+import 'dart:async';
+import 'dart:io';
+
+import 'package:flutter_foreground_task/flutter_foreground_task.dart';
+
+import 'models.dart';
+
+/// 通知栏「全部取消」按钮 id
+const _kBtnCancel = 'cancel_all';
+
+@pragma('vm:entry-point')
+void _startCallback() {
+  FlutterForegroundTask.setTaskHandler(_TransferTaskHandler());
+}
+
+/// 任务 isolate: 只负责保活和转发通知按钮事件, 传输逻辑都在主 isolate
+class _TransferTaskHandler extends TaskHandler {
+  @override
+  Future<void> onStart(DateTime timestamp, TaskStarter starter) async {}
+
+  @override
+  void onRepeatEvent(DateTime timestamp) {}
+
+  @override
+  Future<void> onDestroy(DateTime timestamp, bool isTimeout) async {}
+
+  @override
+  void onNotificationButtonPressed(String id) {
+    if (id == _kBtnCancel) {
+      FlutterForegroundTask.sendDataToMain({'cancelAll': true});
+    }
+  }
+}
+
+/// Android 前台服务: 传输期间保持进程存活, 持久通知显示总进度, 可一键取消
+class TransferForegroundService {
+  static bool _initialized = false;
+  static bool _running = false;
+  static int _lastUpdate = 0;
+
+  /// 主 isolate 收到通知栏「全部取消」时的回调 (由 RelayClient 注册)
+  static void Function()? onCancelAll;
+
+  static void init() {
+    if (!Platform.isAndroid || _initialized) return;
+    _initialized = true;
+    FlutterForegroundTask.init(
+      androidNotificationOptions: AndroidNotificationOptions(
+        channelId: 'transfer_service',
+        channelName: '文件传输',
+        channelDescription: '文件传输期间保持应用存活',
+        onlyAlertOnce: true,
+        channelImportance: NotificationChannelImportance.LOW,
+        priority: NotificationPriority.LOW,
+      ),
+      iosNotificationOptions: const IOSNotificationOptions(),
+      foregroundTaskOptions: ForegroundTaskOptions(
+        eventAction: ForegroundTaskEventAction.nothing(),
+        allowWakeLock: true,
+        allowWifiLock: true,
+      ),
+    );
+    FlutterForegroundTask.addTaskDataCallback((data) {
+      if (data is Map && data['cancelAll'] == true) onCancelAll?.call();
+    });
+  }
+
+  /// 根据进行中的传输同步服务状态 (启动 / 更新进度 / 停止)
+  static Future<void> sync(List<FileTransfer> active) async {
+    if (!Platform.isAndroid || !_initialized) return;
+    try {
+      if (active.isEmpty) {
+        if (_running) {
+          _running = false;
+          await FlutterForegroundTask.stopService();
+        }
+        return;
+      }
+      final total = active.fold<int>(0, (a, t) => a + t.fileSize);
+      final done = active.fold<int>(0, (a, t) => a + t.bytesDone);
+      final pct = total > 0 ? done * 100 ~/ total : 0;
+      final text = active.length == 1
+          ? '${active.first.fileName} $pct%'
+          : '${active.length} 个文件 $pct%';
+      if (!_running) {
+        _running = true;
+        _lastUpdate = DateTime.now().millisecondsSinceEpoch;
+        await FlutterForegroundTask.startService(
+          serviceId: 256,
+          notificationTitle: 'cloudSend 正在传输',
+          notificationText: text,
+          notificationButtons: const [
+            NotificationButton(id: _kBtnCancel, text: '全部取消'),
+          ],
+          callback: _startCallback,
+        );
+      } else {
+        // 节流: 500ms 最多更新一次通知
+        final now = DateTime.now().millisecondsSinceEpoch;
+        if (now - _lastUpdate < 500) return;
+        _lastUpdate = now;
+        await FlutterForegroundTask.updateService(
+          notificationTitle: 'cloudSend 正在传输',
+          notificationText: text,
+          notificationButtons: const [
+            NotificationButton(id: _kBtnCancel, text: '全部取消'),
+          ],
+        );
+      }
+    } catch (_) {}
+  }
+}
