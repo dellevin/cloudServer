@@ -30,6 +30,8 @@ flutter build apk --release
 
 打开应用 → 设置 → 填中继服务器地址(如 `1.2.3.4:8787`)→ 连接。填入相同服务器地址的设备会互相发现,可聊天、互发文件。
 
+> Windows 构建说明:首次构建时 media_kit 会从 GitHub releases 下载 libmpv/ANGLE 预编译包,需能访问 GitHub;若下载被截断导致构建失败(MSB3073),手动下载 `mpv-dev-x86_64-20230924-git-652a1dd.7z` 放到 `build/windows/x64/` 后重新构建即可。
+
 ## 协议(WebSocket)
 
 - 文本帧 JSON:`register` / `peers` / `chat` / `chat_ack` / `file_offer` / `file_accept` / `file_reject` / `file_done` / `file_progress` / `file_result` / `file_cancel`
@@ -40,8 +42,18 @@ flutter build apk --release
 - **断点续传**:接收端先写 `<文件名>.part` 临时文件;`file_accept` 携带 `offset`,发送端从偏移处续传,中断后点"续传/重发"即可接着传
 - **完整性校验**:发送端边发边算 SHA-256,`file_done` 携带哈希;接收端校验通过才把 `.part` 改名为正式文件,并回 `file_result`
 - **取消**:任意一方可随时取消(`file_cancel`),半成品自动清理
+- **掉线中止**:传输中对端掉线即判失败——发送侧中断发送循环(可重发),接收侧保留 `.part`(可续传);已发完但未收到校验结果的(小文件)在 30 秒窗口期内对端掉线同样改判失败,防止误判完成
 - **背压**:接收端每收 2MB 回执 `file_progress`,发送端未确认字节超过 8MB 即暂停等待,防止缓冲爆炸
 - **服务端**:传输路由记录 (发送方, 接收方, 时间),任一端掉线即清理,超时路由每 5 分钟自动清扫
+
+## 文件预览
+
+点击传输记录打开文件:
+
+- **文本 / 图片 / 视频 / zip** 走应用内预览
+  - 视频播放基于 media_kit(Windows / Android),支持播放/暂停、进度拖拽
+  - zip 可查看内容列表,支持解压单个文件或全部解压到下载目录(重名自动追加 `(1)` `(2)`…)
+- 其他类型(音频 / 文档等)调系统默认程序打开
 
 ## 数据位置
 

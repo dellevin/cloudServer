@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
+import 'package:media_kit/media_kit.dart';
 import 'package:provider/provider.dart';
 import 'package:window_manager/window_manager.dart';
 
@@ -14,9 +15,12 @@ import 'ui/devices_page.dart';
 import 'ui/file_preview_page.dart';
 import 'ui/settings_page.dart';
 import 'ui/transfers_page.dart';
+import 'ui/video_player_page.dart';
+import 'ui/zip_preview_page.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  MediaKit.ensureInitialized(); // 视频播放器 (media_kit)
   // Android 前台服务通信端口 (必须在 runApp 前初始化)
   if (Platform.isAndroid) {
     FlutterForegroundTask.initCommunicationPort();
@@ -433,6 +437,8 @@ class _CloudSendAppState extends State<CloudSendApp> {
         '/file_preview': (_) => const FilePreviewPage(),
         '/transfers': (_) => const TransfersPage(),
         '/image_view': (_) => const ImageViewPage(),
+        '/video_view': (_) => const VideoPlayerPage(),
+        '/zip_view': (_) => const ZipPreviewPage(),
       },
     );
   }

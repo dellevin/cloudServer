@@ -53,10 +53,14 @@ String _ext(String name) {
 const imageExts = {'jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'};
 const videoExts = {'mp4', 'mkv', 'avi', 'mov', 'flv', 'webm', 'm4v', '3gp'};
 
+/// 可应用内预览的压缩包扩展名
+const archiveExts = {'zip'};
+
 bool isImageFile(String name) => imageExts.contains(_ext(name));
 bool isVideoFile(String name) => videoExts.contains(_ext(name));
+bool isArchiveFile(String name) => archiveExts.contains(_ext(name));
 
-/// 点击传输记录: 文本/图片走应用内预览, 其他(视频/音频/文档)交给系统默认程序
+/// 点击传输记录: 文本/图片/视频/压缩包走应用内预览, 其他(音频/文档)交给系统默认程序
 Future<void> openTransfer(BuildContext context, FileTransfer t) async {
   final path = t.savePath;
   if (path == null || !File(path).existsSync()) {
@@ -71,6 +75,14 @@ Future<void> openTransfer(BuildContext context, FileTransfer t) async {
   }
   if (isImageFile(t.fileName)) {
     Navigator.pushNamed(context, '/image_view', arguments: path);
+    return;
+  }
+  if (isVideoFile(t.fileName)) {
+    Navigator.pushNamed(context, '/video_view', arguments: path);
+    return;
+  }
+  if (isArchiveFile(t.fileName)) {
+    Navigator.pushNamed(context, '/zip_view', arguments: path);
     return;
   }
   final r = await OpenFilex.open(path);

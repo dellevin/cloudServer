@@ -3,11 +3,11 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:app_badge_plus/app_badge_plus.dart';
 import 'package:archive/archive_io.dart';
 import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart';
-import 'package:flutter_app_badger/flutter_app_badger.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:image/image.dart' as img;
 import 'package:path_provider/path_provider.dart';
@@ -82,11 +82,7 @@ class RelayClient extends ChangeNotifier {
     if (!Platform.isAndroid) return;
     try {
       final total = unread.values.fold<int>(0, (a, b) => a + b);
-      if (total > 0) {
-        FlutterAppBadger.updateBadgeCount(total);
-      } else {
-        FlutterAppBadger.removeBadge();
-      }
+      AppBadgePlus.updateBadge(total);
     } catch (_) {}
   }
 
@@ -113,6 +109,8 @@ class RelayClient extends ChangeNotifier {
   final Map<String, int> _sendAcked = {}; // 发送侧: 对方已确认收到的字节数
   final Map<String, Completer<void>> _sendWaiters = {}; // 背压等待
   final Set<String> _canceled = {}; // 已取消的 transferId (发送循环据此退出)
+  final Set<String> _aborted = {}; // 对端掉线中止的 transferId
+  final Set<String> _unverified = {}; // 已发完但尚未收到接收端校验结果的 transferId
   int _lastNotifyBytes = 0;
 
   Future<void> init() async {
@@ -382,6 +380,7 @@ class RelayClient extends ChangeNotifier {
           }
           peers = next;
           _resendUndelivered();
+          _abortTransfersWithOfflinePeers();
           break;
         case 'chat':
           final from = m['from'] as String;
@@ -504,6 +503,7 @@ class RelayClient extends ChangeNotifier {
         case 'file_result':
           // 接收端校验结果: 失败则把"发送完成"改判为失败
           final t = _find(m['transferId']);
+          _unverified.remove(m['transferId']);
           if (t != null && t.outgoing) {
             final ok = m['ok'] == true;
             if (!ok &&
@@ -567,6 +567,39 @@ class RelayClient extends ChangeNotifier {
       if (t.transferId == tid) return t;
     }
     return null;
+  }
+
+  /// 对端掉线时中止进行中的传输:
+  /// 发送侧唤醒发送循环标记失败 (可重发), 接收侧标记失败并保留 .part (可续传);
+  /// 已发完但未收到校验结果的 (小文件) 同样改判失败
+  void _abortTransfersWithOfflinePeers() {
+    var changed = false;
+    for (final t in transfers) {
+      if (isOnline(t.peerId)) continue;
+      final busy =
+          t.status == TransferStatus.transferring ||
+          t.status == TransferStatus.accepted;
+      if (busy) {
+        if (t.outgoing) {
+          // 发送循环检测到 _aborted 后自行退出并标记失败
+          _aborted.add(t.transferId);
+          final w = _sendWaiters.remove(t.transferId);
+          if (w != null && !w.isCompleted) w.complete();
+        } else {
+          _closeIncoming(t.transferId, deletePart: false);
+          t.status = TransferStatus.failed;
+          ChatDb.upsertTransfer(t);
+        }
+        changed = true;
+      } else if (t.outgoing &&
+          t.status == TransferStatus.done &&
+          _unverified.remove(t.transferId)) {
+        t.status = TransferStatus.failed;
+        ChatDb.upsertTransfer(t);
+        changed = true;
+      }
+    }
+    if (changed) notifyListeners();
   }
 
   // ---------- 聊天 ----------
@@ -879,6 +912,7 @@ class RelayClient extends ChangeNotifier {
   Future<void> _startSend(FileTransfer t, int offset) async {
     final tid = t.transferId;
     _canceled.remove(tid);
+    _aborted.remove(tid);
     t.status = TransferStatus.transferring;
     t.bytesDone = offset;
     _sendAcked[tid] = offset;
@@ -901,7 +935,9 @@ class RelayClient extends ChangeNotifier {
       while (true) {
         while (t.bytesDone - (_sendAcked[tid] ?? 0) >= window) {
           // 窗口满: 等接收端 file_progress 回执
-          if (_canceled.contains(tid) || !connected) {
+          if (_canceled.contains(tid) ||
+              _aborted.contains(tid) ||
+              !connected) {
             throw StateError('aborted');
           }
           final before = _sendAcked[tid] ?? 0;
@@ -920,7 +956,11 @@ class RelayClient extends ChangeNotifier {
             _sendWaiters.remove(tid);
           }
         }
-        if (_canceled.contains(tid) || !connected) throw StateError('aborted');
+        if (_canceled.contains(tid) ||
+            _aborted.contains(tid) ||
+            !connected) {
+          throw StateError('aborted');
+        }
         final chunk = await raf.read(chunkSize);
         if (chunk.isEmpty) break;
         hash.input.add(chunk);
@@ -944,6 +984,9 @@ class RelayClient extends ChangeNotifier {
         'sha256': hash.hex,
         'size': t.bytesDone,
       });
+      // 等待接收端校验结果的窗口期: 期间对端掉线要改判失败 (防小文件误判完成)
+      _unverified.add(tid);
+      Timer(const Duration(seconds: 30), () => _unverified.remove(tid));
       _cleanupTemp(t);
     } catch (_) {
       t.status = _canceled.contains(tid)
@@ -952,6 +995,7 @@ class RelayClient extends ChangeNotifier {
       if (t.status == TransferStatus.canceled) _cleanupTemp(t);
     } finally {
       await raf?.close();
+      _aborted.remove(tid);
       _sendAcked.remove(tid);
       final w = _sendWaiters.remove(tid);
       if (w != null && !w.isCompleted) w.complete();
