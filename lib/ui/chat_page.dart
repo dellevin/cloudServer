@@ -11,11 +11,15 @@ import 'package:provider/provider.dart';
 import 'package:flutter_slidable/flutter_slidable.dart';
 import 'package:scrollable_positioned_list/scrollable_positioned_list.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:wechat_assets_picker/wechat_assets_picker.dart';
 
 import '../client.dart';
 import '../db.dart';
+import '../l10n.dart';
 import '../main.dart';
 import '../models.dart';
+import 'action_dialog.dart';
+import 'app_toast.dart';
 import 'file_preview_page.dart';
 import 'slidable_close.dart';
 import 'video_thumbs.dart';
@@ -26,226 +30,202 @@ Rect _rectOf(BuildContext ctx) {
   return box.localToGlobal(Offset.zero) & box.size;
 }
 
-/// 聊天标签页: 显示有会话记录的对端列表
+/// 聊天标签页: 显示有会话记录的对端列表 (微信风格通栏列表)
 class ChatsTabPage extends StatelessWidget {
   const ChatsTabPage({super.key});
 
   /// 会话最后一条预览: 文件消息显示 [图片]/[视频]/[文件] 样式
   static String _lastPreview(
-    RelayClient c,
     String peerId,
     List<ChatMessage> msgs,
+    FileTransfer? lastFile,
   ) {
     final lastMsgTs = msgs.isNotEmpty ? msgs.last.ts : 0;
-    FileTransfer? lastFile;
-    for (final t in c.transfers) {
-      if (t.peerId == peerId && (lastFile == null || t.ts > lastFile.ts)) {
-        lastFile = t;
-      }
-    }
     if (lastFile != null && lastFile.ts > lastMsgTs) {
       final name = lastFile.fileName;
-      if (isImageFile(name)) return '[图片]';
-      if (isVideoFile(name)) return '[视频]';
-      return '[文件] $name';
+      if (isImageFile(name)) return tr('img_tag');
+      if (isVideoFile(name)) return tr('video_tag');
+      return trf('file_tag', {'name': name});
     }
     return msgs.isNotEmpty ? msgs.last.text : '';
+  }
+
+  /// 各对端的最后一条文件传输 (每帧只扫一次 transfers,
+  /// 代替每行都全表扫的 O(会话数×传输数))
+  static Map<String, FileTransfer> _lastFileByPeer(RelayClient c) {
+    final map = <String, FileTransfer>{};
+    for (final t in c.transfers) {
+      if (t.ephemeral) continue; // 预览临时传输不进会话列表
+      final cur = map[t.peerId];
+      if (cur == null || t.ts > cur.ts) map[t.peerId] = t;
+    }
+    return map;
+  }
+
+  /// 各会话最后活动时间 (消息与文件取最新), 列表按此降序排列
+  static Map<String, int> _lastTsMap(RelayClient c) {
+    final map = <String, int>{
+      for (final e in c.chats.entries)
+        e.key: e.value.isNotEmpty ? e.value.last.ts : 0,
+    };
+    for (final t in c.transfers) {
+      if (t.ephemeral) continue;
+      final cur = map[t.peerId];
+      if (cur != null && t.ts > cur) map[t.peerId] = t.ts;
+    }
+    return map;
+  }
+
+  /// 微信风格时间: 今天 HH:mm / 昨天 / 一周内显示星期 / 今年 M月d日 / 更早全日期
+  static String _listTime(int ts) {
+    if (ts == 0) return '';
+    final d = DateTime.fromMillisecondsSinceEpoch(ts);
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    final day = DateTime(d.year, d.month, d.day);
+    final hm =
+        '${d.hour.toString().padLeft(2, '0')}:${d.minute.toString().padLeft(2, '0')}';
+    if (day == today) return hm;
+    if (day == today.subtract(const Duration(days: 1))) return tr('yesterday');
+    if (today.difference(day).inDays < 7) return tr('wk_${d.weekday}');
+    if (day.year == now.year) {
+      return trf('date_md', {'m': d.month, 'd': d.day});
+    }
+    return trf('date_ymd', {'y': d.year, 'm': d.month, 'd': d.day});
   }
 
   @override
   Widget build(BuildContext context) {
     final c = context.watch<RelayClient>();
-    final ids = c.chats.keys.toList();
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        const SizedBox(height: 8),
-        Expanded(
-          // 下拉刷新: 刷新会话对端在线状态 + 补发未送达消息
-          child: RefreshIndicator(
-            color: AppTheme.green,
-            onRefresh: () => c.refreshPeers(),
-            child: ids.isEmpty
-                // 空态用可滚动容器包一层, 否则无法下拉
-                ? ListView(
-                    physics: const AlwaysScrollableScrollPhysics(),
-                    children: [
-                      SizedBox(
-                        height: MediaQuery.of(context).size.height * 0.25,
-                      ),
-                      const _Empty(icon: Icons.forum_outlined, text: '暂无会话'),
-                    ],
-                  )
-                : SlidableCloseOnOutsideTap(
-                    child: ListView.builder(
-                      // 列表不足一屏时也能下拉
-                      physics: const AlwaysScrollableScrollPhysics(),
-                      padding: const EdgeInsets.symmetric(horizontal: 16),
-                      itemCount: ids.length,
-                      itemBuilder: (_, i) {
-                        final id = ids[i];
-                        final msgs = c.chats[id]!;
-                        final last = _lastPreview(c, id, msgs);
-                        final n = c.unread[id] ?? 0;
-                        final name = c.peerName(id);
-                        final online = c.isOnline(id);
-                        // 左滑露出删除按钮, 点击按钮再弹选项
-                        return Slidable(
-                          key: Key('conv_$id'),
-                          endActionPane: ActionPane(
-                            motion: const DrawerMotion(),
-                            extentRatio: 0.27,
-                            children: [
-                              CustomSlidableAction(
-                                onPressed: (_) => _confirmDeleteConversation(
-                                  context,
-                                  c,
-                                  id,
-                                  name,
+    final lastTs = _lastTsMap(c);
+    final lastFiles = _lastFileByPeer(c);
+    final ids = lastTs.keys.toList()
+      ..sort((a, b) => lastTs[b]!.compareTo(lastTs[a]!));
+    return RefreshIndicator(
+      color: AppTheme.green,
+      onRefresh: () => c.refreshPeers(),
+      child: ids.isEmpty
+          // 空态用可滚动容器包一层, 否则无法下拉
+          ? ListView(
+              physics: const AlwaysScrollableScrollPhysics(),
+              children: [
+                SizedBox(height: MediaQuery.of(context).size.height * 0.25),
+                _Empty(icon: Icons.forum_outlined, text: tr('no_chats')),
+              ],
+            )
+          : SlidableCloseOnOutsideTap(
+              child: Material(
+                color: AppTheme.cardOf(context),
+                child: ListView.separated(
+                  // 列表不足一屏时也能下拉
+                  physics: const AlwaysScrollableScrollPhysics(),
+                  itemCount: ids.length,
+                  // 分隔线从名字左缘开始 (16 边距 + 48 头像 + 12 间距)
+                  separatorBuilder: (_, _) => Divider(
+                    height: 1,
+                    indent: 76,
+                    color: AppTheme.lineOf(context),
+                  ),
+                  itemBuilder: (_, i) {
+                    final id = ids[i];
+                    final msgs = c.chats[id]!;
+                    final last = _lastPreview(id, msgs, lastFiles[id]);
+                    final n = c.unread[id] ?? 0;
+                    final name = c.peerName(id);
+                    // 左滑露出通高红色删除按钮, 点击按钮再弹选项
+                    return Slidable(
+                      key: Key('conv_$id'),
+                      endActionPane: ActionPane(
+                        motion: const DrawerMotion(),
+                        extentRatio: 0.22,
+                        children: [
+                          CustomSlidableAction(
+                            onPressed: (_) => _confirmDeleteConversation(
+                              context,
+                              c,
+                              id,
+                              name,
+                            ),
+                            backgroundColor: AppTheme.red,
+                            padding: EdgeInsets.zero,
+                            child: Center(
+                              child: Text(
+                                tr('delete'),
+                                style: const TextStyle(
+                                  fontSize: 14,
+                                  color: Colors.white,
                                 ),
-                                backgroundColor: Colors.transparent,
-                                padding: EdgeInsets.zero,
-                                child: Container(
-                                  margin: const EdgeInsets.symmetric(
-                                    vertical: 5,
-                                    horizontal: 3,
-                                  ),
-                                  decoration: BoxDecoration(
-                                    color: AppTheme.red,
-                                    borderRadius: BorderRadius.circular(6),
-                                  ),
-                                  alignment: Alignment.center,
-                                  child: const Column(
-                                    mainAxisSize: MainAxisSize.min,
-                                    children: [
-                                      Icon(
-                                        Icons.delete_outline,
-                                        size: 22,
-                                        color: Colors.white,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                      child: InkWell(
+                        onTap: () => Navigator.pushNamed(
+                          context,
+                          '/chat',
+                          arguments: id,
+                        ),
+                        child: Padding(
+                          padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+                          child: Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              _ConversationAvatar(
+                                client: c,
+                                peerId: id,
+                                name: name,
+                                unread: n,
+                              ),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    const SizedBox(height: 1),
+                                    Text(
+                                      name,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: TextStyle(
+                                        fontSize: 16,
+                                        fontWeight: FontWeight.w500,
+                                        color: AppTheme.inkOf(context),
                                       ),
-                                      SizedBox(height: 3),
-                                      Text(
-                                        '删除',
-                                        style: TextStyle(
-                                          fontSize: 12,
-                                          color: Colors.white,
-                                        ),
+                                    ),
+                                    const SizedBox(height: 4),
+                                    Text(
+                                      last,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(
+                                        fontSize: 14,
+                                        color: AppTheme.grey,
                                       ),
-                                    ],
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              const SizedBox(width: 10),
+                              Padding(
+                                padding: const EdgeInsets.only(top: 3),
+                                child: Text(
+                                  _listTime(lastTs[id]!),
+                                  style: const TextStyle(
+                                    fontSize: 11,
+                                    color: AppTheme.grey,
                                   ),
                                 ),
                               ),
                             ],
                           ),
-                          child: Container(
-                            margin: const EdgeInsets.symmetric(vertical: 4),
-                            decoration: BoxDecoration(
-                              border: Border.all(
-                                color: AppTheme.lineOf(context),
-                              ),
-                              borderRadius: BorderRadius.circular(6),
-                            ),
-                            child: ListTile(
-                              contentPadding: const EdgeInsets.symmetric(
-                                horizontal: 14,
-                                vertical: 2,
-                              ),
-                              shape: RoundedRectangleBorder(
-                                borderRadius: BorderRadius.circular(6),
-                              ),
-                              leading: Builder(
-                                builder: (_) {
-                                  final bytes = c.peerAvatarBytes(id);
-                                  final p = bytes != null
-                                      ? MemoryImage(bytes)
-                                      : null;
-                                  return Container(
-                                    width: 36,
-                                    height: 36,
-                                    alignment: Alignment.center,
-                                    decoration: BoxDecoration(
-                                      color: online
-                                          ? AppTheme.green
-                                          : AppTheme.softOf(context),
-                                      borderRadius: BorderRadius.circular(6),
-                                      border: online
-                                          ? null
-                                          : Border.all(
-                                              color: AppTheme.lineOf(context),
-                                            ),
-                                      image: p != null
-                                          ? DecorationImage(
-                                              image: p,
-                                              fit: BoxFit.cover,
-                                            )
-                                          : null,
-                                    ),
-                                    child: p != null
-                                        ? null
-                                        : Text(
-                                            name.isNotEmpty
-                                                ? name[0].toUpperCase()
-                                                : '?',
-                                            style: TextStyle(
-                                              color: online
-                                                  ? Colors.white
-                                                  : AppTheme.grey,
-                                              fontWeight: FontWeight.w600,
-                                              fontSize: 14,
-                                            ),
-                                          ),
-                                  );
-                                },
-                              ),
-                              title: Text(
-                                name,
-                                style: const TextStyle(
-                                  fontWeight: FontWeight.w600,
-                                  fontSize: 14,
-                                ),
-                              ),
-                              subtitle: Text(
-                                last,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(
-                                  fontSize: 12,
-                                  color: AppTheme.grey,
-                                ),
-                              ),
-                              trailing: n > 0
-                                  ? Container(
-                                      padding: const EdgeInsets.symmetric(
-                                        horizontal: 7,
-                                        vertical: 2,
-                                      ),
-                                      decoration: BoxDecoration(
-                                        color: AppTheme.red,
-                                        borderRadius: BorderRadius.circular(10),
-                                      ),
-                                      child: Text(
-                                        '$n',
-                                        style: const TextStyle(
-                                          color: Colors.white,
-                                          fontSize: 11,
-                                        ),
-                                      ),
-                                    )
-                                  : null,
-                              onTap: () => Navigator.pushNamed(
-                                context,
-                                '/chat',
-                                arguments: id,
-                              ),
-                            ),
-                          ),
-                        );
-                      },
-                    ),
-                  ),
-          ),
-        ),
-      ],
+                        ),
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ),
     );
   }
 
@@ -255,51 +235,88 @@ class ChatsTabPage extends StatelessWidget {
     String peerId,
     String name,
   ) async {
-    final choice = await showDialog<String>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: AppTheme.cardOf(context),
-        surfaceTintColor: Colors.transparent,
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(8),
-          side: BorderSide(color: AppTheme.lineOf(context)),
-        ),
-        title: const Text(
-          '删除会话',
-          style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
-        ),
-        content: Text(
-          '如何处理与 $name 的会话?',
-          style: const TextStyle(fontSize: 13, color: AppTheme.grey),
-        ),
-        actionsPadding: const EdgeInsets.fromLTRB(14, 0, 14, 12),
-        actions: [
-          OutlinedButton(
-            style: OutlinedButton.styleFrom(
-              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-            ),
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('取消'),
-          ),
-          OutlinedButton(
-            style: OutlinedButton.styleFrom(
-              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-            ),
-            onPressed: () => Navigator.pop(ctx, 'hide'),
-            child: const Text('仅移除会话'),
-          ),
-          FilledButton(
-            style: FilledButton.styleFrom(
-              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-            ),
-            onPressed: () => Navigator.pop(ctx, 'delete'),
-            child: const Text('删除全部记录'),
-          ),
-        ],
-      ),
+    final choice = await showActionDialog<String>(
+      context,
+      title: tr('del_conv_title'),
+      message: trf('del_conv_message', {'name': name}),
+      actions: [
+        (label: tr('del_conv_hide'), value: 'hide', danger: false),
+        (label: tr('del_conv_all'), value: 'delete', danger: true),
+      ],
     );
     if (choice == 'hide') c.hideConversation(peerId);
     if (choice == 'delete') await c.deleteConversation(peerId);
+  }
+}
+
+/// 会话列表头像: 48px 圆角方形, 未读数红色角标在右上角 (微信样式)
+class _ConversationAvatar extends StatelessWidget {
+  final RelayClient client;
+  final String peerId;
+  final String name;
+  final int unread;
+  const _ConversationAvatar({
+    required this.client,
+    required this.peerId,
+    required this.name,
+    required this.unread,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final bytes = client.peerAvatarBytes(peerId);
+    final avatar = Container(
+      width: 48,
+      height: 48,
+      alignment: Alignment.center,
+      decoration: BoxDecoration(
+        color: const Color(0xFF576B95),
+        borderRadius: BorderRadius.circular(4),
+        image: bytes != null
+            ? DecorationImage(image: MemoryImage(bytes), fit: BoxFit.cover)
+            : null,
+      ),
+      child: bytes != null
+          ? null
+          : Text(
+              name.isNotEmpty ? name[0].toUpperCase() : '?',
+              style: const TextStyle(
+                color: Colors.white,
+                fontWeight: FontWeight.w600,
+                fontSize: 19,
+              ),
+            ),
+    );
+    if (unread <= 0) return avatar;
+    return Stack(
+      clipBehavior: Clip.none,
+      children: [
+        avatar,
+        Positioned(
+          top: -5,
+          right: -8,
+          child: Container(
+            constraints: const BoxConstraints(minWidth: 17),
+            height: 17,
+            padding: const EdgeInsets.symmetric(horizontal: 4.5),
+            decoration: BoxDecoration(
+              color: AppTheme.red,
+              borderRadius: BorderRadius.circular(8.5),
+            ),
+            alignment: Alignment.center,
+            child: Text(
+              unread > 99 ? '99+' : '$unread',
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 10,
+                fontWeight: FontWeight.w600,
+                height: 1,
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
   }
 }
 
@@ -455,7 +472,7 @@ class _ChatPageState extends State<ChatPage> {
     final msgs = c.chats[peerId] ?? <ChatMessage>[];
     if (msgs.isNotEmpty) ts = msgs.last.ts;
     for (final t in c.transfers) {
-      if (t.peerId == peerId && t.ts > ts) ts = t.ts;
+      if (!t.ephemeral && t.peerId == peerId && t.ts > ts) ts = t.ts;
     }
     return ts;
   }
@@ -471,7 +488,7 @@ class _ChatPageState extends State<ChatPage> {
       boundary = msgs.first.ts;
     }
     return c.transfers
-        .where((t) => t.peerId == peerId && t.ts >= boundary)
+        .where((t) => !t.ephemeral && t.peerId == peerId && t.ts >= boundary)
         .toList();
   }
 
@@ -544,7 +561,7 @@ class _ChatPageState extends State<ChatPage> {
               style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
             ),
             Text(
-              online ? '在线' : '离线',
+              online ? tr('online') : tr('offline'),
               style: TextStyle(
                 fontSize: 11,
                 color: online ? AppTheme.inkOf(context) : AppTheme.grey,
@@ -553,8 +570,20 @@ class _ChatPageState extends State<ChatPage> {
           ],
         ),
         actions: [
+          // 远程文件浏览: Android (共享存储) 和 Windows (磁盘分区) 支持
+          if (c.peers.any(
+            (p) =>
+                p.id == peerId &&
+                (p.platform == 'android' || p.platform == 'windows'),
+          ))
+            IconButton(
+              tooltip: tr('fs_title_short'),
+              icon: const Icon(Icons.folder_open, size: 20),
+              onPressed: () =>
+                  Navigator.pushNamed(context, '/remote_fs', arguments: peerId),
+            ),
           IconButton(
-            tooltip: '搜索',
+            tooltip: tr('search'),
             icon: const Icon(Icons.search, size: 20),
             onPressed: () =>
                 Navigator.pushNamed(context, '/chat_search', arguments: peerId),
@@ -584,10 +613,9 @@ class _ChatPageState extends State<ChatPage> {
           if (await c.sendFile(peerId!, f.path)) sent++;
         }
         if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text(sent > 0 ? '已发送 $sent 个文件请求' : '对方不在线, 无法发送文件'),
-            ),
+          AppToast.show(
+            context,
+            sent > 0 ? trf('sent_files', {'n': sent}) : tr('offline_files'),
           );
         }
       },
@@ -606,19 +634,19 @@ class _ChatPageState extends State<ChatPage> {
                     borderRadius: BorderRadius.circular(10),
                     border: Border.all(color: AppTheme.green, width: 2),
                   ),
-                  child: const Center(
+                  child: Center(
                     child: Column(
                       mainAxisSize: MainAxisSize.min,
                       children: [
-                        Icon(
+                        const Icon(
                           Icons.file_upload_outlined,
                           size: 40,
                           color: AppTheme.green,
                         ),
-                        SizedBox(height: 8),
+                        const SizedBox(height: 8),
                         Text(
-                          '松开鼠标发送文件',
-                          style: TextStyle(
+                          tr('drop_to_send'),
+                          style: const TextStyle(
                             fontSize: 14,
                             fontWeight: FontWeight.w600,
                             color: AppTheme.green,
@@ -670,7 +698,7 @@ class _ChatPageState extends State<ChatPage> {
                   msgs.isEmpty && transfers.isEmpty
                       ? Center(
                           child: Text(
-                            '开始和 $name 聊天吧',
+                            trf('say_hello', {'name': name}),
                             style: const TextStyle(
                               color: AppTheme.grey,
                               fontSize: 13,
@@ -815,9 +843,9 @@ class _ChatPageState extends State<ChatPage> {
                                           setState(() => _showPanel = false);
                                         }
                                       },
-                                      decoration: const InputDecoration(
-                                        hintText: '输入消息…',
-                                        hintStyle: TextStyle(
+                                      decoration: InputDecoration(
+                                        hintText: tr('input_hint'),
+                                        hintStyle: const TextStyle(
                                           color: AppTheme.grey,
                                           fontSize: 15,
                                         ),
@@ -872,9 +900,9 @@ class _ChatPageState extends State<ChatPage> {
                                       color: const Color(0xFF07C160),
                                       borderRadius: BorderRadius.circular(8),
                                     ),
-                                    child: const Text(
-                                      '发送',
-                                      style: TextStyle(
+                                    child: Text(
+                                      tr('send'),
+                                      style: const TextStyle(
                                         color: Colors.white,
                                         fontSize: 14,
                                         fontWeight: FontWeight.w600,
@@ -890,15 +918,31 @@ class _ChatPageState extends State<ChatPage> {
                           width: double.infinity,
                           padding: const EdgeInsets.symmetric(vertical: 14),
                           alignment: Alignment.center,
-                          child: const Text(
-                            '对方不在线,无法发送消息',
-                            style: TextStyle(
+                          child: Text(
+                            tr('offline_cant_send'),
+                            style: const TextStyle(
                               fontSize: 13,
                               color: AppTheme.grey,
                             ),
                           ),
                         ),
-                  if (_showPanel) _buildPanel(),
+                  // + 号面板: 展开/收起带高度+淡入动画
+                  AnimatedSwitcher(
+                    duration: const Duration(milliseconds: 180),
+                    switchInCurve: Curves.easeOut,
+                    switchOutCurve: Curves.easeIn,
+                    transitionBuilder: (child, anim) => SizeTransition(
+                      sizeFactor: anim,
+                      axisAlignment: -1,
+                      child: FadeTransition(opacity: anim, child: child),
+                    ),
+                    child: _showPanel
+                        ? KeyedSubtree(
+                            key: const ValueKey('panel'),
+                            child: _buildPanel(),
+                          )
+                        : const SizedBox.shrink(),
+                  ),
                 ],
               ),
             ),
@@ -911,34 +955,30 @@ class _ChatPageState extends State<ChatPage> {
   /// 微信风格 + 号面板: 相册 / 拍照 / 拍视频 / 文件 / 文件夹
   Widget _buildPanel() {
     final picker = ImagePicker();
+    // 开启压缩时先让选择器预缩到 2048 (Luban 再压更快); 关闭时拿真原图
+    final maxW = context.read<RelayClient>().compressImages ? 2048.0 : null;
     final items = <(IconData, String, VoidCallback)>[
-      (
-        Icons.photo_outlined,
-        '相册',
-        () => _sendMediaMulti(
-          () => picker.pickMultipleMedia(maxWidth: 2048),
-          '媒体',
-        ),
-      ),
+      (Icons.photo_outlined, tr('album'), _pickFromAlbum),
       (
         Icons.camera_alt_outlined,
-        '拍照',
+        tr('take_photo'),
         () => _sendMedia(
-          () => picker.pickImage(source: ImageSource.camera, maxWidth: 2048),
-          '图片',
+          () => picker.pickImage(source: ImageSource.camera, maxWidth: maxW),
+          tr('label_image'),
+          image: true,
         ),
       ),
       (
         Icons.videocam_outlined,
-        '拍视频',
+        tr('take_video'),
         () => _sendMedia(
           () => picker.pickVideo(source: ImageSource.camera),
-          '视频',
+          tr('label_video'),
         ),
       ),
       (
         Icons.description_outlined,
-        '文件',
+        tr('files'),
         () {
           setState(() => _showPanel = false);
           _attachFiles();
@@ -946,7 +986,7 @@ class _ChatPageState extends State<ChatPage> {
       ),
       (
         Icons.folder_outlined,
-        '文件夹',
+        tr('folder'),
         () {
           setState(() => _showPanel = false);
           _attachFolder();
@@ -954,52 +994,57 @@ class _ChatPageState extends State<ChatPage> {
       ),
     ];
     final dark = AppTheme.isDark(context);
-    return Container(
-      height: 272, // 两排图标的高度
-      padding: const EdgeInsets.fromLTRB(28, 34, 28, 40),
-      child: Wrap(
-        spacing: 26,
-        runSpacing: 26,
+    Widget cell((IconData, String, VoidCallback) it) => InkWell(
+      borderRadius: BorderRadius.circular(12),
+      onTap: it.$3,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
         children: [
-          for (final it in items)
-            InkWell(
-              borderRadius: BorderRadius.circular(12),
-              onTap: it.$3,
-              child: SizedBox(
-                width: 62,
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Container(
-                      width: 62,
-                      height: 62,
-                      decoration: BoxDecoration(
-                        color: dark ? const Color(0xFF2A2A2A) : Colors.white,
-                        borderRadius: BorderRadius.circular(14),
-                      ),
-                      child: Icon(
-                        it.$1,
-                        size: 30,
-                        color: dark
-                            ? const Color(0xFFAAAAAA)
-                            : const Color(0xFF555555),
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    Text(
-                      it.$2,
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: dark
-                            ? const Color(0xFF888888)
-                            : const Color(0xFF777777),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
+          Container(
+            width: 62,
+            height: 62,
+            decoration: BoxDecoration(
+              color: dark ? const Color(0xFF2A2A2A) : Colors.white,
+              borderRadius: BorderRadius.circular(14),
             ),
+            child: Icon(
+              it.$1,
+              size: 30,
+              color: dark ? const Color(0xFFAAAAAA) : const Color(0xFF555555),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            it.$2,
+            style: TextStyle(
+              fontSize: 12,
+              color: dark ? const Color(0xFF888888) : const Color(0xFF777777),
+            ),
+          ),
         ],
+      ),
+    );
+    // 固定每行 4 个均分宽度, 与设备屏宽无关 (Wrap 定宽排在窄屏会掉成 3 个)
+    final rows = <Widget>[
+      for (var i = 0; i < items.length; i += 4) ...[
+        if (i > 0) const SizedBox(height: 26),
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            for (var j = i; j < i + 4; j++)
+              Expanded(
+                child: j < items.length ? cell(items[j]) : const SizedBox(),
+              ),
+          ],
+        ),
+      ],
+    ];
+    return Container(
+      height: 278, // 两排图标的高度 (单元格 87x2 + 行距 26 + 上下 padding 74)
+      padding: const EdgeInsets.fromLTRB(28, 34, 28, 40),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: rows,
       ),
     );
   }
@@ -1035,9 +1080,13 @@ class _ChatPageState extends State<ChatPage> {
     final hm =
         '${d.hour.toString().padLeft(2, '0')}:${d.minute.toString().padLeft(2, '0')}';
     if (day == today) return hm;
-    if (day == today.subtract(const Duration(days: 1))) return '昨天 $hm';
-    if (day.year == now.year) return '${d.month}月${d.day}日 $hm';
-    return '${d.year}年${d.month}月${d.day}日 $hm';
+    if (day == today.subtract(const Duration(days: 1))) {
+      return '${tr('yesterday')} $hm';
+    }
+    if (day.year == now.year) {
+      return '${trf('date_md', {'m': d.month, 'd': d.day})} $hm';
+    }
+    return '${trf('date_ymd', {'y': d.year, 'm': d.month, 'd': d.day})} $hm';
   }
 
   void _send() {
@@ -1046,9 +1095,7 @@ class _ChatPageState extends State<ChatPage> {
     final c = context.read<RelayClient>();
     // 不在线时消息留在本地, 对方上线 (中继或局域网) 后自动重发
     if (!c.isOnline(peerId!)) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('对方当前离线,消息可能无法送达')));
+      AppToast.show(context, tr('offline_may_fail'));
     }
     c.sendChat(peerId!, t);
     _ctrl.clear();
@@ -1067,8 +1114,9 @@ class _ChatPageState extends State<ChatPage> {
       if (await c.sendFile(peerId!, p)) sent++;
     }
     if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(sent > 0 ? '已发送 $sent 个文件请求' : '对方不在线, 无法发送文件')),
+      AppToast.show(
+        context,
+        sent > 0 ? trf('sent_files', {'n': sent}) : tr('offline_files'),
       );
     }
   }
@@ -1077,9 +1125,8 @@ class _ChatPageState extends State<ChatPage> {
   Future<void> _attachFolder() async {
     final dir = await FilePicker.platform.getDirectoryPath();
     if (dir == null || !mounted) return;
-    final messenger = ScaffoldMessenger.of(context);
     final c = context.read<RelayClient>();
-    messenger.showSnackBar(const SnackBar(content: Text('正在打包文件夹…')));
+    AppToast.show(context, tr('zipping'), sticky: true);
     try {
       final zip = await c.zipFolder(dir);
       final name =
@@ -1090,64 +1137,111 @@ class _ChatPageState extends State<ChatPage> {
         isTemp: true,
         displayName: name,
       );
-      messenger.showSnackBar(
-        SnackBar(content: Text(ok ? '已发送文件夹: $name' : '对方不在线, 无法发送')),
-      );
+      if (mounted) {
+        AppToast.show(
+          context,
+          ok ? trf('sent_folder', {'name': name}) : tr('offline_send'),
+        );
+      }
     } catch (_) {
-      messenger.showSnackBar(const SnackBar(content: Text('文件夹打包失败')));
+      if (mounted) AppToast.show(context, tr('zip_fail'));
     }
   }
 
-  /// 发送图片/视频 (从相册或拍摄拿到路径后走文件传输)
-  Future<void> _sendMedia(Future<XFile?> Function() pick, String label) async {
+  /// 发送图片/视频 (从相册或拍摄拿到路径后走文件传输); image=true 走压缩通道
+  Future<void> _sendMedia(
+    Future<XFile?> Function() pick,
+    String label, {
+    bool image = false,
+  }) async {
     setState(() => _showPanel = false);
     try {
       final f = await pick();
       final path = f?.path;
       if (path != null && mounted) {
-        final ok = await context.read<RelayClient>().sendFile(peerId!, path);
+        final c = context.read<RelayClient>();
+        final ok = image
+            ? await c.sendImage(peerId!, path)
+            : await c.sendFile(peerId!, path);
         if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text(ok ? '已发送$label' : '对方不在线, 无法发送')),
+          AppToast.show(
+            context,
+            ok ? trf('sent_label', {'label': label}) : tr('offline_send'),
           );
         }
       }
     } catch (_) {
       if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(const SnackBar(content: Text('当前平台不支持此功能')));
+        AppToast.show(context, tr('unsupported'));
       }
     }
   }
 
-  /// 从相册多选图片/视频发送
-  Future<void> _sendMediaMulti(
-    Future<List<XFile>> Function() pick,
-    String label,
-  ) async {
+  /// 相册: 手机端用应用内的微信风格图片选择器 (绕开系统文件选择器);
+  /// 桌面端没有相册概念, 用带媒体类型过滤的文件对话框兜底
+  Future<void> _pickFromAlbum() async {
     setState(() => _showPanel = false);
+    List<String> paths;
     try {
-      final files = await pick();
-      if (files.isEmpty || !mounted) return;
-      final c = context.read<RelayClient>();
-      var sent = 0;
-      for (final f in files) {
-        if (await c.sendFile(peerId!, f.path)) sent++;
-      }
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(sent > 0 ? '已发送 $sent 个$label' : '对方不在线, 无法发送'),
+      if (Platform.isAndroid || Platform.isIOS) {
+        final assets = await AssetPicker.pickAssets(
+          context,
+          pickerConfig: AssetPickerConfig(
+            maxAssets: 20,
+            requestType: RequestType.common, // 图片 + 视频
+            themeColor: AppTheme.green,
+            // 选择器界面语言跟随应用语言 (默认中文)
+            textDelegate: l10n.isEn
+                ? const EnglishAssetPickerTextDelegate()
+                : const AssetPickerTextDelegate(),
           ),
         );
+        if (assets == null || assets.isEmpty || !mounted) return;
+        paths = [];
+        for (final e in assets) {
+          final f = await e.file;
+          if (f != null) paths.add(f.path);
+        }
+      } else {
+        final r = await FilePicker.platform.pickFiles(
+          type: FileType.media,
+          allowMultiple: true,
+        );
+        if (r == null || !mounted) return;
+        paths = r.paths.whereType<String>().toList();
       }
     } catch (_) {
       if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(const SnackBar(content: Text('当前平台不支持此功能')));
+        AppToast.show(context, tr('unsupported'));
       }
+      return;
+    }
+    if (paths.isEmpty || !mounted) return;
+    await _sendMediaPaths(paths, tr('media'));
+  }
+
+  /// 多选图片/视频发送: 图片走压缩通道, 视频发原文件
+  Future<void> _sendMediaPaths(List<String> paths, String label) async {
+    final c = context.read<RelayClient>();
+    // 多选里只要带图片且开了压缩, 先提示一下 (大图压缩要一两秒)
+    final compressing = c.compressImages && paths.any(isImageFile);
+    if (compressing) {
+      AppToast.show(context, tr('compressing'), sticky: true);
+    }
+    var sent = 0;
+    for (final p in paths) {
+      final ok = isImageFile(p)
+          ? await c.sendImage(peerId!, p)
+          : await c.sendFile(peerId!, p);
+      if (ok) sent++;
+    }
+    if (mounted) {
+      AppToast.show(
+        context,
+        sent > 0
+            ? trf('sent_n_label', {'n': sent, 'label': label})
+            : tr('offline_send'),
+      );
     }
   }
 
@@ -1165,10 +1259,15 @@ class _ChatPageState extends State<ChatPage> {
     final revealable = t.savePath != null && File(t.savePath!).existsSync();
     _showBubbleMenu(anchor, [
       if (revealable)
-        (label: '打开位置', onTap: () => revealTransferInFolder(context, t)),
+        (
+          label: tr('open_location'),
+          onTap: () => revealTransferInFolder(context, t),
+        ),
       if (!busy)
         (
-          label: t.status == TransferStatus.waiting ? '取消并删除' : '删除记录',
+          label: t.status == TransferStatus.waiting
+              ? tr('cancel_and_delete')
+              : tr('delete_record'),
           onTap: () => c.deleteTransfer(t),
         ),
     ]);
@@ -1182,15 +1281,13 @@ class _ChatPageState extends State<ChatPage> {
   ) {
     _showBubbleMenu(anchor, [
       (
-        label: '复制',
+        label: tr('copy'),
         onTap: () {
           Clipboard.setData(ClipboardData(text: m.text));
-          ScaffoldMessenger.of(
-            context,
-          ).showSnackBar(const SnackBar(content: Text('已复制')));
+          AppToast.show(context, tr('copied'));
         },
       ),
-      (label: '删除', onTap: () => c.deleteMessage(peerId!, m)),
+      (label: tr('delete'), onTap: () => c.deleteMessage(peerId!, m)),
     ]);
   }
 
@@ -1222,7 +1319,7 @@ class _ChatPageState extends State<ChatPage> {
     showGeneralDialog(
       context: context,
       barrierDismissible: true,
-      barrierLabel: '关闭',
+      barrierLabel: tr('close'),
       barrierColor: Colors.transparent,
       pageBuilder: (dlgCtx, _, _) => Stack(
         children: [
@@ -1320,9 +1417,9 @@ class _Avatar extends StatelessWidget {
     final c = context.read<RelayClient>();
     ImageProvider? imgProvider;
     if (me) {
-      final p = c.avatarPath;
-      if (p.isNotEmpty && File(p).existsSync())
-        imgProvider = FileImage(File(p));
+      // 96px 缓存字节, 不再每条气泡全尺寸解码原图
+      final bytes = c.ownAvatarBytes();
+      if (bytes != null) imgProvider = MemoryImage(bytes);
     } else if (peerId != null) {
       final bytes = c.peerAvatarBytes(peerId!);
       if (bytes != null) imgProvider = MemoryImage(bytes);
@@ -1404,6 +1501,15 @@ class _FileBubble extends StatelessWidget {
     this.highlight = false,
   });
 
+  /// existsSync 结果缓存: key = path|status, 状态翻转时自动重查,
+  /// 避免每条进度通知都对每个文件气泡同步 stat 磁盘
+  static final Map<String, bool> _existsCache = {};
+
+  static bool _fileExists(String path, TransferStatus st) {
+    final key = '$path|${st.name}';
+    return _existsCache.putIfAbsent(key, () => File(path).existsSync());
+  }
+
   @override
   Widget build(BuildContext context) {
     final c = context.read<RelayClient>();
@@ -1414,7 +1520,7 @@ class _FileBubble extends StatelessWidget {
     final hasLocal =
         t.status == TransferStatus.done &&
         localPath != null &&
-        File(localPath).existsSync();
+        _fileExists(localPath, t.status);
     final showImg = hasLocal && isImageFile(t.fileName);
     final showVideo = hasLocal && isVideoFile(t.fileName);
     final showMedia = showImg || showVideo;
@@ -1430,6 +1536,8 @@ class _FileBubble extends StatelessWidget {
                 width: 200,
                 height: 140,
                 fit: BoxFit.cover,
+                // 限制解码分辨率: 4000px 原图全尺寸解码约 48MB, 列表多张会 OOM
+                cacheWidth: 600,
                 errorBuilder: (_, _, _) => const SizedBox.shrink(),
               )
             : SizedBox(
@@ -1535,11 +1643,11 @@ class _FileBubble extends StatelessWidget {
               Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  _chip(context, '拒绝', onTap: () => c.rejectFile(t)),
+                  _chip(context, tr('reject'), onTap: () => c.rejectFile(t)),
                   const SizedBox(width: 8),
                   _chip(
                     context,
-                    '接受',
+                    tr('accept'),
                     filled: true,
                     onTap: () => c.acceptFile(t),
                   ),
@@ -1564,6 +1672,15 @@ class _FileBubble extends StatelessWidget {
             _Avatar(name: peerName, me: false, peerId: t.peerId),
             const SizedBox(width: 10),
           ],
+          // 发出的文件被对方拒收 (对方已拉黑本机): 红色感叹号放气泡左侧, 点击重发
+          if (fromMe && t.status == TransferStatus.rejected)
+            Padding(
+              padding: const EdgeInsets.only(top: 13, right: 4),
+              child: GestureDetector(
+                onTap: () => c.retrySend(t),
+                child: const Icon(Icons.error, size: 17, color: AppTheme.red),
+              ),
+            ),
           Builder(
             builder: (bubbleCtx) => GestureDetector(
               onLongPress: onLongPress == null
@@ -1578,7 +1695,7 @@ class _FileBubble extends StatelessWidget {
           ),
           if (fromMe) ...[
             const SizedBox(width: 10),
-            _Avatar(name: '我', me: true),
+            _Avatar(name: tr('me'), me: true),
           ],
         ],
       ),
@@ -1616,13 +1733,13 @@ class _FileBubble extends StatelessWidget {
   }
 
   String _status(TransferStatus s) => switch (s) {
-    TransferStatus.waiting => '等待确认',
-    TransferStatus.accepted => '已接受',
-    TransferStatus.transferring => '传输中',
-    TransferStatus.done => '已完成',
-    TransferStatus.rejected => '已拒绝',
-    TransferStatus.failed => '失败',
-    TransferStatus.canceled => '已取消',
+    TransferStatus.waiting => tr('st_waiting_confirm'),
+    TransferStatus.accepted => tr('st_accepted'),
+    TransferStatus.transferring => tr('st_transferring'),
+    TransferStatus.done => tr('st_done'),
+    TransferStatus.rejected => tr('st_rejected'),
+    TransferStatus.failed => tr('st_failed'),
+    TransferStatus.canceled => tr('st_canceled'),
   };
 
   String _fmt(int b) {
@@ -1670,6 +1787,22 @@ class _Bubble extends StatelessWidget {
               child: _Tail(color: AppTheme.bubbleOf(context), left: true),
             ),
           ],
+          // 被对方拒收 (对方已拉黑本机): 红色感叹号, 点击重发 (微信样式)
+          // 状态图标放气泡左侧, 不挤在气泡和头像中间
+          if (m.fromMe && m.rejected)
+            Padding(
+              padding: const EdgeInsets.only(top: 13, right: 4),
+              child: GestureDetector(
+                onTap: () => c.resendChat(m.peerId, m),
+                child: const Icon(Icons.error, size: 17, color: AppTheme.red),
+              ),
+            )
+          // 未送达标记 (对方上线后会自动重发)
+          else if (m.fromMe && !m.delivered)
+            const Padding(
+              padding: EdgeInsets.only(top: 16, right: 4),
+              child: Icon(Icons.schedule, size: 14, color: AppTheme.grey),
+            ),
           Flexible(
             child: Builder(
               builder: (bubbleCtx) => GestureDetector(
@@ -1697,19 +1830,13 @@ class _Bubble extends StatelessWidget {
               ),
             ),
           ),
-          // 未送达标记 (对方上线后会自动重发)
-          if (m.fromMe && !m.delivered)
-            const Padding(
-              padding: EdgeInsets.only(top: 16, left: 4),
-              child: Icon(Icons.schedule, size: 14, color: AppTheme.grey),
-            ),
           if (m.fromMe) ...[
             const Padding(
               padding: EdgeInsets.only(top: 14),
               child: _Tail(color: green, left: false),
             ),
             const SizedBox(width: 8),
-            _Avatar(name: '我', me: true),
+            _Avatar(name: tr('me'), me: true),
           ],
         ],
       ),

@@ -5,6 +5,7 @@ import 'package:provider/provider.dart';
 
 import '../client.dart';
 import '../db.dart';
+import '../l10n.dart';
 import '../main.dart';
 import '../models.dart';
 
@@ -60,11 +61,11 @@ class _ChatSearchPageState extends State<ChatSearchPage> {
     final pid = item is ChatMessage
         ? item.peerId
         : (item as FileTransfer).peerId;
-    Navigator.pushReplacementNamed(
-      context,
-      '/chat',
-      arguments: {'peerId': pid, 'highlightTs': ts},
-    );
+    final nav = Navigator.of(context);
+    // 清回首页再进聊天: 从聊天页内进入搜索时, pushReplacement 会把旧 ChatPage
+    // 留在栈里 (dispose 时误清 activePeerId, 正在看的会话也累计未读)
+    nav.popUntil((route) => route.isFirst);
+    nav.pushNamed('/chat', arguments: {'peerId': pid, 'highlightTs': ts});
   }
 
   @override
@@ -76,7 +77,7 @@ class _ChatSearchPageState extends State<ChatSearchPage> {
     if (_filter == 1 || (q.isEmpty && _filter != 2)) {
       files = <FileTransfer>[];
     } else {
-      files = c.transfers.where((t) {
+      files = c.visibleTransfers.where((t) {
         if (peerId != null && t.peerId != peerId) return false;
         return q.isEmpty || t.fileName.toLowerCase().contains(q);
       }).toList();
@@ -113,9 +114,12 @@ class _ChatSearchPageState extends State<ChatSearchPage> {
                     fontSize: 14,
                     color: AppTheme.inkOf(context),
                   ),
-                  decoration: const InputDecoration(
-                    hintText: '搜索',
-                    hintStyle: TextStyle(fontSize: 14, color: AppTheme.grey),
+                  decoration: InputDecoration(
+                    hintText: tr('search'),
+                    hintStyle: const TextStyle(
+                      fontSize: 14,
+                      color: AppTheme.grey,
+                    ),
                     filled: false,
                     isCollapsed: true,
                     border: InputBorder.none,
@@ -152,11 +156,11 @@ class _ChatSearchPageState extends State<ChatSearchPage> {
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
             child: Row(
               children: [
-                _filterChip('全部', 0),
+                _filterChip(tr('filter_all'), 0),
                 const SizedBox(width: 8),
-                _filterChip('聊天', 1),
+                _filterChip(tr('filter_chat'), 1),
                 const SizedBox(width: 8),
-                _filterChip('文件', 2),
+                _filterChip(tr('filter_file'), 2),
               ],
             ),
           ),
@@ -167,8 +171,8 @@ class _ChatSearchPageState extends State<ChatSearchPage> {
                         ? Icons.search
                         : Icons.find_in_page_outlined,
                     text: q.isEmpty
-                        ? (_filter == 2 ? '暂无传输记录' : '搜索聊天记录和文件')
-                        : '没有匹配的结果',
+                        ? (_filter == 2 ? tr('no_transfers') : tr('search_tip'))
+                        : tr('no_match'),
                   )
                 : ListView.separated(
                     padding: const EdgeInsets.symmetric(vertical: 8),
@@ -279,7 +283,7 @@ class _ResultTile extends StatelessWidget {
   }) {
     return _ResultTile(
       leading: _MsgAvatar(peerId: m.peerId, fromMe: m.fromMe),
-      title: m.fromMe ? '我' : '',
+      title: m.fromMe ? tr('me') : '',
       subtitle: m.text,
       time: _fmtTime(m.ts),
       q: q,
@@ -310,7 +314,7 @@ class _ResultTile extends StatelessWidget {
         ),
       ),
       title: t.fileName,
-      subtitle: t.outgoing ? '我发出的文件' : '收到的文件',
+      subtitle: t.outgoing ? tr('file_out') : tr('file_in'),
       time: _fmtTime(t.ts),
       q: q,
       onTap: onTap,
@@ -328,9 +332,9 @@ class _ResultTile extends StatelessWidget {
     final hm =
         '${d.hour.toString().padLeft(2, '0')}:${d.minute.toString().padLeft(2, '0')}';
     if (day == today) return hm;
-    if (day == today.subtract(const Duration(days: 1))) return '昨天';
-    if (day.year == now.year) return '${d.month}月${d.day}日';
-    return '${d.year}年${d.month}月${d.day}日';
+    if (day == today.subtract(const Duration(days: 1))) return tr('yesterday');
+    if (day.year == now.year) return trf('date_md', {'m': d.month, 'd': d.day});
+    return trf('date_ymd', {'y': d.year, 'm': d.month, 'd': d.day});
   }
 
   @override
@@ -338,9 +342,9 @@ class _ResultTile extends StatelessWidget {
     final c = context.read<RelayClient>();
     final displayTitle = titleIsFile
         ? title
-        : (fromMe ? '我' : c.peerName(senderPeerId ?? ''));
+        : (fromMe ? tr('me') : c.peerName(senderPeerId ?? ''));
     final displaySubtitle = titleIsFile && senderPeerId != null
-        ? '${fromMe ? "发给" : "来自"} ${c.peerName(senderPeerId!)} · $subtitle'
+        ? '${fromMe ? trf('sent_to', {'name': c.peerName(senderPeerId!)}) : trf('recv_from', {'name': c.peerName(senderPeerId!)})} · $subtitle'
         : subtitle;
     return Material(
       color: AppTheme.cardOf(context),

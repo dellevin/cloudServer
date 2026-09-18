@@ -6,8 +6,8 @@ import 'dart:typed_data';
 import 'models.dart';
 
 /// 局域网发现 + 直连传输:
-///  - UDP 广播 (端口 45677): 每 5s 宣告 {id,name,avatar,tcpPort}, 超过 15s
-///    未收到宣告则判定下线
+///  - UDP 广播 (端口 45677): 每 5s 宣告 {id,name,avatar,tcpPort,ver,platform},
+///    超过 15s 未收到宣告则判定下线
 ///  - TCP 服务 (端口 45678): 需要向对方发消息时按需连接, 首帧为 hello 握手
 ///  - 帧格式: 1 字节类型 (0=JSON 文本, 1=二进制) + 4 字节大端长度 + 负载
 ///
@@ -17,6 +17,7 @@ class LanPeerInfo {
   final String id;
   String name;
   String? avatar;
+  String? platform; // windows / android / ... (旧版未上报为 null)
   InternetAddress addr;
   int tcpPort;
   int lastSeen; // 毫秒时间戳
@@ -28,6 +29,7 @@ class LanPeerInfo {
     required this.id,
     required this.name,
     this.avatar,
+    this.platform,
     required this.addr,
     required this.tcpPort,
     required this.lastSeen,
@@ -73,7 +75,14 @@ class LanLink {
       final payload = Uint8List.sublistView(_pending, 5, 5 + len);
       _pending = Uint8List.sublistView(_pending, 5 + len);
       if (closed) return;
-      onFrame?.call(kind == 0 ? utf8.decode(payload) : payload);
+      // 畸形帧 (非 UTF-8 文本/处理异常) 不应抛进 zone 使宿主崩溃:
+      // 关闭这条不可信的连接, 发送方自然回退到中继通道
+      try {
+        onFrame?.call(kind == 0 ? utf8.decode(payload) : payload);
+      } catch (_) {
+        close();
+        return;
+      }
     }
   }
 
@@ -131,6 +140,10 @@ class LanManager {
 
   /// 某对端的直连断开时回调
   void Function(String peerId)? onLinkClosed;
+
+  /// 拉黑拦截 (由 RelayClient 注入): 返回 true 时
+  /// 拒绝该 IP 的 TCP 接入与 UDP 宣告
+  bool Function(String ip)? shouldBlockIp;
 
   final Map<String, LanPeerInfo> peers = {};
   final Map<String, LanLink> links = {};
@@ -220,6 +233,7 @@ class LanManager {
         'avatar': avatar,
         'tcpPort': _actualTcpPort,
         'ver': kProtocolVersion,
+        'platform': Platform.operatingSystem,
       }),
     );
     try {
@@ -258,25 +272,33 @@ class LanManager {
     } catch (_) {
       return;
     }
-    final id = m['id'] as String?;
-    if (id == null || id.isEmpty || id == deviceId) return;
+    final id = m['id'];
+    if (id is! String || id.isEmpty || id == deviceId) return;
+    // 拉黑的 IP: 宣告直接忽略 (对端不会出现在设备列表)
+    if (shouldBlockIp?.call(dg.address.address) == true) return;
     // NAT 泄漏回来的宣告 (如 Android 模拟器): 源地址被 NAT 改写成宿主机
     // 自己的地址, 按此地址反连只会连到自己/不可达, 必须忽略
     if (_ownAddrs.contains(dg.address.address)) return;
-    _upsertPeer(
-      id,
-      name: m['name'] as String? ?? 'Unknown',
-      avatar: m['avatar'] as String?,
-      addr: dg.address,
-      tcpPort: m['tcpPort'] as int? ?? 0,
-      ver: m['ver'] as int? ?? 0,
-    );
+    try {
+      _upsertPeer(
+        id,
+        name: m['name'] as String? ?? 'Unknown',
+        avatar: m['avatar'] as String?,
+        addr: dg.address,
+        tcpPort: m['tcpPort'] as int? ?? 0,
+        ver: m['ver'] as int? ?? 0,
+        platform: m['platform'] as String?,
+      );
+    } catch (_) {
+      // 字段类型不符的畸形宣告直接忽略
+    }
   }
 
   void _upsertPeer(
     String id, {
     required String name,
     String? avatar,
+    String? platform,
     required InternetAddress addr,
     required int tcpPort,
     bool manual = false,
@@ -289,6 +311,7 @@ class LanManager {
         id: id,
         name: name,
         avatar: avatar,
+        platform: platform,
         addr: addr,
         tcpPort: tcpPort,
         lastSeen: now,
@@ -304,9 +327,11 @@ class LanManager {
         old.name != name ||
         old.avatar != avatar ||
         old.tcpPort != tcpPort ||
+        (platform != null && old.platform != platform) ||
         (manual && !old.manual);
     old.name = name;
     if (avatar != null) old.avatar = avatar;
+    if (platform != null) old.platform = platform;
     old.addr = addr;
     if (tcpPort != 0) old.tcpPort = tcpPort;
     if (ver != 0) old.ver = ver;
@@ -321,6 +346,11 @@ class LanManager {
   // ---------- 直连 (TCP) ----------
 
   void _onAccept(Socket socket) {
+    // 拉黑的 IP: 连接直接断开, 不回复握手
+    if (shouldBlockIp?.call(socket.remoteAddress.address) == true) {
+      socket.destroy();
+      return;
+    }
     final link = LanLink(socket, inbound: true);
     _wireLink(link);
     _sendHello(link);
@@ -342,6 +372,7 @@ class LanManager {
       'name': getName(),
       'avatar': _lastAvatar,
       'ver': kProtocolVersion,
+      'platform': Platform.operatingSystem,
     });
   }
 
@@ -375,6 +406,8 @@ class LanManager {
       link.close();
       return;
     }
+    // 拉黑的设备不断开链路: 其消息在 RelayClient._onData 按类型拦截并回拒收,
+    // 链路保留拒收回执 (chat_reject/file_reject) 才能送达对方
     if (link.inbound) {
       // 对方连入: 借握手更新资料 (UDP 被拦时也能发现彼此)
       _upsertPeer(
@@ -384,6 +417,7 @@ class LanManager {
         addr: link.remoteAddr,
         tcpPort: 0, // 反连端口未知, 保留宣告里的值
         ver: m['ver'] as int? ?? 0,
+        platform: m['platform'] as String?,
       );
     } else {
       // 我方连出: 用已知的对端地址/端口 (手动连接时即输入的地址)
@@ -396,6 +430,7 @@ class LanManager {
         manual: link.manual,
         manualTarget: link.manualTarget,
         ver: m['ver'] as int? ?? 0,
+        platform: m['platform'] as String?,
       );
     }
     _register(link, id);
@@ -442,6 +477,8 @@ class LanManager {
     int port, {
     String? manualTarget,
   }) async {
+    // 拉黑的 IP 不主动发起连接 (手动目标里躺着被拉黑地址时也不再重试)
+    if (shouldBlockIp?.call(addr.address) == true) return null;
     try {
       final socket = await Socket.connect(
         addr,
@@ -456,7 +493,10 @@ class LanManager {
       _wireLink(link);
       _sendHello(link);
       try {
-        return await link.greeted!.future.timeout(const Duration(seconds: 4));
+        final id = await link.greeted!.future.timeout(
+          const Duration(seconds: 4),
+        );
+        return id.isEmpty ? null : id; // 空串 = 被对方/黑名单拒绝
       } on TimeoutException {
         link.close(); // 对方不是 cloudSend
         return null;
@@ -470,6 +510,7 @@ class LanManager {
     try {
       final info = peers[peerId];
       if (info == null || info.tcpPort == 0) return null;
+      if (shouldBlockIp?.call(info.addr.address) == true) return null;
       final socket = await Socket.connect(
         info.addr,
         info.tcpPort,

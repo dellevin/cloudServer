@@ -4,8 +4,11 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:open_filex/open_filex.dart';
 
+import '../l10n.dart';
 import '../main.dart';
 import '../models.dart';
+import 'action_dialog.dart';
+import 'app_toast.dart';
 
 /// 文本类扩展名: 应用内预览
 const _textExts = {
@@ -59,14 +62,13 @@ const archiveExts = {'zip'};
 bool isImageFile(String name) => imageExts.contains(_ext(name));
 bool isVideoFile(String name) => videoExts.contains(_ext(name));
 bool isArchiveFile(String name) => archiveExts.contains(_ext(name));
+bool isTextFile(String name) => _textExts.contains(_ext(name));
 
 /// 点击传输记录: 文本/图片/视频/压缩包走应用内预览, 其他(音频/文档)交给系统默认程序
 Future<void> openTransfer(BuildContext context, FileTransfer t) async {
   final path = t.savePath;
   if (path == null || !File(path).existsSync()) {
-    ScaffoldMessenger.of(
-      context,
-    ).showSnackBar(const SnackBar(content: Text('文件不存在或已被移动')));
+    AppToast.show(context, tr('file_gone'));
     return;
   }
   if (_textExts.contains(_ext(t.fileName))) {
@@ -87,9 +89,7 @@ Future<void> openTransfer(BuildContext context, FileTransfer t) async {
   }
   final r = await OpenFilex.open(path);
   if (r.type != ResultType.done && context.mounted) {
-    ScaffoldMessenger.of(
-      context,
-    ).showSnackBar(SnackBar(content: Text('无法打开: ${r.message}')));
+    AppToast.show(context, trf('open_fail', {'msg': r.message}));
   }
 }
 
@@ -97,9 +97,7 @@ Future<void> openTransfer(BuildContext context, FileTransfer t) async {
 Future<void> openTransferWith(BuildContext context, FileTransfer t) async {
   final path = t.savePath;
   if (path == null || !File(path).existsSync()) {
-    ScaffoldMessenger.of(
-      context,
-    ).showSnackBar(const SnackBar(content: Text('文件不存在或已被移动')));
+    AppToast.show(context, tr('file_gone'));
     return;
   }
   if (Platform.isWindows) {
@@ -108,9 +106,7 @@ Future<void> openTransferWith(BuildContext context, FileTransfer t) async {
   }
   final r = await OpenFilex.open(path);
   if (r.type != ResultType.done && context.mounted) {
-    ScaffoldMessenger.of(
-      context,
-    ).showSnackBar(SnackBar(content: Text('无法打开: ${r.message}')));
+    AppToast.show(context, trf('open_fail', {'msg': r.message}));
   }
 }
 
@@ -122,9 +118,7 @@ Future<void> revealTransferInFolder(
 ) async {
   final path = t.savePath;
   if (path == null || !File(path).existsSync()) {
-    ScaffoldMessenger.of(
-      context,
-    ).showSnackBar(const SnackBar(content: Text('文件不存在或已被移动')));
+    AppToast.show(context, tr('file_gone'));
     return;
   }
   try {
@@ -150,63 +144,28 @@ Future<void> revealTransferInFolder(
     }
   } catch (_) {}
   if (context.mounted) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('文件位于: ${File(path).parent.path}')),
+    AppToast.show(
+      context,
+      trf('file_located', {'dir': File(path).parent.path}),
     );
   }
 }
 
-/// 删除确认对话框 (与消息列表删除会话弹窗一致的风格)
+/// 删除确认对话框 (微信动作面板风格, 与消息列表删除会话弹窗一致)
 /// 返回 'record' / 'both' / null(取消)
 Future<String?> confirmDeleteDialog(
   BuildContext context, {
   required String title,
   String? message,
 }) {
-  return showDialog<String>(
-    context: context,
-    builder: (ctx) => AlertDialog(
-      backgroundColor: AppTheme.cardOf(ctx),
-      surfaceTintColor: Colors.transparent,
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(8),
-        side: BorderSide(color: AppTheme.lineOf(ctx)),
-      ),
-      title: Text(
-        title,
-        style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
-      ),
-      content: message == null
-          ? null
-          : Text(
-              message,
-              style: const TextStyle(fontSize: 13, color: AppTheme.grey),
-            ),
-      actionsPadding: const EdgeInsets.fromLTRB(14, 0, 14, 12),
-      actions: [
-        OutlinedButton(
-          style: OutlinedButton.styleFrom(
-            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-          ),
-          onPressed: () => Navigator.pop(ctx),
-          child: const Text('取消'),
-        ),
-        OutlinedButton(
-          style: OutlinedButton.styleFrom(
-            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-          ),
-          onPressed: () => Navigator.pop(ctx, 'record'),
-          child: const Text('仅删除记录'),
-        ),
-        FilledButton(
-          style: FilledButton.styleFrom(
-            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-          ),
-          onPressed: () => Navigator.pop(ctx, 'both'),
-          child: const Text('删除记录和文件'),
-        ),
-      ],
-    ),
+  return showActionDialog<String>(
+    context,
+    title: title,
+    message: message,
+    actions: [
+      (label: tr('del_record_only'), value: 'record', danger: false),
+      (label: tr('del_record_file'), value: 'both', danger: true),
+    ],
   );
 }
 
@@ -214,10 +173,10 @@ Future<String?> confirmDeleteDialog(
 Future<String?> confirmDeleteTransfer(BuildContext context, FileTransfer t) {
   return confirmDeleteDialog(
     context,
-    title: '删除传输记录',
+    title: tr('del_transfer_title'),
     message: t.status == TransferStatus.waiting
-        ? '「${t.fileName}」还在等待对方确认, 删除将取消该请求。'
-        : '「${t.fileName}」',
+        ? trf('del_transfer_waiting', {'name': t.fileName})
+        : trf('file_quoted', {'name': t.fileName}),
   );
 }
 
@@ -229,6 +188,12 @@ class ImageViewPage extends StatelessWidget {
   Widget build(BuildContext context) {
     final path = ModalRoute.of(context)!.settings.arguments as String;
     final name = path.split(RegExp(r'[\\/]')).last;
+    // 限制解码分辨率防 OOM (留 2x 余量供双指放大)
+    final cacheWidth =
+        (MediaQuery.sizeOf(context).width *
+                MediaQuery.devicePixelRatioOf(context) *
+                2)
+            .round();
     return Scaffold(
       backgroundColor: Colors.black,
       appBar: AppBar(
@@ -239,7 +204,16 @@ class ImageViewPage extends StatelessWidget {
       body: Center(
         child: InteractiveViewer(
           maxScale: 8,
-          child: Image.file(File(path), fit: BoxFit.contain),
+          child: Image.file(
+            File(path),
+            fit: BoxFit.contain,
+            cacheWidth: cacheWidth,
+            errorBuilder: (_, _, _) => const Icon(
+              Icons.broken_image_outlined,
+              color: Colors.white54,
+              size: 48,
+            ),
+          ),
         ),
       ),
     );
@@ -268,10 +242,10 @@ class FilePreviewPage extends StatelessWidget {
         future: _readText(path),
         builder: (_, snap) {
           if (snap.hasError) {
-            return const Center(
+            return Center(
               child: Text(
-                '读取失败或不是文本文件',
-                style: TextStyle(color: AppTheme.grey),
+                tr('not_text'),
+                style: const TextStyle(color: AppTheme.grey),
               ),
             );
           }
@@ -325,7 +299,7 @@ class FilePreviewPage extends StatelessWidget {
     } catch (_) {
       text = String.fromCharCodes(bytes);
     }
-    if (size > cap) text += '\n\n... (文件过大, 仅显示前 512KB)';
+    if (size > cap) text += '\n\n... (${tr('too_large')})';
     return text;
   }
 }

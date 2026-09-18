@@ -16,6 +16,9 @@ class ChatMessage {
   /// 仅对 fromMe=true 有意义: 是否已收到对方 ack
   bool delivered;
 
+  /// 仅对 fromMe=true 有意义: 被对方拒收 (对方已拉黑本机)
+  bool rejected;
+
   ChatMessage({
     this.id,
     required this.peerId,
@@ -23,6 +26,7 @@ class ChatMessage {
     required this.text,
     required this.ts,
     this.delivered = true,
+    this.rejected = false,
   });
 
   Map<String, dynamic> toMap() => {
@@ -32,6 +36,7 @@ class ChatMessage {
     'text': text,
     'ts': ts,
     'delivered': delivered ? 1 : 0,
+    'rejected': rejected ? 1 : 0,
   };
 
   factory ChatMessage.fromMap(Map<String, dynamic> m) => ChatMessage(
@@ -41,6 +46,7 @@ class ChatMessage {
     text: m['text'] as String,
     ts: m['ts'] as int,
     delivered: (m['delivered'] as int? ?? 1) == 1,
+    rejected: (m['rejected'] as int? ?? 0) == 1,
   );
 }
 
@@ -56,10 +62,10 @@ class ChatDb {
     final base = await getDatabasesPath();
     _db = await openDatabase(
       p.join(base, 'cloudsend_chat.db'),
-      version: 3,
+      version: 4,
       onCreate: (d, v) async {
         await d.execute(
-          'CREATE TABLE messages(id INTEGER PRIMARY KEY AUTOINCREMENT, peerId TEXT NOT NULL, fromMe INTEGER NOT NULL, text TEXT NOT NULL, ts INTEGER NOT NULL, delivered INTEGER NOT NULL DEFAULT 1)',
+          'CREATE TABLE messages(id INTEGER PRIMARY KEY AUTOINCREMENT, peerId TEXT NOT NULL, fromMe INTEGER NOT NULL, text TEXT NOT NULL, ts INTEGER NOT NULL, delivered INTEGER NOT NULL DEFAULT 1, rejected INTEGER NOT NULL DEFAULT 0)',
         );
         await d.execute(
           'CREATE TABLE transfers(transferId TEXT PRIMARY KEY, peerId TEXT NOT NULL, fileName TEXT NOT NULL, fileSize INTEGER NOT NULL, outgoing INTEGER NOT NULL, status TEXT NOT NULL, savePath TEXT, ts INTEGER NOT NULL)',
@@ -74,6 +80,11 @@ class ChatDb {
         if (oldV < 3) {
           await d.execute(
             'ALTER TABLE messages ADD COLUMN delivered INTEGER NOT NULL DEFAULT 1',
+          );
+        }
+        if (oldV < 4) {
+          await d.execute(
+            'ALTER TABLE messages ADD COLUMN rejected INTEGER NOT NULL DEFAULT 0',
           );
         }
       },
@@ -96,24 +107,68 @@ class ChatDb {
         whereArgs: [peerId, ts],
       );
 
+  /// 标记某条消息被对方拒收 (对方拉黑了本机, 不再重发)
+  static Future<void> markRejected(String peerId, int ts) async =>
+      (await db).update(
+        'messages',
+        {'rejected': 1},
+        where: 'peerId = ? AND ts = ?',
+        whereArgs: [peerId, ts],
+      );
+
+  /// 清除拒收标记回到未送达状态 (点击红色感叹号重发)
+  static Future<void> clearRejected(String peerId, int ts) async =>
+      (await db).update(
+        'messages',
+        {'rejected': 0, 'delivered': 0},
+        where: 'peerId = ? AND ts = ?',
+        whereArgs: [peerId, ts],
+      );
+
   /// 删除与某对端的整个会话
   static Future<int> deleteConversation(String peerId) async =>
       (await db).delete('messages', where: 'peerId = ?', whereArgs: [peerId]);
 
-  /// 拉取会话消息: 取最近 limit 条 (beforeTs 用于向上翻页), 返回按时间正序
+  /// 拉取会话消息: 取最近 limit 条 (beforeTs+beforeId 用于向上翻页),
+  /// 返回按时间正序; 游标为 (ts,id) 双条件, 同毫秒的消息不会在页边界丢失
   static Future<List<ChatMessage>> history(
     String peerId, {
     int limit = 50,
     int? beforeTs,
+    int? beforeId,
   }) async {
+    final String where;
+    final List<Object> args;
+    if (beforeTs != null && beforeId != null) {
+      where = 'peerId = ? AND (ts < ? OR (ts = ? AND id < ?))';
+      args = [peerId, beforeTs, beforeTs, beforeId];
+    } else if (beforeTs != null) {
+      where = 'peerId = ? AND ts < ?';
+      args = [peerId, beforeTs];
+    } else {
+      where = 'peerId = ?';
+      args = [peerId];
+    }
     final rows = await (await db).query(
       'messages',
-      where: beforeTs != null ? 'peerId = ? AND ts < ?' : 'peerId = ?',
-      whereArgs: beforeTs != null ? [peerId, beforeTs] : [peerId],
-      orderBy: 'ts DESC',
+      where: where,
+      whereArgs: args,
+      orderBy: 'ts DESC, id DESC',
       limit: limit,
     );
     return rows.map(ChatMessage.fromMap).toList().reversed.toList();
+  }
+
+  /// 是否已存在该对端同 ts 的消息 (入库前兜底去重:
+  /// 会话被隐藏或分页未加载时, 对端重发的消息不能二次入库)
+  static Future<bool> exists(String peerId, int ts) async {
+    final rows = await (await db).query(
+      'messages',
+      where: 'peerId = ? AND ts = ?',
+      whereArgs: [peerId, ts],
+      limit: 1,
+    );
+    return rows.isNotEmpty;
   }
 
   /// 搜索消息内容 (peerId=null 搜全部会话), 按时间倒序, 限 200 条
@@ -137,11 +192,12 @@ class ChatDb {
     return rows.map(ChatMessage.fromMap).toList();
   }
 
-  /// 某对端所有未送达的外发消息 (重连后补发用, 不受分页加载影响)
+  /// 某对端所有未送达的外发消息 (重连后补发用, 不受分页加载影响);
+  /// 被对方拒收的消息不再补发
   static Future<List<ChatMessage>> undelivered(String peerId) async {
     final rows = await (await db).query(
       'messages',
-      where: 'peerId = ? AND fromMe = 1 AND delivered = 0',
+      where: 'peerId = ? AND fromMe = 1 AND delivered = 0 AND rejected = 0',
       whereArgs: [peerId],
       orderBy: 'ts ASC',
     );
@@ -159,6 +215,7 @@ class ChatDb {
   // ---------- 传输记录持久化 ----------
 
   static Future<void> upsertTransfer(FileTransfer t) async {
+    if (t.ephemeral) return; // 预览临时传输不入库
     await (await db).insert('transfers', {
       'transferId': t.transferId,
       'peerId': t.peerId,

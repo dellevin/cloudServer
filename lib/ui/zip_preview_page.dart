@@ -10,7 +10,9 @@ import 'package:path/path.dart' as p;
 import 'package:provider/provider.dart';
 
 import '../client.dart';
+import '../l10n.dart';
 import '../main.dart';
+import 'app_toast.dart';
 
 /// zip 文件名乱码修复: archive 包按 UTF-8 解码条目名, 失败时回退成
 /// 「每字节→一字符」的伪 latin1 字符串 (国产 Windows 压缩包多为 GBK 且
@@ -64,7 +66,7 @@ class _ZipPreviewPageState extends State<ZipPreviewPage> {
       await input.close();
       if (mounted) setState(() => _files = files);
     } catch (_) {
-      if (mounted) setState(() => _error = '无法读取压缩包 (可能已损坏或不是 zip 格式)');
+      if (mounted) setState(() => _error = tr('zip_read_fail'));
     }
   }
 
@@ -95,7 +97,6 @@ class _ZipPreviewPageState extends State<ZipPreviewPage> {
   Future<void> _extractOne(ArchiveFile f) async {
     if (_extracting) return;
     setState(() => _extracting = true);
-    final messenger = ScaffoldMessenger.of(context);
     try {
       final dir = await context.read<RelayClient>().downloadDir();
       final name = f.name.split(RegExp(r'[\\/]')).last;
@@ -116,17 +117,16 @@ class _ZipPreviewPageState extends State<ZipPreviewPage> {
         await out?.close();
         await input.close();
       }
-      messenger.showSnackBar(
-        SnackBar(
-          content: Text('已解压: $dest'),
-          action: SnackBarAction(
-            label: '打开',
-            onPressed: () => OpenFilex.open(dest),
-          ),
-        ),
-      );
+      if (mounted) {
+        AppToast.show(
+          context,
+          trf('extracted', {'dest': dest}),
+          actionLabel: tr('open'),
+          onAction: () => OpenFilex.open(dest),
+        );
+      }
     } catch (_) {
-      messenger.showSnackBar(const SnackBar(content: Text('解压失败')));
+      if (mounted) AppToast.show(context, tr('extract_fail'));
     } finally {
       if (mounted) setState(() => _extracting = false);
     }
@@ -136,7 +136,6 @@ class _ZipPreviewPageState extends State<ZipPreviewPage> {
   Future<void> _extractAll() async {
     if (_extracting) return;
     setState(() => _extracting = true);
-    final messenger = ScaffoldMessenger.of(context);
     try {
       final dir = await context.read<RelayClient>().downloadDir();
       final base = _path.split(RegExp(r'[\\/]')).last;
@@ -171,17 +170,16 @@ class _ZipPreviewPageState extends State<ZipPreviewPage> {
       } finally {
         await input.close();
       }
-      messenger.showSnackBar(
-        SnackBar(
-          content: Text('已解压到: $folder'),
-          action: SnackBarAction(
-            label: '打开',
-            onPressed: () => OpenFilex.open(folder),
-          ),
-        ),
-      );
+      if (mounted) {
+        AppToast.show(
+          context,
+          trf('extracted_to', {'folder': folder}),
+          actionLabel: tr('open'),
+          onAction: () => OpenFilex.open(folder),
+        );
+      }
     } catch (_) {
-      messenger.showSnackBar(const SnackBar(content: Text('解压失败')));
+      if (mounted) AppToast.show(context, tr('extract_fail'));
     } finally {
       if (mounted) setState(() => _extracting = false);
     }
@@ -217,7 +215,11 @@ class _ZipPreviewPageState extends State<ZipPreviewPage> {
                           ),
                         )
                       : const Icon(Icons.unarchive_outlined, size: 18),
-                  label: Text(_extracting ? '解压中…' : '全部解压 (${_files!.length} 个文件)'),
+                  label: Text(
+                    _extracting
+                        ? tr('extracting')
+                        : trf('extract_all', {'n': _files!.length}),
+                  ),
                 ),
               ),
             ),
@@ -241,8 +243,8 @@ class _ZipPreviewPageState extends State<ZipPreviewPage> {
       );
     }
     if (files.isEmpty) {
-      return const Center(
-        child: Text('压缩包是空的', style: TextStyle(color: AppTheme.grey)),
+      return Center(
+        child: Text(tr('zip_empty'), style: const TextStyle(color: AppTheme.grey)),
       );
     }
     return ListView.builder(
@@ -293,7 +295,7 @@ class _ZipPreviewPageState extends State<ZipPreviewPage> {
             ),
             trailing: TextButton(
               onPressed: _extracting ? null : () => _extractOne(f),
-              child: const Text('解压', style: TextStyle(fontSize: 12.5)),
+              child: Text(tr('extract'), style: const TextStyle(fontSize: 12.5)),
             ),
           ),
         );

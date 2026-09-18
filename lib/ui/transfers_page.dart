@@ -5,8 +5,10 @@ import 'package:flutter_slidable/flutter_slidable.dart';
 import 'package:provider/provider.dart';
 
 import '../client.dart';
+import '../l10n.dart';
 import '../main.dart';
 import '../models.dart';
+import 'app_toast.dart';
 import 'file_preview_page.dart';
 import 'slidable_close.dart';
 
@@ -28,6 +30,15 @@ class _TransfersPageState extends State<TransfersPage> {
   int _shown = _pageSize;
   final ScrollController _ctrl = ScrollController();
 
+  /// existsSync 结果缓存: key = path|status|bytesDone,
+  /// 传输状态/进度变化自动失效重查, 避免进度通知刷屏时反复同步 stat
+  final Map<String, bool> _existsCache = {};
+
+  bool _fileExists(String path, TransferStatus st, int bytes) {
+    final key = '$path|${st.name}|$bytes';
+    return _existsCache.putIfAbsent(key, () => File(path).existsSync());
+  }
+
   @override
   void initState() {
     super.initState();
@@ -37,7 +48,7 @@ class _TransfersPageState extends State<TransfersPage> {
   void _onScroll() {
     if (!_ctrl.hasClients) return;
     if (_ctrl.position.pixels < _ctrl.position.maxScrollExtent - 240) return;
-    final total = context.read<RelayClient>().transfers.length;
+    final total = context.read<RelayClient>().visibleTransfers.length;
     if (_shown >= total) return;
     setState(() => _shown += _pageSize);
   }
@@ -60,23 +71,24 @@ class _TransfersPageState extends State<TransfersPage> {
   }
 
   Future<void> _deleteSelected(RelayClient c) async {
-    final targets = c.transfers
+    final targets = c.visibleTransfers
         .where((t) => _selected.contains(t.transferId))
         .toList();
     if (targets.isEmpty) return;
     final choice = await confirmDeleteDialog(
       context,
-      title: '删除 ${targets.length} 条传输记录',
+      title: trf('del_transfers_title', {'n': targets.length}),
     );
     if (choice == null) return;
     await c.deleteTransfers(targets, deleteFile: choice == 'both');
-    _exitSelect();
+    // 删文件 IO 期间用户可能已退出页面
+    if (mounted) _exitSelect();
   }
 
   @override
   Widget build(BuildContext context) {
     final c = context.watch<RelayClient>();
-    final full = c.transfers.reversed.toList();
+    final full = c.visibleTransfers.reversed.toList();
     final list = full.take(_shown).toList();
     final hasMore = full.length > list.length;
     // 可选择的: 已加载且非传输中的记录
@@ -123,9 +135,9 @@ class _TransfersPageState extends State<TransfersPage> {
                     ),
                   ),
                   const SizedBox(height: 14),
-                  const Text(
-                    '暂无传输记录',
-                    style: TextStyle(
+                  Text(
+                    tr('no_transfers'),
+                    style: const TextStyle(
                       color: AppTheme.grey,
                       fontWeight: FontWeight.w600,
                     ),
@@ -135,119 +147,128 @@ class _TransfersPageState extends State<TransfersPage> {
             )
           // 左滑互斥: 开一个关其他; 点空白/其他条目关闭
           : SlidableCloseOnOutsideTap(
-              child: ListView.builder(
-                controller: _ctrl,
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 12,
-                  vertical: 6,
-                ),
-                // 有未加载的记录时, 底部多一行加载指示
-                itemCount: items.length + (hasMore ? 1 : 0),
-                itemBuilder: (_, i) {
-                  if (i >= items.length) {
-                    return const Padding(
-                      padding: EdgeInsets.symmetric(vertical: 14),
-                      child: Center(
-                        child: SizedBox(
-                          width: 18,
-                          height: 18,
-                          child: CircularProgressIndicator(
-                            strokeWidth: 2,
+              child: RefreshIndicator(
+                color: AppTheme.green,
+                onRefresh: () => c.refreshPeers(),
+                child: ListView.builder(
+                  controller: _ctrl,
+                  // 列表不足一屏时也能下拉
+                  physics: const AlwaysScrollableScrollPhysics(),
+                  padding: const EdgeInsets.only(bottom: 12),
+                  // 有未加载的记录时, 底部多一行加载指示
+                  itemCount: items.length + (hasMore ? 1 : 0),
+                  itemBuilder: (_, i) {
+                    if (i >= items.length) {
+                      return const Padding(
+                        padding: EdgeInsets.symmetric(vertical: 14),
+                        child: Center(
+                          child: SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              color: AppTheme.grey,
+                            ),
+                          ),
+                        ),
+                      );
+                    }
+                    final item = items[i];
+                    // 日期分组头 (微信账单风格: 灰底小字)
+                    if (item is String) {
+                      return Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 14, 16, 6),
+                        child: Text(
+                          item,
+                          style: const TextStyle(
+                            fontSize: 12,
                             color: AppTheme.grey,
                           ),
                         ),
-                      ),
+                      );
+                    }
+                    final t = item as FileTransfer;
+                    final busy =
+                        t.status == TransferStatus.accepted ||
+                        t.status == TransferStatus.transferring;
+                    final checked = _selected.contains(t.transferId);
+                    // 组内行间细分隔线, 组尾/列表尾不画
+                    final showDivider =
+                        i + 1 < items.length && items[i + 1] is! String;
+                    final card = TransferCard(
+                      t: t,
+                      selecting: _selecting,
+                      selected: checked,
+                      showDivider: showDivider,
+                      onSelectToggle: busy
+                          ? null
+                          : () => setState(() {
+                              if (checked) {
+                                _selected.remove(t.transferId);
+                              } else {
+                                _selected.add(t.transferId);
+                              }
+                            }),
                     );
-                  }
-                  final item = items[i];
-                  // 日期分组头 (微信聊天时间分隔风格)
-                  if (item is String) {
-                    return Padding(
-                      padding: const EdgeInsets.fromLTRB(4, 12, 4, 6),
-                      child: Text(
-                        item,
-                        style: const TextStyle(
-                          fontSize: 11.5,
-                          color: AppTheme.grey,
-                          fontWeight: FontWeight.w600,
-                          letterSpacing: 1,
-                        ),
-                      ),
-                    );
-                  }
-                  final t = item as FileTransfer;
-                  final busy =
-                      t.status == TransferStatus.accepted ||
-                      t.status == TransferStatus.transferring;
-                  final checked = _selected.contains(t.transferId);
-                  final card = TransferCard(
-                    t: t,
-                    selecting: _selecting,
-                    selected: checked,
-                    onSelectToggle: busy
-                        ? null
-                        : () => setState(() {
-                            if (checked) {
-                              _selected.remove(t.transferId);
-                            } else {
-                              _selected.add(t.transferId);
-                            }
-                          }),
-                  );
-                  if (_selecting || busy) return card;
-                  // 左滑露出操作按钮: 打开(收到需已完成, 发出的本地有文件即可)
-                  // 位置(文件在本地) / 删除; 按钮为正方形 (边长≈条目高), 面板宽度按按钮个数换算
-                  final revealable =
-                      t.savePath != null && File(t.savePath!).existsSync();
-                  final openable = revealable &&
-                      (t.outgoing || t.status == TransferStatus.done);
-                  final n = 1 + (revealable ? 1 : 0) + (openable ? 1 : 0);
-                  final sw = MediaQuery.of(context).size.width;
-                  final ratio = (n * 76.0) / sw;
-                  return Slidable(
-                    key: Key('transfer_${t.transferId}'),
-                    endActionPane: ActionPane(
-                      motion: const DrawerMotion(),
-                      extentRatio: ratio.clamp(0.0, 0.8),
-                      children: [
-                        if (openable)
-                          CustomSlidableAction(
-                            onPressed: (_) => openTransfer(context, t),
-                            backgroundColor: Colors.transparent,
-                            padding: EdgeInsets.zero,
-                            child: const _SquareAction(
-                              color: Color(0xFF4C8DFF),
-                              icon: Icons.visibility_outlined,
-                              label: '打开',
+                    if (_selecting || busy) return card;
+                    // 左滑露出操作按钮: 打开(收到需已完成, 发出的本地有文件即可)
+                    // 位置(文件在本地) / 删除; 按钮为正方形 (边长≈条目高), 面板宽度按按钮个数换算
+                    // existsSync 走缓存 (key 含状态/进度, 完成/续传变化时自动重查),
+                    // 否则 5Hz 进度通知下每行每次都同步 stat 磁盘
+                    final revealable =
+                        t.savePath != null &&
+                        _fileExists(t.savePath!, t.status, t.bytesDone);
+                    final openable =
+                        revealable &&
+                        (t.outgoing || t.status == TransferStatus.done);
+                    final n = 1 + (revealable ? 1 : 0) + (openable ? 1 : 0);
+                    final sw = MediaQuery.of(context).size.width;
+                    final ratio = (n * 76.0) / sw;
+                    return Slidable(
+                      key: Key('transfer_${t.transferId}'),
+                      endActionPane: ActionPane(
+                        motion: const DrawerMotion(),
+                        extentRatio: ratio.clamp(0.0, 0.8),
+                        children: [
+                          if (openable)
+                            CustomSlidableAction(
+                              onPressed: (_) => openTransfer(context, t),
+                              backgroundColor: Colors.transparent,
+                              padding: EdgeInsets.zero,
+                              child: _SquareAction(
+                                color: const Color(0xFF4C8DFF),
+                                icon: Icons.visibility_outlined,
+                                label: tr('open'),
+                              ),
                             ),
-                          ),
-                        if (revealable)
+                          if (revealable)
+                            CustomSlidableAction(
+                              onPressed: (_) =>
+                                  revealTransferInFolder(context, t),
+                              backgroundColor: Colors.transparent,
+                              padding: EdgeInsets.zero,
+                              child: _SquareAction(
+                                color: AppTheme.green,
+                                icon: Icons.folder_open,
+                                label: tr('locate'),
+                              ),
+                            ),
                           CustomSlidableAction(
-                            onPressed: (_) =>
-                                revealTransferInFolder(context, t),
+                            onPressed: (_) => _deleteOne(c, t),
                             backgroundColor: Colors.transparent,
                             padding: EdgeInsets.zero,
                             child: _SquareAction(
-                              color: AppTheme.green,
-                              icon: Icons.folder_open,
-                              label: '位置',
+                              color: AppTheme.red,
+                              icon: Icons.delete_outline,
+                              label: tr('delete'),
                             ),
                           ),
-                        CustomSlidableAction(
-                          onPressed: (_) => _deleteOne(c, t),
-                          backgroundColor: Colors.transparent,
-                          padding: EdgeInsets.zero,
-                          child: _SquareAction(
-                            color: AppTheme.red,
-                            icon: Icons.delete_outline,
-                            label: '删除',
-                          ),
-                        ),
-                      ],
-                    ),
-                    child: card,
-                  );
-                },
+                        ],
+                      ),
+                      child: card,
+                    );
+                  },
+                ),
               ),
             ),
     );
@@ -259,7 +280,7 @@ class _TransfersPageState extends State<TransfersPage> {
         ? Row(
             children: [
               Text(
-                '已选 ${_selected.length} 条',
+                trf('selected_n', {'n': _selected.length}),
                 style: TextStyle(
                   fontSize: 13,
                   fontWeight: FontWeight.w600,
@@ -277,14 +298,16 @@ class _TransfersPageState extends State<TransfersPage> {
                       ..addAll(selectable.map((t) => t.transferId));
                   }
                 }),
-                child: Text(allSelected ? '取消全选' : '全选'),
+                child: Text(
+                  allSelected ? tr('unselect_all') : tr('select_all'),
+                ),
               ),
               TextButton(
                 onPressed: _selected.isEmpty ? null : () => _deleteSelected(c),
-                child: const Text('删除'),
+                child: Text(tr('delete')),
               ),
               IconButton(
-                tooltip: '退出选择',
+                tooltip: tr('exit_select'),
                 icon: const Icon(Icons.close, size: 20),
                 onPressed: _exitSelect,
               ),
@@ -308,7 +331,7 @@ class _TransfersPageState extends State<TransfersPage> {
                 child: Row(
                   children: [
                     Text(
-                      '共 ${list.length} 条',
+                      trf('total_n', {'n': list.length}),
                       style: const TextStyle(
                         fontSize: 12,
                         color: AppTheme.grey,
@@ -316,7 +339,7 @@ class _TransfersPageState extends State<TransfersPage> {
                     ),
                     const Spacer(),
                     IconButton(
-                      tooltip: '选择',
+                      tooltip: tr('select'),
                       icon: const Icon(Icons.checklist, size: 20),
                       onPressed: () => setState(() => _selecting = true),
                     ),
@@ -332,7 +355,11 @@ class _TransfersPageState extends State<TransfersPage> {
     return Scaffold(
       backgroundColor: AppTheme.softOf(context),
       appBar: AppBar(
-        title: Text(_selecting ? '已选 ${_selected.length} 条' : '传输记录'),
+        title: Text(
+          _selecting
+              ? trf('selected_n', {'n': _selected.length})
+              : tr('seg_transfers'),
+        ),
         actions: [
           if (list.isNotEmpty)
             _selecting
@@ -348,16 +375,18 @@ class _TransfersPageState extends State<TransfersPage> {
                               ..addAll(selectable.map((t) => t.transferId));
                           }
                         }),
-                        child: Text(allSelected ? '取消全选' : '全选'),
+                        child: Text(
+                          allSelected ? tr('unselect_all') : tr('select_all'),
+                        ),
                       ),
                       TextButton(
                         onPressed: _selected.isEmpty
                             ? null
                             : () => _deleteSelected(c),
-                        child: const Text('删除'),
+                        child: Text(tr('delete')),
                       ),
                       IconButton(
-                        tooltip: '退出选择',
+                        tooltip: tr('exit_select'),
                         icon: const Icon(Icons.close, size: 20),
                         onPressed: _exitSelect,
                       ),
@@ -365,7 +394,7 @@ class _TransfersPageState extends State<TransfersPage> {
                     ],
                   )
                 : IconButton(
-                    tooltip: '选择',
+                    tooltip: tr('select'),
                     icon: const Icon(Icons.checklist, size: 20),
                     onPressed: () => setState(() => _selecting = true),
                   ),
@@ -385,10 +414,10 @@ class _TransfersPageState extends State<TransfersPage> {
     final now = DateTime.now();
     final today = DateTime(now.year, now.month, now.day);
     final day = DateTime(d.year, d.month, d.day);
-    if (day == today) return '今天';
-    if (day == today.subtract(const Duration(days: 1))) return '昨天';
-    if (d.year == now.year) return '${d.month}月${d.day}日';
-    return '${d.year}年${d.month}月${d.day}日';
+    if (day == today) return tr('today');
+    if (day == today.subtract(const Duration(days: 1))) return tr('yesterday');
+    if (d.year == now.year) return trf('date_md', {'m': d.month, 'd': d.day});
+    return trf('date_ymd', {'y': d.year, 'm': d.month, 'd': d.day});
   }
 }
 
@@ -406,10 +435,9 @@ class _RetryButton extends StatelessWidget {
       onTap: () async {
         final ok = t.outgoing ? await c.retrySend(t) : await c.retryReceive(t);
         if (!ok && context.mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text(t.outgoing ? '对方不在线或本地文件已不存在' : '对方不在线, 无法续传'),
-            ),
+          AppToast.show(
+            context,
+            t.outgoing ? tr('retry_fail_out') : tr('resume_fail'),
           );
         }
       },
@@ -421,10 +449,12 @@ class _RetryButton extends StatelessWidget {
         ),
         child: Text(
           t.outgoing
-              ? '重发'
+              ? tr('resend')
               : (isResume
-                    ? '续传 ${(t.progress * 100).toStringAsFixed(0)}%'
-                    : '重试'),
+                    ? trf('resume_pct', {
+                        'pct': (t.progress * 100).toStringAsFixed(0),
+                      })
+                    : tr('retry')),
           style: const TextStyle(
             fontSize: 11.5,
             color: AppTheme.green,
@@ -436,7 +466,7 @@ class _RetryButton extends StatelessWidget {
   }
 }
 
-/// 左滑操作按钮: 填满格子 (与消息列表删除按钮同款)
+/// 左滑操作按钮: 通高纯色块 (微信样式)
 class _SquareAction extends StatelessWidget {
   final Color color;
   final IconData icon;
@@ -450,11 +480,7 @@ class _SquareAction extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      margin: const EdgeInsets.symmetric(vertical: 3, horizontal: 3),
-      decoration: BoxDecoration(
-        color: color,
-        borderRadius: BorderRadius.circular(8),
-      ),
+      color: color,
       alignment: Alignment.center,
       child: FittedBox(
         fit: BoxFit.scaleDown,
@@ -474,17 +500,19 @@ class _SquareAction extends StatelessWidget {
   }
 }
 
-/// 传输卡片 (微信风格: 灰底白卡, 文件类型彩色图标, 状态着色)
+/// 传输记录行 (微信账单风格: 通栏白块 + 行间细分隔线)
 class TransferCard extends StatelessWidget {
   final FileTransfer t;
   final bool selecting;
   final bool selected;
+  final bool showDivider;
   final VoidCallback? onSelectToggle;
   const TransferCard({
     super.key,
     required this.t,
     this.selecting = false,
     this.selected = false,
+    this.showDivider = true,
     this.onSelectToggle,
   });
 
@@ -492,217 +520,230 @@ class TransferCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final c = context.read<RelayClient>();
     final (icon, iconColor) = _fileVisual(t.fileName);
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 3),
-      child: Material(
-        color: selected
-            ? (AppTheme.isDark(context)
-                  ? const Color(0xFF0E3B24)
-                  : const Color(0xFFE7F6EC))
-            : AppTheme.cardOf(context),
-        borderRadius: BorderRadius.circular(10),
-        child: InkWell(
-          borderRadius: BorderRadius.circular(10),
-          // 不再点击预览 (改在左滑「打开」里); 仅多选模式响应点击
-          onTap: selecting ? onSelectToggle : null,
-          onLongPress: t.status == TransferStatus.done && !selecting
-              ? () => openTransferWith(context, t)
-              : null,
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    if (selecting) ...[
-                      Icon(
-                        selected
-                            ? Icons.check_circle
-                            : Icons.radio_button_unchecked,
-                        size: 18,
-                        color: selected ? AppTheme.green : AppTheme.grey,
-                      ),
-                      const SizedBox(width: 8),
-                    ],
-                    // 文件类型图标: 彩色软底方块
-                    Container(
-                      width: 34,
-                      height: 34,
-                      decoration: BoxDecoration(
-                        color: iconColor.withValues(alpha: 0.12),
-                        borderRadius: BorderRadius.circular(7),
-                      ),
-                      child: Icon(icon, size: 18, color: iconColor),
-                    ),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            t.fileName,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              fontWeight: FontWeight.w600,
-                              fontSize: 13,
-                              color: AppTheme.inkOf(context),
-                            ),
-                          ),
-                          const SizedBox(height: 2),
-                          Row(
-                            children: [
-                              Icon(
-                                t.outgoing
-                                    ? Icons.north_east
-                                    : Icons.south_west,
-                                size: 10,
-                                color: AppTheme.grey,
-                              ),
-                              const SizedBox(width: 3),
-                              Flexible(
-                                child: Text(
-                                  '${t.outgoing ? "发给" : "来自"} ${c.peerName(t.peerId)} · ${_fmt(t.fileSize)} · ${_hm(t.ts)}',
-                                  style: const TextStyle(
-                                    fontSize: 11,
-                                    color: AppTheme.grey,
-                                  ),
-                                  overflow: TextOverflow.ellipsis,
-                                ),
-                              ),
-                            ],
-                          ),
-                        ],
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    Text(
-                      c.isSendQueued(t.transferId)
-                          ? '排队中'
-                          : _statusLabel(t.status),
-                      style: TextStyle(
-                        fontSize: 10.5,
-                        color: _statusColor(t.status),
-                        fontWeight: FontWeight.w500,
-                        letterSpacing: 0.5,
-                      ),
-                    ),
-                  ],
-                ),
-                if (t.status == TransferStatus.transferring ||
-                    t.status == TransferStatus.accepted) ...[
-                  const SizedBox(height: 8),
+    return Material(
+      color: selected
+          ? (AppTheme.isDark(context)
+                ? const Color(0xFF0E3B24)
+                : const Color(0xFFE7F6EC))
+          : AppTheme.cardOf(context),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          InkWell(
+            // 不再点击预览 (改在左滑「打开」里); 仅多选模式响应点击
+            onTap: selecting ? onSelectToggle : null,
+            onLongPress: t.status == TransferStatus.done && !selecting
+                ? () => openTransferWith(context, t)
+                : null,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
                   Row(
                     children: [
+                      if (selecting) ...[
+                        Icon(
+                          selected
+                              ? Icons.check_circle
+                              : Icons.radio_button_unchecked,
+                          size: 18,
+                          color: selected ? AppTheme.green : AppTheme.grey,
+                        ),
+                        const SizedBox(width: 8),
+                      ],
+                      // 文件类型图标: 彩色软底方块
+                      Container(
+                        width: 40,
+                        height: 40,
+                        decoration: BoxDecoration(
+                          color: iconColor.withValues(alpha: 0.12),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: Icon(icon, size: 20, color: iconColor),
+                      ),
+                      const SizedBox(width: 12),
                       Expanded(
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            ClipRRect(
-                              borderRadius: BorderRadius.circular(2),
-                              child: LinearProgressIndicator(
-                                value: t.progress,
-                                minHeight: 4,
-                                color: AppTheme.green,
-                                backgroundColor: AppTheme.lineOf(context),
+                            Text(
+                              t.fileName,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontWeight: FontWeight.w500,
+                                fontSize: 15,
+                                color: AppTheme.inkOf(context),
                               ),
                             ),
-                            const SizedBox(height: 6),
-                            Text(
-                              [
-                                '${_fmt(t.bytesDone)} / ${_fmt(t.fileSize)} · ${(t.progress * 100).toStringAsFixed(0)}%',
-                                // 传输中显示实时速度与预计剩余时间
-                                if (t.status == TransferStatus.transferring &&
-                                    t.speedBps > 0)
-                                  '${_fmt(t.speedBps.round())}/s · 剩余 ${_etaText(t.etaSeconds)}',
-                              ].join(' · '),
+                            const SizedBox(height: 3),
+                            Row(
+                              children: [
+                                Icon(
+                                  t.outgoing
+                                      ? Icons.north_east
+                                      : Icons.south_west,
+                                  size: 10,
+                                  color: AppTheme.grey,
+                                ),
+                                const SizedBox(width: 3),
+                                Flexible(
+                                  child: Text(
+                                    '${t.outgoing ? trf('sent_to', {'name': c.peerName(t.peerId)}) : trf('recv_from', {'name': c.peerName(t.peerId)})} · ${_fmt(t.fileSize)} · ${_hm(t.ts)}',
+                                    style: const TextStyle(
+                                      fontSize: 12,
+                                      color: AppTheme.grey,
+                                    ),
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Text(
+                        c.isSendQueued(t.transferId)
+                            ? tr('queued')
+                            : _statusLabel(t.status),
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: _statusColor(t.status),
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                    ],
+                  ),
+                  if (t.status == TransferStatus.transferring ||
+                      t.status == TransferStatus.accepted) ...[
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              ClipRRect(
+                                borderRadius: BorderRadius.circular(2),
+                                child: LinearProgressIndicator(
+                                  value: t.progress,
+                                  minHeight: 4,
+                                  color: AppTheme.green,
+                                  backgroundColor: AppTheme.lineOf(context),
+                                ),
+                              ),
+                              const SizedBox(height: 6),
+                              Text(
+                                [
+                                  '${_fmt(t.bytesDone)} / ${_fmt(t.fileSize)} · ${(t.progress * 100).toStringAsFixed(0)}%',
+                                  // 传输中显示实时速度与预计剩余时间
+                                  if (t.status == TransferStatus.transferring &&
+                                      t.speedBps > 0)
+                                    '${_fmt(t.speedBps.round())}/s · ${trf('eta_left', {'eta': _etaText(t.etaSeconds)})}',
+                                ].join(' · '),
+                                style: const TextStyle(
+                                  fontSize: 10.5,
+                                  color: AppTheme.grey,
+                                  fontFamily: 'monospace',
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        InkWell(
+                          borderRadius: BorderRadius.circular(4),
+                          onTap: () => c.cancelTransfer(t),
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 8,
+                              vertical: 2,
+                            ),
+                            child: Text(
+                              tr('cancel'),
+                              style: const TextStyle(
+                                fontSize: 12,
+                                color: AppTheme.red,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                  if (t.status == TransferStatus.failed ||
+                      t.status == TransferStatus.canceled ||
+                      (t.outgoing && t.status == TransferStatus.rejected)) ...[
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        if (!t.outgoing && t.bytesDone > 0)
+                          Expanded(
+                            child: Text(
+                              trf('received_n', {
+                                'n':
+                                    '${_fmt(t.bytesDone)} / ${_fmt(t.fileSize)}',
+                              }),
                               style: const TextStyle(
                                 fontSize: 10.5,
                                 color: AppTheme.grey,
                                 fontFamily: 'monospace',
                               ),
                             ),
-                          ],
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      InkWell(
-                        borderRadius: BorderRadius.circular(4),
-                        onTap: () => c.cancelTransfer(t),
-                        child: const Padding(
-                          padding: EdgeInsets.symmetric(
-                            horizontal: 8,
-                            vertical: 2,
-                          ),
-                          child: Text(
-                            '取消',
-                            style: TextStyle(fontSize: 12, color: AppTheme.red),
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                ],
-                if (t.status == TransferStatus.failed ||
-                    t.status == TransferStatus.canceled ||
-                    (t.outgoing && t.status == TransferStatus.rejected)) ...[
-                  const SizedBox(height: 8),
-                  Row(
-                    children: [
-                      if (!t.outgoing && t.bytesDone > 0)
-                        Expanded(
-                          child: Text(
-                            '已收 ${_fmt(t.bytesDone)} / ${_fmt(t.fileSize)}',
-                            style: const TextStyle(
-                              fontSize: 10.5,
-                              color: AppTheme.grey,
-                              fontFamily: 'monospace',
+                          )
+                        else
+                          const Spacer(),
+                        _RetryButton(t: t),
+                      ],
+                    ),
+                  ],
+                  if (!t.outgoing && t.status == TransferStatus.waiting) ...[
+                    const SizedBox(height: 8),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.end,
+                      children: [
+                        OutlinedButton(
+                          style: OutlinedButton.styleFrom(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 14,
+                              vertical: 6,
                             ),
+                            minimumSize: Size.zero,
+                            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                           ),
-                        )
-                      else
-                        const Spacer(),
-                      _RetryButton(t: t),
-                    ],
-                  ),
-                ],
-                if (!t.outgoing && t.status == TransferStatus.waiting) ...[
-                  const SizedBox(height: 8),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.end,
-                    children: [
-                      OutlinedButton(
-                        style: OutlinedButton.styleFrom(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 14,
-                            vertical: 6,
+                          onPressed: () => c.rejectFile(t),
+                          child: Text(
+                            tr('reject'),
+                            style: const TextStyle(fontSize: 12),
                           ),
-                          minimumSize: Size.zero,
-                          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                         ),
-                        onPressed: () => c.rejectFile(t),
-                        child: const Text('拒绝', style: TextStyle(fontSize: 12)),
-                      ),
-                      const SizedBox(width: 8),
-                      FilledButton(
-                        style: FilledButton.styleFrom(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 14,
-                            vertical: 6,
+                        const SizedBox(width: 8),
+                        FilledButton(
+                          style: FilledButton.styleFrom(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 14,
+                              vertical: 6,
+                            ),
+                            minimumSize: Size.zero,
+                            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                           ),
-                          minimumSize: Size.zero,
-                          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                          onPressed: () => c.acceptFile(t),
+                          child: Text(
+                            tr('accept'),
+                            style: const TextStyle(fontSize: 12),
+                          ),
                         ),
-                        onPressed: () => c.acceptFile(t),
-                        child: const Text('接受', style: TextStyle(fontSize: 12)),
-                      ),
-                    ],
-                  ),
+                      ],
+                    ),
+                  ],
                 ],
-              ],
+              ),
             ),
           ),
-        ),
+          if (showDivider)
+            Divider(height: 1, indent: 66, color: AppTheme.lineOf(context)),
+        ],
       ),
     );
   }
@@ -765,13 +806,13 @@ class TransferCard extends StatelessWidget {
   }
 
   static String _statusLabel(TransferStatus s) => switch (s) {
-    TransferStatus.waiting => '等待确认',
-    TransferStatus.accepted => '已接受',
-    TransferStatus.transferring => '传输中',
-    TransferStatus.done => '已完成',
-    TransferStatus.rejected => '已拒绝',
-    TransferStatus.failed => '失败',
-    TransferStatus.canceled => '已取消',
+    TransferStatus.waiting => tr('st_waiting_confirm'),
+    TransferStatus.accepted => tr('st_accepted'),
+    TransferStatus.transferring => tr('st_transferring'),
+    TransferStatus.done => tr('st_done'),
+    TransferStatus.rejected => tr('st_rejected'),
+    TransferStatus.failed => tr('st_failed'),
+    TransferStatus.canceled => tr('st_canceled'),
   };
 
   static Color _statusColor(TransferStatus s) => switch (s) {
@@ -800,8 +841,8 @@ class TransferCard extends StatelessWidget {
   /// 剩余时间文案: <60s 显秒, <60min 显分, 否则 >1小时
   static String _etaText(double? secs) {
     if (secs == null) return '--';
-    if (secs < 60) return '${secs.ceil()}秒';
-    if (secs < 3600) return '${(secs / 60).ceil()}分钟';
-    return '>1小时';
+    if (secs < 60) return trf('eta_secs', {'n': secs.ceil()});
+    if (secs < 3600) return trf('eta_mins', {'n': (secs / 60).ceil()});
+    return tr('eta_hour');
   }
 }

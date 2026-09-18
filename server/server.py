@@ -4,8 +4,8 @@
 
 协议:
   文本帧(JSON):
-    C->S {"type":"register","id":..., "name":...}
-    S->C {"type":"peers","peers":[{"id","name"}...]}
+    C->S {"type":"register","id":..., "name":..., "avatar":..., "ver":..., "platform":...}
+    S->C {"type":"peers","peers":[{"id","name","avatar","platform"}...]}
     转发(附带 from/to): chat / chat_ack / file_offer / file_accept / file_reject
       / file_done / file_progress / file_result / file_cancel
   二进制帧: 前36字节为 transferId(ASCII), 其余为文件数据块, 按 transferId 路由
@@ -200,7 +200,7 @@ def client_ip(ws):
 async def broadcast_peers():
     msg = json.dumps({
         "type": "peers",
-        "peers": [{"id": i, "name": c["name"], "avatar": c.get("avatar")} for i, c in clients.items()],
+        "peers": [{"id": i, "name": c["name"], "avatar": c.get("avatar"), "platform": c.get("platform")} for i, c in clients.items()],
     })
     for c in list(clients.values()):
         try:
@@ -271,8 +271,9 @@ def enforce_acl(loop):
 
 # 直接转发的消息类型 (服务器注入 from 后按 to 转发)
 FORWARD_TYPES = (
-    "chat", "chat_ack", "file_offer", "file_reject",
+    "chat", "chat_ack", "chat_reject", "file_offer", "file_reject",
     "file_done", "file_progress", "file_result", "file_cancel",
+    "fs_list", "fs_list_result", "fs_get",
 )
 
 
@@ -295,65 +296,92 @@ async def handle(ws):
         ip_conns[ip] = n + 1
     try:
         async for data in ws:
-            if isinstance(data, str):
-                if len(data) > MAX_TEXT_FRAME:
-                    print(f"[!] oversize text frame from {my_id or ip} ({len(data)}B), dropped")
-                    continue
-                try:
-                    m = json.loads(data)
-                except Exception:
-                    continue
-                t = m.get("type")
-                if t == "register":
-                    my_id = m["id"]
-                    # register 限流: 正常客户端只在连接/手动刷新时注册
-                    now = time.time()
-                    hist = [x for x in reg_hist.get(ip, []) if now - x < 60]
-                    if len(hist) >= REGISTER_PER_MIN:
-                        print(f"[x] register rate limit hit from {ip}")
-                        await kick(ws, "rate")
-                        return
-                    hist.append(now)
-                    reg_hist[ip] = hist
-                    # 注册级拦截: 设备 id 不被允许 (或此时 IP 名单也变了)
-                    r = block_reason(my_id, ip)
-                    if r:
-                        print(f"[x] register {my_id} from {ip} refused ({r})")
-                        await kick(ws, r)
-                        return
-                    clients[my_id] = {
-                        "name": m.get("name", "Unknown"),
-                        "ws": ws,
-                        "avatar": m.get("avatar"),
-                        "ip": ip,
-                    }
-                    print(f"[+] {m.get('name')} ({my_id}) v{m.get('ver', 0)} joined from {ip}, total={len(clients)}")
-                    await broadcast_peers()
-                elif t == "file_accept":
-                    m["from"] = my_id
-                    # 数据块流向: 文件发送方(m["to"]) -> 文件接收方(my_id)
-                    routes[m["transferId"]] = {"from": m.get("to"), "to": my_id, "ts": time.time()}
-                    to = m.get("to")
-                    if to:
+            try:
+                if isinstance(data, str):
+                    if len(data) > MAX_TEXT_FRAME:
+                        print(f"[!] oversize text frame from {my_id or ip} ({len(data)}B), dropped")
+                        continue
+                    try:
+                        m = json.loads(data)
+                    except Exception:
+                        continue
+                    if not isinstance(m, dict):
+                        continue  # 非对象 JSON (null/数组/数字) 无法路由
+                    t = m.get("type")
+                    if t == "register":
+                        rid = m.get("id")
+                        if not isinstance(rid, str) or not rid:
+                            continue
+                        my_id = rid
+                        # register 限流: 正常客户端只在连接/手动刷新时注册
+                        now = time.time()
+                        hist = [x for x in reg_hist.get(ip, []) if now - x < 60]
+                        if len(hist) >= REGISTER_PER_MIN:
+                            print(f"[x] register rate limit hit from {ip}")
+                            await kick(ws, "rate")
+                            return
+                        hist.append(now)
+                        reg_hist[ip] = hist
+                        # 注册级拦截: 设备 id 不被允许 (或此时 IP 名单也变了)
+                        r = block_reason(my_id, ip)
+                        if r:
+                            print(f"[x] register {my_id} from {ip} refused ({r})")
+                            await kick(ws, r)
+                            return
+                        # 同一连接换 id 重新注册: 清掉旧 id 的映射, 防幽灵条目
+                        for k, v in list(clients.items()):
+                            if v["ws"] is ws and k != my_id:
+                                del clients[k]
+                        # 同 id 已有旧连接: 踢掉旧的, 新连接接管身份 (防并行劫持)
+                        old = clients.get(my_id)
+                        if old is not None and old["ws"] is not ws:
+                            print(f"[~] {my_id} re-registered, kicking old connection")
+                            await kick(old["ws"], "replaced")
+                        clients[my_id] = {
+                            "name": m.get("name", "Unknown"),
+                            "ws": ws,
+                            "avatar": m.get("avatar"),
+                            "platform": m.get("platform"),
+                            "ip": ip,
+                        }
+                        print(f"[+] {m.get('name')} ({my_id}) v{m.get('ver', 0)} joined from {ip}, total={len(clients)}")
+                        await broadcast_peers()
+                    elif t == "file_accept":
+                        tid = m.get("transferId")
+                        to = m.get("to")
+                        # 未注册不可建路由; 缺字段直接忽略, 不抛异常杀连接
+                        if my_id is None or not isinstance(tid, str) or not tid \
+                                or not isinstance(to, str) or not to:
+                            continue
+                        m["from"] = my_id
+                        # 数据块流向: 文件发送方(m["to"]) -> 文件接收方(my_id)
+                        routes[tid] = {"from": to, "to": my_id, "ts": time.time()}
                         await forward(to, json.dumps(m))
-                elif t in FORWARD_TYPES:
-                    m["from"] = my_id
-                    if t in ("file_done", "file_cancel"):
-                        routes.pop(m.get("transferId"), None)  # 传输结束, 释放路由
-                    to = m.get("to")
-                    if to:
-                        await forward(to, json.dumps(m))
-            else:
-                # 二进制: 前36字节为 transferId
-                if len(data) > MAX_BIN_FRAME:
-                    print(f"[!] oversize binary frame from {my_id or ip} ({len(data)}B), dropped")
-                    continue
-                if len(data) > 36:
-                    tid = data[:36].decode("ascii", errors="ignore")
-                    r = routes.get(tid)
-                    # 只转发路由登记的发送方发来的数据块, 防止伪造注入
-                    if r and r["from"] == my_id:
-                        await forward(r["to"], data)
+                    elif t in FORWARD_TYPES:
+                        if my_id is None:
+                            continue  # 未注册不可中继
+                        m["from"] = my_id
+                        if t in ("file_done", "file_cancel"):
+                            routes.pop(m.get("transferId"), None)  # 传输结束, 释放路由
+                        to = m.get("to")
+                        if isinstance(to, str) and to:
+                            await forward(to, json.dumps(m))
+                else:
+                    # 二进制: 前36字节为 transferId
+                    if len(data) > MAX_BIN_FRAME:
+                        print(f"[!] oversize binary frame from {my_id or ip} ({len(data)}B), dropped")
+                        continue
+                    if len(data) > 36 and my_id is not None:
+                        tid = data[:36].decode("ascii", errors="ignore")
+                        r = routes.get(tid)
+                        # 只转发路由登记的发送方发来的数据块, 防止伪造注入
+                        if r and r["from"] == my_id:
+                            await forward(r["to"], data)
+            except websockets.ConnectionClosed:
+                raise  # 断连交给外层统一处理
+            except Exception as e:
+                # 单条畸形帧不应杀死整条连接
+                print(f"[!] bad frame from {my_id or ip}: {e!r}")
     except websockets.ConnectionClosed:
         pass  # 客户端异常断开,走 finally 清理
     finally:
@@ -465,7 +493,7 @@ PANEL_HTML = """<!DOCTYPE html>
                     padding: 5px 13px; border-radius: 7px; font-size: 12.5px;
                     cursor: pointer; }
   .topbar .logout:hover { border-color: #fa5151; color: #fa5151; }
-  .content { padding: 18px 20px 30px; max-width: 920px; }
+  .content { padding: 18px 20px 30px; }
   .card { background: #fff; border-radius: 10px; padding: 14px 16px;
           box-shadow: 0 1px 3px rgba(0,0,0,.08); margin-bottom: 14px; }
   .card h2 { font-size: 14px; color: #555; margin-bottom: 10px; }
@@ -480,10 +508,14 @@ PANEL_HTML = """<!DOCTYPE html>
   td, th { text-align: left; padding: 7px 8px; border-bottom: 1px solid #eee; }
   th { color: #888; font-weight: 500; }
   td .ops { display: flex; gap: 6px; flex-wrap: wrap; }
-  .tag { display: inline-block; background: #eef2f7; border-radius: 4px;
-         padding: 2px 8px; margin: 2px 4px 2px 0; font-family: monospace;
-         word-break: break-all; }
-  .tag button { margin-left: 6px; padding: 0 6px; background: #fa5151; }
+  /* 黑/白名单: 两个 card 横向双列 (窄屏堆叠) */
+  .cols { display: flex; gap: 14px; align-items: flex-start; }
+  .cols .card { flex: 1; min-width: 0; }
+  /* 名单条目: 一行一条 */
+  .entry { display: flex; align-items: center; gap: 8px; padding: 6px 2px;
+           border-bottom: 1px solid #f0f0f0; font-family: monospace;
+           font-size: 12.5px; word-break: break-all; }
+  .entry span { flex: 1; min-width: 0; }
   .row { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
   .hint { color: #999; font-size: 12px; }
   .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
@@ -499,6 +531,7 @@ PANEL_HTML = """<!DOCTYPE html>
     nav { display: flex; padding: 0; }
     nav a { border-left: 0; border-bottom: 3px solid transparent; padding: 11px 12px; }
     nav a.active { border-bottom-color: #07c160; background: transparent; }
+    .cols { flex-direction: column; align-items: stretch; }
   }
 </style>
 </head>
@@ -535,40 +568,44 @@ PANEL_HTML = """<!DOCTYPE html>
     </section>
 
     <section id="view-black" hidden>
-      <div class="card">
-        <h2>设备 ID 黑名单</h2>
-        <div id="black-ids"></div>
-        <div class="row">
-          <input type="text" id="black-idInput" placeholder="设备唯一 id, 如 3f9a...-....">
-          <button onclick="addEntry('black','ids')">添加</button>
+      <div class="cols">
+        <div class="card">
+          <h2>设备 ID 黑名单</h2>
+          <div class="row" style="margin:0 0 10px">
+            <input type="text" id="black-idInput" placeholder="设备唯一 id, 如 3f9a...-....">
+            <button onclick="addEntry('black','ids')">添加</button>
+          </div>
+          <div id="black-ids"></div>
         </div>
-      </div>
-      <div class="card">
-        <h2>IP 黑名单</h2>
-        <div id="black-ips"></div>
-        <div class="row">
-          <input type="text" id="black-ipInput" placeholder="IP 或网段, 如 1.2.3.4 / 10.0.0.0/8">
-          <button onclick="addEntry('black','ips')">添加</button>
+        <div class="card">
+          <h2>IP 黑名单</h2>
+          <div class="row" style="margin:0 0 10px">
+            <input type="text" id="black-ipInput" placeholder="IP 或网段, 如 1.2.3.4 / 10.0.0.0/8">
+            <button onclick="addEntry('black','ips')">添加</button>
+          </div>
+          <div id="black-ips"></div>
         </div>
       </div>
       <div class="hint">黑名单模式开启后, 名单内的设备/IP 将被拒绝接入; 已连接的会立即被踢下线。</div>
     </section>
 
     <section id="view-white" hidden>
-      <div class="card">
-        <h2>设备 ID 白名单</h2>
-        <div id="white-ids"></div>
-        <div class="row">
-          <input type="text" id="white-idInput" placeholder="设备唯一 id, 如 3f9a...-....">
-          <button onclick="addEntry('white','ids')">添加</button>
+      <div class="cols">
+        <div class="card">
+          <h2>设备 ID 白名单</h2>
+          <div class="row" style="margin:0 0 10px">
+            <input type="text" id="white-idInput" placeholder="设备唯一 id, 如 3f9a...-....">
+            <button onclick="addEntry('white','ids')">添加</button>
+          </div>
+          <div id="white-ids"></div>
         </div>
-      </div>
-      <div class="card">
-        <h2>IP 白名单</h2>
-        <div id="white-ips"></div>
-        <div class="row">
-          <input type="text" id="white-ipInput" placeholder="IP 或网段, 如 1.2.3.4 / 10.0.0.0/8">
-          <button onclick="addEntry('white','ips')">添加</button>
+        <div class="card">
+          <h2>IP 白名单</h2>
+          <div class="row" style="margin:0 0 10px">
+            <input type="text" id="white-ipInput" placeholder="IP 或网段, 如 1.2.3.4 / 10.0.0.0/8">
+            <button onclick="addEntry('white','ips')">添加</button>
+          </div>
+          <div id="white-ips"></div>
         </div>
       </div>
       <div class="hint">白名单模式开启后, 仅名单内的设备/IP 可以接入, 其余一律拒绝。</div>
@@ -619,13 +656,13 @@ async function api(path, body) {
 function render(s) {
   for (const b of document.querySelectorAll('#modeSeg button'))
     b.classList.toggle('on', b.dataset.m === s.mode);
-  const tag = (lst, kind) => (v) =>
-    `<span class="tag">${esc(v)}<button class="small"
-       onclick="removeEntry('${lst}','${kind}',decodeURIComponent('${u(v)}'))">×</button></span>`;
+  const entry = (lst, kind) => (v) =>
+    `<div class="entry"><span>${esc(v)}</span><button class="red small"
+       onclick="removeEntry('${lst}','${kind}',decodeURIComponent('${u(v)}'))">移除</button></div>`;
   for (const lst of ['black', 'white'])
     for (const kind of ['ids', 'ips'])
       document.getElementById(`${lst}-${kind}`).innerHTML =
-        s[lst][kind].map(tag(lst, kind)).join('') || '<span class="hint">空</span>';
+        s[lst][kind].map(entry(lst, kind)).join('') || '<div class="hint">空</div>';
   document.getElementById('cnt').textContent =
     s.clients.length ? `(${s.clients.length})` : '';
   document.getElementById('clients').innerHTML = s.clients.map(c =>

@@ -5,12 +5,14 @@ class Peer {
   final String id;
   final String name;
   final String? avatar; // base64 PNG (96x96)
+  final String? platform; // windows / android / linux / macos / ios (旧版未上报为 null)
   final bool viaLan; // 局域网发现
   final bool viaRelay; // 中继服务器在线
   Peer({
     required this.id,
     required this.name,
     this.avatar,
+    this.platform,
     this.viaLan = false,
     this.viaRelay = false,
   });
@@ -19,6 +21,7 @@ class Peer {
     id: j['id'] as String,
     name: j['name'] as String? ?? 'Unknown',
     avatar: j['avatar'] as String?,
+    platform: j['platform'] as String?,
     viaRelay: true,
   );
 }
@@ -43,6 +46,10 @@ class FileTransfer {
   TransferStatus status;
   int bytesDone;
   String? savePath;
+
+  /// 瞬态: 远程浏览页「预览」拉取的临时传输 — 存缓存目录、不入库、
+  /// 不出现在聊天/传输记录 UI, 重启即弃
+  bool ephemeral = false;
 
   FileTransfer({
     required this.transferId,

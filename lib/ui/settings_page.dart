@@ -6,146 +6,162 @@ import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 
 import '../client.dart';
+import '../l10n.dart';
 import '../main.dart';
-import 'devices_page.dart';
+import 'action_dialog.dart';
+import 'app_toast.dart';
 
 /// 设置页 (微信「我 → 设置」风格: 灰底 + 通栏白色分组)
 class SettingsPage extends StatelessWidget {
-  const SettingsPage({super.key});
+  /// embedded=true 时嵌入主界面 (不带 Scaffold/AppBar)
+  final bool embedded;
+  const SettingsPage({super.key, this.embedded = false});
 
   @override
   Widget build(BuildContext context) {
     final c = context.watch<RelayClient>();
+    final body = ListView(
+      children: [
+        const SizedBox(height: 10),
+
+        // ---- 个人信息大卡 ----
+        const _ProfileCard(),
+        const SizedBox(height: 10),
+
+        // ---- 功能模式 ----
+        _Group(
+          children: [
+            _Tile(
+              title: tr('mode_title'),
+              value: switch (c.connMode) {
+                'relay' => tr('mode_relay'),
+                'lan' => tr('mode_lan'),
+                _ => tr('mode_both'),
+              },
+              onTap: () => _pickConnMode(context, c),
+            ),
+          ],
+        ),
+        const SizedBox(height: 10),
+
+        // ---- 中继服务器 (仅局域网模式下隐藏) ----
+        if (c.connMode != 'lan') ...[
+          _Group(
+            children: [
+              _Tile(
+                title: tr('server'),
+                value: c.serverAddr.isEmpty ? tr('not_set') : c.serverAddr,
+                // 连接中也可编辑, 保存后自动断开旧连接并重连新地址
+                onTap: () => _editField(
+                  context,
+                  title: tr('server_addr_title'),
+                  hint: tr('server_addr_hint'),
+                  initial: c.serverAddr,
+                  onSubmit: (v) {
+                    if (v.isNotEmpty) c.connect(v);
+                  },
+                ),
+              ),
+              _ServerStatusTile(),
+            ],
+          ),
+          const SizedBox(height: 10),
+        ],
+
+        // ---- 局域网 (仅中继模式下隐藏) ----
+        if (c.connMode != 'relay') ...[
+          const _NetworkGroup(),
+          const SizedBox(height: 10),
+        ],
+
+        // ---- 通用 ----
+        _Group(
+          children: [
+            _Tile(
+              title: tr('seg_transfers'),
+              onTap: () => Navigator.pushNamed(context, '/transfers'),
+            ),
+            const _SaveDirTile(),
+            const _ClearCacheTile(),
+            _Tile(
+              title: tr('blocklist'),
+              value: trf('n_items', {
+                'n': c.blockedPeers.length + c.blockedIps.length,
+              }),
+              onTap: () => Navigator.pushNamed(context, '/blocklist'),
+            ),
+            _Tile(
+              title: tr('queue_sends'),
+              trailing: Switch(
+                value: c.queueSends,
+                onChanged: (v) => c.setQueueSends(v),
+              ),
+              onTap: () => c.setQueueSends(!c.queueSends),
+            ),
+            _Tile(
+              title: tr('compress_images'),
+              trailing: Switch(
+                value: c.compressImages,
+                onChanged: (v) => c.setCompressImages(v),
+              ),
+              onTap: () => c.setCompressImages(!c.compressImages),
+            ),
+            _Tile(
+              title: tr('dark_mode'),
+              trailing: Switch(
+                value: c.darkMode,
+                onChanged: (v) => c.setDarkMode(v),
+              ),
+              onTap: () => c.setDarkMode(!c.darkMode),
+            ),
+            _Tile(
+              title: tr('language'),
+              value: l10n.isEn ? 'English' : '中文',
+              onTap: () => _pickLanguage(context),
+            ),
+          ],
+        ),
+        const SizedBox(height: 10),
+
+        // ---- 诊断 ----
+        _Group(
+          children: [
+            _Tile(
+              title: tr('run_log'),
+              onTap: () => Navigator.pushNamed(context, '/log'),
+            ),
+          ],
+        ),
+        const SizedBox(height: 10),
+
+        // ---- 关于 ----
+        _Group(
+          children: [_Tile(title: '${tr('about')} cloudSend', value: 'v1.0.0')],
+        ),
+
+        const SizedBox(height: 24),
+        Center(
+          child: Text(
+            tr('footer_tip'),
+            style: const TextStyle(fontSize: 11, color: AppTheme.grey),
+          ),
+        ),
+        const SizedBox(height: 24),
+      ],
+    );
+    if (embedded) {
+      return Container(color: AppTheme.softOf(context), child: body);
+    }
     return Scaffold(
       backgroundColor: AppTheme.softOf(context),
       appBar: AppBar(
-        title: const Text('设置'),
+        title: Text(tr('settings')),
         bottom: const PreferredSize(
           preferredSize: Size.fromHeight(1),
           child: Divider(height: 1),
         ),
       ),
-      body: ListView(
-        children: [
-          const SizedBox(height: 10),
-
-          // ---- 个人信息大卡 ----
-          const _ProfileCard(),
-          const SizedBox(height: 10),
-
-          // ---- 功能模式 ----
-          _Group(
-            children: [
-              _Tile(
-                icon: Icons.alt_route,
-                title: '功能模式',
-                value: switch (c.connMode) {
-                  'relay' => '仅中继',
-                  'lan' => '仅局域网',
-                  _ => '局域网 + 中继',
-                },
-                onTap: () => _pickConnMode(context, c),
-              ),
-            ],
-          ),
-          const SizedBox(height: 10),
-
-          // ---- 中继服务器 (仅局域网模式下隐藏) ----
-          if (c.connMode != 'lan') ...[
-            _Group(
-              children: [
-                _Tile(
-                  icon: Icons.dns_outlined,
-                  title: '服务器',
-                  value: c.serverAddr.isEmpty ? '未设置' : c.serverAddr,
-                  // 连接中也可编辑, 保存后自动断开旧连接并重连新地址
-                  onTap: () => _editField(
-                    context,
-                    title: '服务器地址',
-                    hint: '例如 1.2.3.4:8787 或 ws://example.com/ws',
-                    initial: c.serverAddr,
-                    onSubmit: (v) {
-                      if (v.isNotEmpty) c.connect(v);
-                    },
-                  ),
-                ),
-                _ServerStatusTile(),
-              ],
-            ),
-            const SizedBox(height: 10),
-          ],
-
-          // ---- 局域网 (仅中继模式下隐藏) ----
-          if (c.connMode != 'relay') ...[
-            const _NetworkGroup(),
-            const SizedBox(height: 10),
-          ],
-
-          // ---- 通用 ----
-          _Group(
-            children: [
-              _Tile(
-                icon: Icons.swap_vert,
-                title: '传输记录',
-                onTap: () => Navigator.pushNamed(context, '/transfers'),
-              ),
-              const _SaveDirTile(),
-              const _ClearCacheTile(),
-              _Tile(
-                icon: Icons.playlist_play,
-                title: '多文件排队发送',
-                trailing: Switch(
-                  value: c.queueSends,
-                  onChanged: (v) => c.setQueueSends(v),
-                ),
-                onTap: () => c.setQueueSends(!c.queueSends),
-              ),
-              _Tile(
-                icon: Icons.dark_mode_outlined,
-                title: '深色模式',
-                trailing: Switch(
-                  value: c.darkMode,
-                  onChanged: (v) => c.setDarkMode(v),
-                ),
-                onTap: () => c.setDarkMode(!c.darkMode),
-              ),
-            ],
-          ),
-          const SizedBox(height: 10),
-
-          // ---- 诊断 ----
-          _Group(
-            children: [
-              _Tile(
-                icon: Icons.article_outlined,
-                title: '运行日志',
-                onTap: () => Navigator.pushNamed(context, '/log'),
-              ),
-            ],
-          ),
-          const SizedBox(height: 10),
-
-          // ---- 关于 ----
-          const _Group(
-            children: [
-              _Tile(
-                icon: Icons.info_outline,
-                title: '关于 cloudSend',
-                value: 'v1.0.0',
-              ),
-            ],
-          ),
-
-          const SizedBox(height: 24),
-          const Center(
-            child: Text(
-              '填写公网服务器地址，可以随时随地使用！',
-              style: TextStyle(fontSize: 11, color: AppTheme.grey),
-            ),
-          ),
-          const SizedBox(height: 24),
-        ],
-      ),
+      body: body,
     );
   }
 
@@ -170,17 +186,21 @@ class SettingsPage extends StatelessWidget {
                 color: AppTheme.lineOf(context),
               ),
             ),
-            const Padding(
-              padding: EdgeInsets.fromLTRB(16, 12, 16, 6),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 6),
               child: Text(
-                '功能模式',
-                style: TextStyle(fontSize: 12, color: AppTheme.grey),
+                tr('mode_title'),
+                style: const TextStyle(fontSize: 12, color: AppTheme.grey),
               ),
             ),
             for (final (mode, title, desc) in [
-              ('both', '局域网 + 中继 (推荐)', '优先走局域网直连；传输失败或离开局域网时自动切换中继保证连接'),
-              ('relay', '仅中继', '只通过中继服务器连接，关闭局域网发现与直连'),
-              ('lan', '仅局域网', '只在局域网内使用，不连接中继服务器'),
+              (
+                'both',
+                '${tr('mode_both')} ${tr('mode_both_rec')}',
+                tr('mode_both_desc'),
+              ),
+              ('relay', tr('mode_relay'), tr('mode_relay_desc')),
+              ('lan', tr('mode_lan'), tr('mode_lan_desc')),
             ])
               ListTile(
                 dense: true,
@@ -210,6 +230,19 @@ class SettingsPage extends StatelessWidget {
         ),
       ),
     );
+  }
+
+  /// 语言选择弹窗: 中文 / English
+  static Future<void> _pickLanguage(BuildContext context) async {
+    final v = await showActionDialog<String>(
+      context,
+      title: tr('language'),
+      actions: const [
+        (label: '中文', value: 'zh', danger: false),
+        (label: 'English', value: 'en', danger: false),
+      ],
+    );
+    if (v != null) l10n.setLang(v);
   }
 
   /// 弹窗编辑单个字段
@@ -244,14 +277,14 @@ class SettingsPage extends StatelessWidget {
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
             ),
             onPressed: () => Navigator.pop(ctx),
-            child: const Text('取消'),
+            child: Text(tr('cancel')),
           ),
           FilledButton(
             style: FilledButton.styleFrom(
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
             ),
             onPressed: () => Navigator.pop(ctx, ctrl.text.trim()),
-            child: const Text('确定'),
+            child: Text(tr('ok')),
           ),
         ],
       ),
@@ -274,7 +307,7 @@ class _Group extends StatelessWidget {
         children: [
           for (var i = 0; i < children.length; i++) ...[
             children[i],
-            if (i < children.length - 1) const Divider(height: 1, indent: 52),
+            if (i < children.length - 1) const Divider(height: 1, indent: 16),
           ],
         ],
       ),
@@ -282,21 +315,14 @@ class _Group extends StatelessWidget {
   }
 }
 
-/// 标准设置条目: 左图标 + 标题, 右灰色 value + 箭头
+/// 标准设置条目: 标题, 右灰色 value + 箭头
 class _Tile extends StatelessWidget {
-  final IconData icon;
   final String title;
   final String? value;
   final Widget? trailing;
   final VoidCallback? onTap;
 
-  const _Tile({
-    required this.icon,
-    required this.title,
-    this.value,
-    this.trailing,
-    this.onTap,
-  });
+  const _Tile({required this.title, this.value, this.trailing, this.onTap});
 
   @override
   Widget build(BuildContext context) {
@@ -305,23 +331,12 @@ class _Tile extends StatelessWidget {
       child: SizedBox(
         height: 52,
         child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 14),
+          padding: const EdgeInsets.symmetric(horizontal: 16),
           child: Row(
             children: [
-              Icon(
-                icon,
-                size: 22,
-                color: AppTheme.isDark(context)
-                    ? AppTheme.grey
-                    : const Color(0xFF555555),
-              ),
-              const SizedBox(width: 12),
               Text(
                 title,
-                style: TextStyle(
-                  fontSize: 14.5,
-                  color: AppTheme.inkOf(context),
-                ),
+                style: TextStyle(fontSize: 16, color: AppTheme.inkOf(context)),
               ),
               // value 用 Expanded + 右对齐, 短文本也紧贴右侧 (Spacer+Flexible
               // 会平分剩余空间导致短文本浮在中间)
@@ -402,8 +417,8 @@ class _ProfileCard extends StatelessWidget {
             child: InkWell(
               onTap: () => SettingsPage._editField(
                 context,
-                title: '用户名',
-                hint: '输入用户名',
+                title: tr('username'),
+                hint: tr('username_hint'),
                 initial: c.deviceName,
                 onSubmit: (v) {
                   if (v.isNotEmpty) c.setDeviceName(v);
@@ -424,9 +439,7 @@ class _ProfileCard extends StatelessWidget {
                   GestureDetector(
                     onTap: () {
                       Clipboard.setData(ClipboardData(text: c.deviceId));
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(content: Text('设备 ID 已复制')),
-                      );
+                      AppToast.show(context, tr('id_copied'));
                     },
                     child: Row(
                       mainAxisSize: MainAxisSize.min,
@@ -477,7 +490,10 @@ class _ProfileCard extends StatelessWidget {
               horizontalTitleGap: 8,
               contentPadding: const EdgeInsets.symmetric(horizontal: 14),
               leading: const Icon(Icons.photo_library_outlined, size: 15),
-              title: const Text('从文件中选择', style: TextStyle(fontSize: 12.5)),
+              title: Text(
+                tr('pick_from_file'),
+                style: const TextStyle(fontSize: 12.5),
+              ),
               onTap: () async {
                 Navigator.pop(ctx);
                 final r = await FilePicker.platform.pickFiles(
@@ -494,7 +510,10 @@ class _ProfileCard extends StatelessWidget {
                 horizontalTitleGap: 8,
                 contentPadding: const EdgeInsets.symmetric(horizontal: 14),
                 leading: const Icon(Icons.restart_alt, size: 15),
-                title: const Text('恢复默认', style: TextStyle(fontSize: 12.5)),
+                title: Text(
+                  tr('restore_default'),
+                  style: const TextStyle(fontSize: 12.5),
+                ),
                 onTap: () {
                   Navigator.pop(ctx);
                   c.setAvatar('');
@@ -540,7 +559,7 @@ class _NetworkGroupState extends State<_NetworkGroup> {
       }
     }
     final all = ifs.expand((i) => i.addresses).toList();
-    return all.isEmpty ? '无' : '${all.length} 个地址';
+    return all.isEmpty ? tr('none') : trf('n_addrs', {'n': all.length});
   }
 
   void _showIps(BuildContext context) {
@@ -564,11 +583,11 @@ class _NetworkGroupState extends State<_NetworkGroup> {
                 color: AppTheme.lineOf(context),
               ),
             ),
-            const Padding(
-              padding: EdgeInsets.fromLTRB(16, 12, 16, 6),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 6),
               child: Text(
-                '本机 IP 地址 (点按复制, 对方可输入此地址手动连接)',
-                style: TextStyle(fontSize: 12, color: AppTheme.grey),
+                tr('ip_sheet_title'),
+                style: const TextStyle(fontSize: 12, color: AppTheme.grey),
               ),
             ),
             Flexible(
@@ -598,9 +617,9 @@ class _NetworkGroupState extends State<_NetworkGroup> {
                           ),
                         ),
                         trailing: a.isLoopback
-                            ? const Text(
-                                '回环',
-                                style: TextStyle(
+                            ? Text(
+                                tr('loopback'),
+                                style: const TextStyle(
                                   fontSize: 11,
                                   color: AppTheme.grey,
                                 ),
@@ -608,8 +627,9 @@ class _NetworkGroupState extends State<_NetworkGroup> {
                             : null,
                         onTap: () {
                           Clipboard.setData(ClipboardData(text: a.address));
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            SnackBar(content: Text('已复制 ${a.address}')),
+                          AppToast.show(
+                            context,
+                            trf('copied_addr', {'addr': a.address}),
                           );
                         },
                       ),
@@ -648,26 +668,32 @@ class _NetworkGroupState extends State<_NetworkGroup> {
                 padding: const EdgeInsets.fromLTRB(16, 12, 8, 6),
                 child: Row(
                   children: [
-                    const Expanded(
+                    Expanded(
                       child: Text(
-                        '手动添加的设备',
-                        style: TextStyle(fontSize: 12, color: AppTheme.grey),
+                        tr('manual_devices_title'),
+                        style: const TextStyle(
+                          fontSize: 12,
+                          color: AppTheme.grey,
+                        ),
                       ),
                     ),
                     TextButton.icon(
-                      onPressed: () => showAddManualPeerDialog(context),
+                      onPressed: () => _showAddLanTargetDialog(context),
                       icon: const Icon(Icons.add, size: 15),
-                      label: const Text('添加', style: TextStyle(fontSize: 12)),
+                      label: Text(
+                        tr('add'),
+                        style: const TextStyle(fontSize: 12),
+                      ),
                     ),
                   ],
                 ),
               ),
               if (c.manualLanTargets.isEmpty)
-                const Padding(
-                  padding: EdgeInsets.fromLTRB(16, 4, 16, 12),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 4, 16, 12),
                   child: Text(
-                    '用于广播不可达的场景 (如 Android 模拟器)。\n添加后即使重启应用也会自动重连。',
-                    style: TextStyle(
+                    tr('manual_devices_desc'),
+                    style: const TextStyle(
                       fontSize: 11.5,
                       color: AppTheme.grey,
                       height: 1.5,
@@ -712,17 +738,15 @@ class _NetworkGroupState extends State<_NetworkGroup> {
     final c = context.watch<RelayClient>();
     return _Group(
       children: [
-        _Tile(icon: Icons.lan_outlined, title: '局域网直连', value: c.lanStatusText),
+        _Tile(title: tr('lan_direct'), value: c.lanStatusText),
         _Tile(
-          icon: Icons.wifi,
-          title: '本机 IP',
+          title: tr('local_ip'),
           value: _ipSummary,
           onTap: () => _showIps(context),
         ),
         _Tile(
-          icon: Icons.add_link,
-          title: '手动设备',
-          value: '${c.manualLanTargets.length} 个',
+          title: tr('manual_devices'),
+          value: trf('n_items', {'n': c.manualLanTargets.length}),
           onTap: () => _showManualPeers(context, c),
         ),
       ],
@@ -736,8 +760,7 @@ class _ServerStatusTile extends StatelessWidget {
   Widget build(BuildContext context) {
     final c = context.watch<RelayClient>();
     return _Tile(
-      icon: Icons.link,
-      title: '状态',
+      title: tr('status'),
       trailing: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
@@ -748,12 +771,12 @@ class _ServerStatusTile extends StatelessWidget {
           ),
           const SizedBox(width: 6),
           Text(
-            c.connected ? '已连接' : '未连接',
+            c.connected ? tr('connected') : tr('not_connected'),
             style: const TextStyle(fontSize: 13, color: AppTheme.grey),
           ),
           const SizedBox(width: 12),
           _PillButton(
-            label: c.connected ? '断开' : '连接',
+            label: c.connected ? tr('disconnect') : tr('connect'),
             filled: !c.connected,
             onTap: () {
               if (c.connected) {
@@ -761,8 +784,8 @@ class _ServerStatusTile extends StatelessWidget {
               } else if (c.serverAddr.isEmpty) {
                 SettingsPage._editField(
                   context,
-                  title: '服务器地址',
-                  hint: '例如 1.2.3.4:8787 或 ws://example.com/ws',
+                  title: tr('server_addr_title'),
+                  hint: tr('server_addr_hint'),
                   initial: c.serverAddr,
                   onSubmit: (v) {
                     if (v.isNotEmpty) c.connect(v);
@@ -818,13 +841,13 @@ class _ClearCacheTileState extends State<_ClearCacheTile> {
         backgroundColor: AppTheme.cardOf(context),
         surfaceTintColor: Colors.transparent,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-        title: const Text(
-          '清除缓存',
-          style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+        title: Text(
+          tr('clear_cache'),
+          style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
         ),
-        content: const Text(
-          '将清空临时文件 (含文件选择器复制的文件副本)，不影响已接收保存的文件。',
-          style: TextStyle(fontSize: 13),
+        content: Text(
+          tr('clear_cache_msg'),
+          style: const TextStyle(fontSize: 13),
         ),
         actionsPadding: const EdgeInsets.fromLTRB(14, 0, 14, 12),
         actions: [
@@ -833,14 +856,14 @@ class _ClearCacheTileState extends State<_ClearCacheTile> {
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
             ),
             onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('取消'),
+            child: Text(tr('cancel')),
           ),
           FilledButton(
             style: FilledButton.styleFrom(
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
             ),
             onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('清除'),
+            child: Text(tr('clear')),
           ),
         ],
       ),
@@ -849,9 +872,7 @@ class _ClearCacheTileState extends State<_ClearCacheTile> {
       await c.clearCache();
       await _load();
       if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(const SnackBar(content: Text('缓存已清除')));
+        AppToast.show(context, tr('cache_cleared'));
       }
     }
   }
@@ -860,8 +881,7 @@ class _ClearCacheTileState extends State<_ClearCacheTile> {
   Widget build(BuildContext context) {
     final c = context.read<RelayClient>();
     return _Tile(
-      icon: Icons.cleaning_services_outlined,
-      title: '清除缓存',
+      title: tr('clear_cache'),
       value: _bytes == null ? '…' : _fmt(_bytes!),
       onTap: () => _confirmClear(c),
     );
@@ -919,8 +939,7 @@ class _SaveDirTile extends StatelessWidget {
       builder: (_, snap) {
         final dir = snap.data ?? '';
         return _Tile(
-          icon: Icons.folder_open,
-          title: '文件保存位置',
+          title: tr('save_dir'),
           value: dir.isEmpty ? '…' : dir,
           onTap: dir.isEmpty ? null : () => _showMenu(context, c, dir),
         );
@@ -945,7 +964,7 @@ class _SaveDirTile extends StatelessWidget {
             const SizedBox(height: 2),
             _menuItem(
               icon: Icons.folder_open,
-              label: '打开文件夹',
+              label: tr('open_folder'),
               onTap: () {
                 Navigator.pop(ctx);
                 _openDir(context, dir);
@@ -953,30 +972,26 @@ class _SaveDirTile extends StatelessWidget {
             ),
             _menuItem(
               icon: Icons.drive_file_move_outline,
-              label: '更改保存位置',
+              label: tr('change_save_dir'),
               onTap: () async {
                 Navigator.pop(ctx);
                 final picked = await FilePicker.platform.getDirectoryPath();
                 if (picked != null && picked.isNotEmpty) {
                   await c.setDownloadDir(picked);
                   if (context.mounted) {
-                    ScaffoldMessenger.of(
-                      context,
-                    ).showSnackBar(const SnackBar(content: Text('保存位置已更新')));
+                    AppToast.show(context, tr('dir_updated'));
                   }
                 }
               },
             ),
             _menuItem(
               icon: Icons.restart_alt,
-              label: '恢复默认位置',
+              label: tr('reset_save_dir'),
               onTap: () async {
                 Navigator.pop(ctx);
                 await c.setDownloadDir(null);
                 if (context.mounted) {
-                  ScaffoldMessenger.of(
-                    context,
-                  ).showSnackBar(const SnackBar(content: Text('已恢复默认保存位置')));
+                  AppToast.show(context, tr('dir_reset'));
                 }
               },
             ),
@@ -1013,17 +1028,83 @@ class _SaveDirTile extends StatelessWidget {
         await Process.run('xdg-open', [dir]);
       } else {
         if (context.mounted) {
-          ScaffoldMessenger.of(
-            context,
-          ).showSnackBar(SnackBar(content: Text('文件保存于: $dir')));
+          AppToast.show(context, trf('dir_saved_to', {'dir': dir}));
         }
       }
     } catch (_) {
       if (context.mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(const SnackBar(content: Text('无法打开文件夹')));
+        AppToast.show(context, tr('open_folder_fail'));
       }
     }
+  }
+}
+
+/// 「手动设备 → 添加」对话框: 输入对端 IP[:端口] 强制建立局域网直连。
+/// 用于广播不可达的场景 (如 Android 模拟器, 填 10.0.2.2 可连宿主机)。
+Future<void> _showAddLanTargetDialog(BuildContext context) async {
+  final c = context.read<RelayClient>();
+  final ctrl = TextEditingController();
+  final input = await showDialog<String>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      backgroundColor: AppTheme.cardOf(context),
+      surfaceTintColor: Colors.transparent,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      title: Text(
+        tr('manual_devices'),
+        style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+      ),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          TextField(
+            controller: ctrl,
+            autofocus: true,
+            keyboardType: TextInputType.url,
+            decoration: InputDecoration(hintText: tr('lan_target_hint')),
+            onSubmitted: (_) => Navigator.pop(ctx, ctrl.text.trim()),
+          ),
+          const SizedBox(height: 10),
+          Text(
+            tr('lan_target_desc'),
+            style: const TextStyle(
+              fontSize: 11,
+              color: AppTheme.grey,
+              height: 1.5,
+            ),
+          ),
+        ],
+      ),
+      actionsPadding: const EdgeInsets.fromLTRB(14, 0, 14, 12),
+      actions: [
+        OutlinedButton(
+          style: OutlinedButton.styleFrom(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+          ),
+          onPressed: () => Navigator.pop(ctx),
+          child: Text(tr('cancel')),
+        ),
+        FilledButton(
+          style: FilledButton.styleFrom(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+          ),
+          onPressed: () => Navigator.pop(ctx, ctrl.text.trim()),
+          child: Text(tr('connect')),
+        ),
+      ],
+    ),
+  );
+  // showDialog 完成时退出动画仍在播放, TextField 还在树里;
+  // 立即 dispose 会让动画重建崩 "used after disposed", 延迟到动画结束
+  Future<void>.delayed(const Duration(milliseconds: 300), ctrl.dispose);
+  if (input == null || input.isEmpty || !context.mounted) return;
+  AppToast.show(context, tr('connecting'), sticky: true);
+  final peerId = await c.addManualLanPeer(input);
+  if (!context.mounted) return;
+  if (peerId != null) {
+    AppToast.show(context, trf('connected_to', {'name': c.peerName(peerId)}));
+  } else {
+    AppToast.show(context, tr('connect_fail'));
   }
 }

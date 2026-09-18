@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 
+import 'l10n.dart';
 import 'models.dart';
 
 /// 通知栏「全部取消」按钮 id
@@ -47,8 +48,8 @@ class TransferForegroundService {
     FlutterForegroundTask.init(
       androidNotificationOptions: AndroidNotificationOptions(
         channelId: 'transfer_service',
-        channelName: '文件传输',
-        channelDescription: '文件传输期间保持应用存活',
+        channelName: tr('notif_channel'),
+        channelDescription: tr('notif_channel_desc'),
         onlyAlertOnce: true,
         channelImportance: NotificationChannelImportance.LOW,
         priority: NotificationPriority.LOW,
@@ -87,17 +88,17 @@ class TransferForegroundService {
       final speed = active.fold<double>(0, (a, t) => a + t.speedBps);
       final base = active.length == 1
           ? '${active.first.fileName} $pct%'
-          : '${active.length} 个文件 $pct%';
+          : '${trf('n_files', {'n': active.length})} $pct%';
       final text = speed > 0 ? '$base · ${_fmtSpeed(speed)}' : base;
       if (!_running) {
         _running = true;
         _lastUpdate = DateTime.now().millisecondsSinceEpoch;
         await FlutterForegroundTask.startService(
           serviceId: 256,
-          notificationTitle: 'cloudSend 正在传输',
+          notificationTitle: tr('notif_title'),
           notificationText: text,
-          notificationButtons: const [
-            NotificationButton(id: _kBtnCancel, text: '全部取消'),
+          notificationButtons: [
+            NotificationButton(id: _kBtnCancel, text: tr('cancel_all')),
           ],
           callback: _startCallback,
         );
@@ -107,10 +108,10 @@ class TransferForegroundService {
         if (now - _lastUpdate < 500) return;
         _lastUpdate = now;
         await FlutterForegroundTask.updateService(
-          notificationTitle: 'cloudSend 正在传输',
+          notificationTitle: tr('notif_title'),
           notificationText: text,
-          notificationButtons: const [
-            NotificationButton(id: _kBtnCancel, text: '全部取消'),
+          notificationButtons: [
+            NotificationButton(id: _kBtnCancel, text: tr('cancel_all')),
           ],
         );
       }

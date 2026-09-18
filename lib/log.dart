@@ -4,6 +4,8 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 
+import 'l10n.dart';
+
 /// 轻量文件日志: 单文件滚动 (超过 1MB 时截断保留尾部 512KB)。
 /// 关键路径 (连接/传输/协议异常) 都写一份, 设置页可查看/导出/清空。
 class Log {
@@ -75,7 +77,7 @@ class Log {
   static Future<String> readTail({int maxBytes = 128 * 1024}) async {
     flush();
     final f = _file;
-    if (f == null || !await f.exists()) return '(暂无日志)';
+    if (f == null || !await f.exists()) return tr('no_log_yet');
     try {
       final len = await f.length();
       final raf = await f.open();
@@ -87,9 +89,9 @@ class Log {
         final nl = text.indexOf('\n');
         if (nl >= 0) text = text.substring(nl + 1);
       }
-      return text.isEmpty ? '(暂无日志)' : text;
+      return text.isEmpty ? tr('no_log_yet') : text;
     } catch (err) {
-      return '(读取日志失败: $err)';
+      return trf('log_read_fail', {'err': err});
     }
   }
 

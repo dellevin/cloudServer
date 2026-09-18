@@ -4,16 +4,20 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:media_kit/media_kit.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:provider/provider.dart';
 import 'package:window_manager/window_manager.dart';
 
 import 'client.dart';
+import 'l10n.dart';
 import 'models.dart';
 import 'ui/chat_page.dart';
 import 'ui/chat_search_page.dart';
+import 'ui/blocklist_page.dart';
 import 'ui/devices_page.dart';
 import 'ui/file_preview_page.dart';
 import 'ui/log_page.dart';
+import 'ui/remote_fs_page.dart';
 import 'ui/settings_page.dart';
 import 'ui/transfers_page.dart';
 import 'ui/video_player_page.dart';
@@ -25,6 +29,9 @@ void main() async {
   // Android 前台服务通信端口 (必须在 runApp 前初始化)
   if (Platform.isAndroid) {
     FlutterForegroundTask.initCommunicationPort();
+    // 启动即请求「所有文件访问」(远程文件浏览的被浏览方需要,
+    // 打开的是系统设置页, 用户允许后返回)
+    unawaited(_requestAllFilesAccess());
   }
   // Windows: 固定宽度窗口 + 自定义标题栏 (仅最小化/关闭, 无最大化)
   if (Platform.isWindows) {
@@ -45,9 +52,20 @@ void main() async {
   }
   final client = RelayClient();
   await client.init();
+  await l10n.init();
   runApp(
     ChangeNotifierProvider.value(value: client, child: const CloudSendApp()),
   );
+}
+
+/// 启动时请求「所有文件访问」权限 (已授权则直接跳过, 不打扰)
+Future<void> _requestAllFilesAccess() async {
+  try {
+    final st = await Permission.manageExternalStorage.status;
+    if (!st.isGranted) {
+      await Permission.manageExternalStorage.request();
+    }
+  } catch (_) {}
 }
 
 /// 微信风格主题
@@ -435,9 +453,9 @@ class _CloudSendAppState extends State<CloudSendApp> {
             borderRadius: BorderRadius.circular(8),
             side: BorderSide(color: AppTheme.lineOf(dctx)),
           ),
-          title: const Text(
-            '连接已断开',
-            style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+          title: Text(
+            tr('dlg_disconnected'),
+            style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
           ),
           content: Text(
             RelayClient.blockedText(reason),
@@ -453,7 +471,7 @@ class _CloudSendAppState extends State<CloudSendApp> {
                 ),
               ),
               onPressed: () => Navigator.pop(dctx, false),
-              child: const Text('知道了'),
+              child: Text(tr('got_it')),
             ),
             FilledButton(
               style: FilledButton.styleFrom(
@@ -463,7 +481,7 @@ class _CloudSendAppState extends State<CloudSendApp> {
                 ),
               ),
               onPressed: () => Navigator.pop(dctx, true),
-              child: const Text('重新连接'),
+              child: Text(tr('reconnect')),
             ),
           ],
         ),
@@ -480,41 +498,51 @@ class _CloudSendAppState extends State<CloudSendApp> {
 
   @override
   Widget build(BuildContext context) {
-    final c = context.watch<RelayClient>();
+    // 只关心深色模式和踢线原因: 传输进度等高频 notify 不再重建整棵 MaterialApp
+    final (darkMode, blockedReason) = context
+        .select<RelayClient, (bool, String?)>(
+          (c) => (c.darkMode, c.blockedReason),
+        );
+    final c = context.read<RelayClient>();
     // 被服务器踢下线/拉黑时弹全局提示 (build 里不能直接弹窗, 延后到帧末)
-    if (c.blockedReason != null) {
+    if (blockedReason != null) {
       WidgetsBinding.instance.addPostFrameCallback(
         (_) => _showBlockedDialog(c),
       );
     }
-    return MaterialApp(
-      title: 'cloudSend',
-      debugShowCheckedModeBanner: false,
-      theme: AppTheme.theme,
-      darkTheme: AppTheme.darkTheme,
-      themeMode: c.darkMode ? ThemeMode.dark : ThemeMode.light,
-      navigatorKey: _navigatorKey,
-      // Windows: 顶部叠加自定义标题栏
-      builder: Platform.isWindows
-          ? (ctx, child) => Column(
-              children: [
-                const _WindowTitleBar(),
-                Expanded(child: child ?? const SizedBox.shrink()),
-              ],
-            )
-          : null,
-      home: const HomePage(),
-      routes: {
-        '/chat': (_) => const ChatPage(),
-        '/chat_search': (_) => const ChatSearchPage(),
-        '/settings': (_) => const SettingsPage(),
-        '/file_preview': (_) => const FilePreviewPage(),
-        '/transfers': (_) => const TransfersPage(),
-        '/log': (_) => const LogPage(),
-        '/image_view': (_) => const ImageViewPage(),
-        '/video_view': (_) => const VideoPlayerPage(),
-        '/zip_view': (_) => const ZipPreviewPage(),
-      },
+    // 语言切换时整棵 MaterialApp 树重建
+    return ListenableBuilder(
+      listenable: l10n,
+      builder: (context, _) => MaterialApp(
+        title: 'cloudSend',
+        debugShowCheckedModeBanner: false,
+        theme: AppTheme.theme,
+        darkTheme: AppTheme.darkTheme,
+        themeMode: darkMode ? ThemeMode.dark : ThemeMode.light,
+        navigatorKey: _navigatorKey,
+        // Windows: 顶部叠加自定义标题栏
+        builder: Platform.isWindows
+            ? (ctx, child) => Column(
+                children: [
+                  const _WindowTitleBar(),
+                  Expanded(child: child ?? const SizedBox.shrink()),
+                ],
+              )
+            : null,
+        home: const HomePage(),
+        routes: {
+          '/chat': (_) => const ChatPage(),
+          '/chat_search': (_) => const ChatSearchPage(),
+          '/blocklist': (_) => const BlocklistPage(),
+          '/file_preview': (_) => const FilePreviewPage(),
+          '/transfers': (_) => const TransfersPage(),
+          '/log': (_) => const LogPage(),
+          '/image_view': (_) => const ImageViewPage(),
+          '/video_view': (_) => const VideoPlayerPage(),
+          '/zip_view': (_) => const ZipPreviewPage(),
+          '/remote_fs': (_) => const RemoteFsPage(),
+        },
+      ),
     );
   }
 }
@@ -684,7 +712,7 @@ class _FileOfferDialog extends StatelessWidget {
           ),
           const SizedBox(height: 10),
           Text(
-            '$name 向您发送文件',
+            trf('offer_sends_you', {'name': name}),
             style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
           ),
           const SizedBox(height: 14),
@@ -751,14 +779,14 @@ class _FileOfferDialog extends StatelessWidget {
             Expanded(
               child: OutlinedButton(
                 onPressed: () => _act(context, c, false),
-                child: const Text('拒绝'),
+                child: Text(tr('reject')),
               ),
             ),
             const SizedBox(width: 10),
             Expanded(
               child: FilledButton(
                 onPressed: () => _act(context, c, true),
-                child: const Text('接受'),
+                child: Text(tr('accept')),
               ),
             ),
           ],
@@ -776,13 +804,15 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage> {
-  int _tab = 0; // 0=设备 1=聊天
+  int _tab = 0; // 0=设备 1=聊天 2=设置
   int _chatSub = 0; // 聊天 tab 内: 0=消息 1=传输记录
 
   @override
   Widget build(BuildContext context) {
-    final c = context.watch<RelayClient>();
-    final unreadTotal = c.unread.values.fold(0, (a, b) => a + b);
+    // 只订阅未读总数: 其他高频通知 (传输进度等) 不重建首页骨架
+    final unreadTotal = context.select<RelayClient, int>(
+      (c) => c.unread.values.fold(0, (a, b) => a + b),
+    );
     return Scaffold(
       appBar: AppBar(
         title: _tab == 0
@@ -808,6 +838,8 @@ class _HomePageState extends State<HomePage> {
                   ),
                 ],
               )
+            : _tab == 2
+            ? Text(tr('settings'))
             : Align(
                 alignment: Alignment.centerLeft,
                 child: Container(
@@ -818,22 +850,22 @@ class _HomePageState extends State<HomePage> {
                     borderRadius: BorderRadius.circular(15.5),
                     border: Border.all(color: AppTheme.lineOf(context)),
                   ),
-                  child: Row(children: [_seg('消息', 0), _seg('传输记录', 1)]),
+                  child: Row(
+                    children: [
+                      _seg(tr('seg_messages'), 0),
+                      _seg(tr('seg_transfers'), 1),
+                    ],
+                  ),
                 ),
               ),
         actions: [
-          _RefreshAction(),
+          if (_tab < 2) _RefreshAction(),
           if (_tab == 1)
             _CircleAction(
-              tooltip: '搜索',
+              tooltip: tr('search'),
               icon: Icons.search,
               onTap: () => Navigator.pushNamed(context, '/chat_search'),
             ),
-          _CircleAction(
-            tooltip: '设置',
-            icon: Icons.settings_outlined,
-            onTap: () => Navigator.pushNamed(context, '/settings'),
-          ),
           const SizedBox(width: 10),
         ],
         bottom: const PreferredSize(
@@ -842,20 +874,25 @@ class _HomePageState extends State<HomePage> {
         ),
       ),
       body: IndexedStack(
-        index: _tab == 0 ? 0 : _chatSub + 1,
+        index: _tab == 0
+            ? 0
+            : _tab == 2
+            ? 3
+            : _chatSub + 1,
         children: const [
           DevicesPage(),
           ChatsTabPage(),
           TransfersPage(embedded: true),
+          SettingsPage(embedded: true),
         ],
       ),
       bottomNavigationBar: NavigationBar(
         selectedIndex: _tab,
         onDestinationSelected: (i) => setState(() => _tab = i),
         destinations: [
-          const NavigationDestination(
-            icon: Icon(Icons.devices_outlined),
-            label: '设备',
+          NavigationDestination(
+            icon: const Icon(Icons.devices_outlined),
+            label: tr('tab_devices'),
           ),
           NavigationDestination(
             icon: Badge.count(
@@ -863,7 +900,11 @@ class _HomePageState extends State<HomePage> {
               isLabelVisible: unreadTotal > 0,
               child: const Icon(Icons.chat_bubble_outline),
             ),
-            label: '聊天',
+            label: tr('tab_chat'),
+          ),
+          NavigationDestination(
+            icon: const Icon(Icons.settings_outlined),
+            label: tr('settings'),
           ),
         ],
       ),
@@ -973,7 +1014,7 @@ class _RefreshActionState extends State<_RefreshAction>
   @override
   Widget build(BuildContext context) {
     return _CircleAction(
-      tooltip: '刷新',
+      tooltip: tr('refresh'),
       icon: Icons.refresh,
       onTap: _refresh,
       child: RotationTransition(

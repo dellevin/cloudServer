@@ -4,8 +4,10 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../client.dart';
+import '../l10n.dart';
 import '../log.dart';
 import '../main.dart';
+import 'app_toast.dart';
 
 /// 运行日志查看页: 显示日志尾部, 可刷新/导出到下载目录/清空
 class LogPage extends StatefulWidget {
@@ -16,7 +18,7 @@ class LogPage extends StatefulWidget {
 }
 
 class _LogPageState extends State<LogPage> {
-  String _text = '加载中…';
+  late String _text = tr('loading');
   bool _exporting = false;
 
   @override
@@ -33,13 +35,14 @@ class _LogPageState extends State<LogPage> {
   Future<void> _export() async {
     if (_exporting) return;
     setState(() => _exporting = true);
+    final client = context.read<RelayClient>();
     try {
       final src = Log.filePath;
       if (src == null || !await File(src).exists()) {
-        _toast('暂无日志可导出');
+        _toast(tr('no_log'));
         return;
       }
-      final dir = await context.read<RelayClient>().downloadDir();
+      final dir = await client.downloadDir();
       final d = DateTime.now();
       String p2(int v) => v.toString().padLeft(2, '0');
       final dest =
@@ -47,9 +50,9 @@ class _LogPageState extends State<LogPage> {
           '${d.year}${p2(d.month)}${p2(d.day)}_'
           '${p2(d.hour)}${p2(d.minute)}${p2(d.second)}.txt';
       await File(src).copy(dest);
-      _toast('已导出: $dest');
+      _toast(trf('log_exported', {'dest': dest}));
     } catch (e) {
-      _toast('导出失败: $e');
+      _toast(trf('log_export_fail', {'e': e}));
     } finally {
       if (mounted) setState(() => _exporting = false);
     }
@@ -62,13 +65,13 @@ class _LogPageState extends State<LogPage> {
         backgroundColor: AppTheme.cardOf(dctx),
         surfaceTintColor: Colors.transparent,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-        title: const Text(
-          '清空日志',
-          style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+        title: Text(
+          tr('clear_log_title'),
+          style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
         ),
-        content: const Text(
-          '确定要清空全部运行日志吗？',
-          style: TextStyle(fontSize: 13, color: AppTheme.grey),
+        content: Text(
+          tr('clear_log_msg'),
+          style: const TextStyle(fontSize: 13, color: AppTheme.grey),
         ),
         actionsPadding: const EdgeInsets.fromLTRB(14, 0, 14, 12),
         actions: [
@@ -77,14 +80,14 @@ class _LogPageState extends State<LogPage> {
               padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
             ),
             onPressed: () => Navigator.pop(dctx, false),
-            child: const Text('取消'),
+            child: Text(tr('cancel')),
           ),
           FilledButton(
             style: FilledButton.styleFrom(
               padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
             ),
             onPressed: () => Navigator.pop(dctx, true),
-            child: const Text('清空'),
+            child: Text(tr('clear_all')),
           ),
         ],
       ),
@@ -97,7 +100,7 @@ class _LogPageState extends State<LogPage> {
 
   void _toast(String msg) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+    AppToast.show(context, msg);
   }
 
   @override
@@ -105,15 +108,15 @@ class _LogPageState extends State<LogPage> {
     return Scaffold(
       backgroundColor: AppTheme.softOf(context),
       appBar: AppBar(
-        title: const Text('运行日志'),
+        title: Text(tr('run_log')),
         actions: [
           IconButton(
-            tooltip: '刷新',
+            tooltip: tr('refresh'),
             icon: const Icon(Icons.refresh, size: 20),
             onPressed: _reload,
           ),
           IconButton(
-            tooltip: '导出到下载目录',
+            tooltip: tr('export_log'),
             icon: _exporting
                 ? const SizedBox(
                     width: 16,
@@ -124,7 +127,7 @@ class _LogPageState extends State<LogPage> {
             onPressed: _exporting ? null : _export,
           ),
           IconButton(
-            tooltip: '清空',
+            tooltip: tr('clear_all'),
             icon: const Icon(Icons.delete_outline, size: 20),
             onPressed: _clear,
           ),
