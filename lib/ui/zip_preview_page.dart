@@ -1,12 +1,35 @@
+import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:archive/archive_io.dart';
 import 'package:flutter/material.dart';
+import 'package:gbk_codec/gbk_codec.dart';
 import 'package:open_filex/open_filex.dart';
+import 'package:path/path.dart' as p;
 import 'package:provider/provider.dart';
 
 import '../client.dart';
 import '../main.dart';
+
+/// zip 文件名乱码修复: archive 包按 UTF-8 解码条目名, 失败时回退成
+/// 「每字节→一字符」的伪 latin1 字符串 (国产 Windows 压缩包多为 GBK 且
+/// 未设 UTF-8 标志位)。此时原始字节还在 codeUnits 里, 依序尝试还原:
+/// 严格 UTF-8 (有些包内容实为 UTF-8) → GBK
+String fixZipEntryName(String name) {
+  final units = name.codeUnits;
+  final hasHigh = units.any((u) => u > 0x7F);
+  if (!hasHigh || units.any((u) => u > 0xFF)) return name;
+  final bytes = Uint8List.fromList(units);
+  try {
+    return utf8.decode(bytes); // 严格模式, 非法序列抛异常
+  } catch (_) {}
+  try {
+    // 注意用 gbk_bytes: 同库的 gbk 解码器不会拼双字节, 解不出来
+    return gbk_bytes.decode(bytes);
+  } catch (_) {}
+  return name;
+}
 
 /// 压缩包预览页: 列出 zip 内容, 支持解压单个文件 / 全部解压到下载目录
 class ZipPreviewPage extends StatefulWidget {
@@ -34,6 +57,9 @@ class _ZipPreviewPageState extends State<ZipPreviewPage> {
     try {
       final input = InputFileStream(_path);
       final archive = ZipDecoder().decodeStream(input);
+      for (final f in archive.files) {
+        f.name = fixZipEntryName(f.name);
+      }
       final files = archive.files.where((f) => f.isFile).toList();
       await input.close();
       if (mounted) setState(() => _files = files);
@@ -79,7 +105,8 @@ class _ZipPreviewPageState extends State<ZipPreviewPage> {
       try {
         final archive = ZipDecoder().decodeStream(input);
         for (final file in archive.files) {
-          if (file.name == f.name && file.isFile) {
+          // 重新解码得到的是未修复的名字, 先修复再与列表项比对
+          if (fixZipEntryName(file.name) == f.name && file.isFile) {
             out = OutputFileStream(dest);
             file.writeContent(out);
             break;
@@ -120,7 +147,30 @@ class _ZipPreviewPageState extends State<ZipPreviewPage> {
         folder = '${folder}_1';
       }
       await Directory(folder).create(recursive: true);
-      await extractFileToDisk(_path, folder);
+      // 不用 extractFileToDisk: 解压前要先修复条目名, 并拦掉 ../ 越界路径
+      final input = InputFileStream(_path);
+      try {
+        final archive = ZipDecoder().decodeStream(input);
+        for (final file in archive.files) {
+          final name = fixZipEntryName(file.name);
+          final segs = name.split(RegExp(r'[\\/]'));
+          if (segs.contains('..')) continue;
+          final outPath = p.joinAll([folder, ...segs]);
+          if (!file.isFile) {
+            await Directory(outPath).create(recursive: true);
+            continue;
+          }
+          await Directory(p.dirname(outPath)).create(recursive: true);
+          final out = OutputFileStream(outPath);
+          try {
+            file.writeContent(out);
+          } finally {
+            await out.close();
+          }
+        }
+      } finally {
+        await input.close();
+      }
       messenger.showSnackBar(
         SnackBar(
           content: Text('已解压到: $folder'),

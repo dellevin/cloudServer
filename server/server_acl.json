@@ -1,0 +1,16 @@
+{
+  "mode": "whitelist",
+  "black": {
+    "ids": [],
+    "ips": []
+  },
+  "white": {
+    "ids": [
+      "a60b3f48-a2c0-4776-90b7-30bc97335ca6",
+      "05aafce0-ced2-429a-9fed-283b9b9c709f"
+    ],
+    "ips": [
+      "192.168.31.48"
+    ]
+  }
+}

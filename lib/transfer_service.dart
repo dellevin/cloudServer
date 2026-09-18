@@ -65,6 +65,11 @@ class TransferForegroundService {
     });
   }
 
+  static String _fmtSpeed(double bps) {
+    if (bps < 1024 * 1024) return '${(bps / 1024).toStringAsFixed(0)} KB/s';
+    return '${(bps / 1024 / 1024).toStringAsFixed(1)} MB/s';
+  }
+
   /// 根据进行中的传输同步服务状态 (启动 / 更新进度 / 停止)
   static Future<void> sync(List<FileTransfer> active) async {
     if (!Platform.isAndroid || !_initialized) return;
@@ -79,9 +84,11 @@ class TransferForegroundService {
       final total = active.fold<int>(0, (a, t) => a + t.fileSize);
       final done = active.fold<int>(0, (a, t) => a + t.bytesDone);
       final pct = total > 0 ? done * 100 ~/ total : 0;
-      final text = active.length == 1
+      final speed = active.fold<double>(0, (a, t) => a + t.speedBps);
+      final base = active.length == 1
           ? '${active.first.fileName} $pct%'
           : '${active.length} 个文件 $pct%';
+      final text = speed > 0 ? '$base · ${_fmtSpeed(speed)}' : base;
       if (!_running) {
         _running = true;
         _lastUpdate = DateTime.now().millisecondsSinceEpoch;

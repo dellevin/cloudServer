@@ -114,6 +114,48 @@ Future<void> openTransferWith(BuildContext context, FileTransfer t) async {
   }
 }
 
+/// 打开文件所在位置 (Windows 资源管理器定位并选中; macOS Finder 显示;
+/// Linux/Android 打开所在目录, 失败则提示路径)
+Future<void> revealTransferInFolder(
+  BuildContext context,
+  FileTransfer t,
+) async {
+  final path = t.savePath;
+  if (path == null || !File(path).existsSync()) {
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('文件不存在或已被移动')));
+    return;
+  }
+  try {
+    if (Platform.isWindows) {
+      // explorer 成功也可能返回非零退出码, 不据此举异常
+      await Process.run('explorer.exe', [
+        '/select,${path.replaceAll('/', '\\')}',
+      ]);
+      return;
+    }
+    if (Platform.isMacOS) {
+      await Process.run('open', ['-R', path]);
+      return;
+    }
+    final dir = File(path).parent.path;
+    if (Platform.isAndroid) {
+      // 部分文件管理器能处理目录打开, 不行则落到下面提示路径
+      final r = await OpenFilex.open(dir);
+      if (r.type == ResultType.done) return;
+    } else {
+      await Process.run('xdg-open', [dir]);
+      return;
+    }
+  } catch (_) {}
+  if (context.mounted) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('文件位于: ${File(path).parent.path}')),
+    );
+  }
+}
+
 /// 删除确认对话框 (与消息列表删除会话弹窗一致的风格)
 /// 返回 'record' / 'both' / null(取消)
 Future<String?> confirmDeleteDialog(

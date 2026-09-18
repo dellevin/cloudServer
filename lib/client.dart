@@ -16,6 +16,8 @@ import 'package:uuid/uuid.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import 'db.dart';
+import 'lan.dart';
+import 'log.dart';
 import 'models.dart';
 import 'transfer_service.dart';
 
@@ -32,6 +34,10 @@ import 'transfer_service.dart';
 ///  - file_accept 带 offset: 已收字节数, 发送端从该偏移续传
 ///  - file_progress: 接收端每收 2MB 回执一次, 发送端 8MB 窗口背压
 ///  - file_done 带 sha256, 接收端校验后回 file_result {ok}
+///
+/// 局域网直连 (见 lan.dart):
+///  - UDP 广播自动发现同网段设备, peers 为中继+局域网合并列表
+///  - 对端在局域网内时控制消息和二进制块优先走 TCP 直连, 失败回退中继
 class RelayClient extends ChangeNotifier {
   String deviceId = '';
   String deviceName = '';
@@ -39,16 +45,47 @@ class RelayClient extends ChangeNotifier {
   String serverAddr = '';
   bool connected = false;
   bool darkMode = false;
-  List<Peer> peers = [];
+
+  /// 功能模式: both=局域网+中继 (默认, 局域网优先, 失败/离网自动切中继)
+  /// relay=仅中继 (停用局域网发现与直连) / lan=仅局域网 (不连中继)
+  String connMode = 'both';
+  bool get _lanActive => connMode != 'relay';
+  bool get _relayActive => connMode != 'lan';
+
+  /// 多文件排队发送: 同一对端同时只传一个, 避免带宽互抢 (默认开)
+  bool queueSends = true;
+
+  /// 信任的设备 (设备ID): 这些设备发来的文件自动接受, 不再弹窗询问
+  Set<String> trustedPeers = {};
+  List<Peer> peers = []; // 中继 + 局域网合并后的在线设备
+  List<Peer> _relayPeers = []; // 仅中继服务器下发的在线设备
+  Set<String> _relayIds = {};
+  List<String> manualLanTargets = []; // 手动添加的局域网设备 "ip:port"
   final List<FileTransfer> transfers = [];
   final Map<String, List<ChatMessage>> chats = {};
   final Map<String, int> unread = {};
+
+  late LanManager _lan; // 仅中继模式下为已 dispose 的空实例 (不启动发现/直连)
 
   WebSocketChannel? _ch;
   Timer? _reconnectTimer;
   bool _manualClose = false;
   int _retryCount = 0; // 重连次数 (指数退避用, 连上后归零)
   bool _svcSyncPending = false;
+
+  /// 被服务器拒绝的原因 (kick=踢下线/black_id=拉黑ID/black_ip=拉黑IP/white=不在白名单)
+  /// null=正常; 被拦后停止自动重连, 由用户手动重连 (connect 时清除)
+  String? blockedReason;
+
+  /// 被拦原因 → 用户可读文案
+  static String blockedText(String reason) => switch (reason) {
+    'kick' => '你已被管理员踢下线',
+    'black_id' => '你的设备已被管理员拉黑 (设备ID)',
+    'black_ip' => '当前 IP 已被管理员拉黑',
+    'white' => '你的设备不在服务器白名单内',
+    'rate' => '操作过于频繁，已被服务器暂时断开',
+    _ => '服务器拒绝了连接',
+  };
 
   /// 传输状态变化时同步 Android 前台服务 (microtask 节流)
   @override
@@ -113,7 +150,17 @@ class RelayClient extends ChangeNotifier {
   final Set<String> _unverified = {}; // 已发完但尚未收到接收端校验结果的 transferId
   int _lastNotifyBytes = 0;
 
+  // ---- 发送队列 (queueSends 开启时, 同一对端串行发送) ----
+  final Set<String> _sendingPeers = {}; // 当前有发送任务在跑的对端
+  final Map<String, List<String>> _sendQueue = {}; // peerId -> 排队中的 transferId
+  final Map<String, int> _queuedOffsets = {}; // 排队中 transferId 的续传偏移
+
+  /// 该传输是否在发送队列中排队 (UI 显示「排队中」用)
+  bool isSendQueued(String tid) =>
+      _sendQueue.values.any((l) => l.contains(tid));
+
   Future<void> init() async {
+    await Log.init();
     final sp = await SharedPreferences.getInstance();
     deviceId = sp.getString('deviceId') ?? const Uuid().v4();
     await sp.setString('deviceId', deviceId);
@@ -121,6 +168,11 @@ class RelayClient extends ChangeNotifier {
     await sp.setString('deviceName', deviceName);
     avatarPath = sp.getString('avatarPath') ?? '';
     serverAddr = sp.getString('serverAddr') ?? '';
+    connMode = sp.getString('connMode') ?? 'both';
+    queueSends = sp.getBool('queueSends') ?? true;
+    trustedPeers = (sp.getStringList('trustedPeers') ?? []).toSet();
+    Log.i('app', 'init: id=$deviceId name=$deviceName mode=$connMode '
+        'queue=$queueSends trusted=${trustedPeers.length}');
     _downloadDirOverride = sp.getString('downloadDir');
     darkMode = sp.getBool('darkMode') ?? false;
     // 恢复未读数 (重启不丢角标)
@@ -133,15 +185,24 @@ class RelayClient extends ChangeNotifier {
       } catch (_) {}
     }
     TransferForegroundService.init();
+    // 手动添加的局域网设备列表 (局域网/混合模式启动时自动重连)
+    manualLanTargets = sp.getStringList('manualLanPeers') ?? [];
+    // 局域网发现: 广播自身 + 监听同网段设备 (仅中继模式不启动, 但保留空实例)
+    if (_lanActive) {
+      _startLan();
+    } else {
+      _lan = _createLan();
+    }
     // 通知栏「全部取消」: 取消所有进行中的传输
     TransferForegroundService.onCancelAll = () {
-      for (final t in transfers
-          .where(
-            (t) =>
-                t.status == TransferStatus.accepted ||
-                t.status == TransferStatus.transferring,
-          )
-          .toList()) {
+      for (final t
+          in transfers
+              .where(
+                (t) =>
+                    t.status == TransferStatus.accepted ||
+                    t.status == TransferStatus.transferring,
+              )
+              .toList()) {
         cancelTransfer(t);
       }
     };
@@ -149,7 +210,107 @@ class RelayClient extends ChangeNotifier {
     _initLifecycle();
     await _restoreLocalData();
     _updateBadge();
-    if (serverAddr.isNotEmpty) connect(serverAddr);
+    if (serverAddr.isNotEmpty && _relayActive) connect(serverAddr);
+  }
+
+  /// 构造局域网管理器 (未启动状态; 仅中继模式下作为空实例占位)
+  LanManager _createLan() => LanManager(
+    deviceId: deviceId,
+    getName: () => deviceName,
+    getAvatarB64: _avatarBase64,
+  );
+
+  /// 启动局域网发现与直连 (both/lan 模式)
+  void _startLan() {
+    _lan = _createLan();
+    _lan.onPeersChanged = () {
+      _rebuildPeers();
+      _abortTransfersWithOfflinePeers();
+      _resendUndelivered();
+    };
+    _lan.onFrame = _onData; // 直连通道的消息与中继走同一处理
+    _lan.onLinkClosed = (_) {
+      _abortTransfersWithOfflinePeers();
+      // 直连断开时可能有消息写进了死连接, 立即重发未送达消息 (走中继/新直连)
+      _resendUndelivered();
+      notifyListeners();
+    };
+    unawaited(
+      _lan.start().then((_) => Log.i('lan', 'started: $lanStatusText')),
+    );
+    for (final t in List.of(manualLanTargets)) {
+      unawaited(_connectManual(t, persist: false));
+    }
+  }
+
+  /// 停止局域网发现与直连 (切到仅中继模式时调用)
+  Future<void> _stopLan() async {
+    final lan = _lan;
+    lan.onPeersChanged = null;
+    lan.onFrame = null;
+    lan.onLinkClosed = null;
+    await lan.dispose();
+    lan.peers.clear();
+    lan.links.clear();
+    _lanFailCount.clear();
+    _lanFailUntil.clear();
+    _lan = _createLan(); // 换上空实例, 避免后续误触已 dispose 的对象
+  }
+
+  /// 切换功能模式 (设置页): 按需启动/停止局域网与中继
+  Future<void> setConnMode(String mode) async {
+    assert(mode == 'both' || mode == 'relay' || mode == 'lan');
+    if (mode == connMode) return;
+    final wasLan = _lanActive; // 赋值前捕获, 避免 lan→both 重复启动局域网
+    connMode = mode;
+    (await SharedPreferences.getInstance()).setString('connMode', mode);
+    if (_lanActive && !wasLan) {
+      _startLan();
+    } else if (!_lanActive && wasLan) {
+      await _stopLan();
+    }
+    if (!_relayActive) {
+      blockedReason = null; // 仅局域网模式下被踢状态无意义
+      disconnect();
+    } else if (!connected && serverAddr.isNotEmpty) {
+      unawaited(connect(serverAddr));
+    }
+    _rebuildPeers();
+    notifyListeners();
+  }
+
+  /// 下拉刷新 (设备页/聊天页): 局域网立即重播宣告 + 补连掉线的手动设备;
+  /// 中继重新 register 换取最新在线列表 (服务器覆盖旧条目并广播 peers),
+  /// 未连接时下拉等同于手动重连。顺带补发未送达消息。
+  Future<void> refreshPeers() async {
+    if (_lanActive) {
+      unawaited(_lan.announceNow());
+      for (final t in List.of(manualLanTargets)) {
+        final linked = _lan.peers.entries.any(
+          (e) =>
+              e.value.manualTarget == t && _lan.links[e.key]?.closed == false,
+        );
+        if (!linked) unawaited(_connectManual(t, persist: false));
+      }
+    }
+    if (_relayActive) {
+      if (connected) {
+        _ch?.sink.add(
+          jsonEncode({
+            'type': 'register',
+            'id': deviceId,
+            'name': deviceName,
+            'avatar': await _avatarBase64(),
+            'ver': kProtocolVersion,
+          }),
+        );
+      } else if (serverAddr.isNotEmpty) {
+        unawaited(connect(serverAddr));
+      }
+    }
+    unawaited(_resendUndelivered());
+    // 给 UDP 回应/中继回包留点时间, 也让刷新动画有最低时长
+    await Future.delayed(const Duration(milliseconds: 800));
   }
 
   /// 启动时恢复聊天会话列表和历史传输记录
@@ -191,16 +352,26 @@ class RelayClient extends ChangeNotifier {
           ),
           android: AndroidInitializationSettings('@mipmap/ic_launcher'),
         ),
+        // 点击通知跳转到对应会话 (payload = 对端 peerId)
+        onDidReceiveNotificationResponse: (resp) {
+          final p = resp.payload;
+          if (p != null && p.isNotEmpty) {
+            Log.i('notify', 'notification tapped, open chat $p');
+            onNotificationOpenChat?.call(p);
+          }
+        },
       );
       await _notifications
           .resolvePlatformSpecificImplementation<
             AndroidFlutterLocalNotificationsPlugin
           >()
           ?.requestNotificationsPermission();
-    } catch (_) {}
+    } catch (e) {
+      Log.e('notify', 'init notifications failed', e);
+    }
   }
 
-  void _notify(String title, String body) {
+  void _notify(String title, String body, {String? payload}) {
     // Windows 端不弹系统通知 (应用内弹窗 + 未读角标已足够)
     if (Platform.isWindows) return;
     try {
@@ -217,6 +388,7 @@ class RelayClient extends ChangeNotifier {
             priority: Priority.high,
           ),
         ),
+        payload: payload,
       );
     } catch (_) {}
   }
@@ -285,8 +457,38 @@ class RelayClient extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// 切换多文件排队发送 (持久化)
+  Future<void> setQueueSends(bool v) async {
+    queueSends = v;
+    (await SharedPreferences.getInstance()).setBool('queueSends', v);
+    Log.i('app', 'queueSends -> $v');
+    notifyListeners();
+  }
+
+  bool isTrusted(String peerId) => trustedPeers.contains(peerId);
+
+  /// 信任/取消信任设备: 信任的设备发来的文件自动接受 (持久化)
+  Future<void> setTrusted(String peerId, bool v) async {
+    if (v) {
+      trustedPeers.add(peerId);
+    } else {
+      trustedPeers.remove(peerId);
+    }
+    (await SharedPreferences.getInstance()).setStringList(
+      'trustedPeers',
+      trustedPeers.toList(),
+    );
+    Log.i('app', 'trusted $peerId -> $v');
+    notifyListeners();
+  }
+
+  /// 系统通知被点击时的回调 (参数为对端 peerId), 由 UI 层注册用于跳转会话
+  void Function(String peerId)? onNotificationOpenChat;
+
   Future<void> connect(String addr) async {
+    if (!_relayActive) return; // 仅局域网模式下不连中继
     serverAddr = addr.trim();
+    blockedReason = null; // 手动/自动重连都视作新一轮, 清除被拦标记
     (await SharedPreferences.getInstance()).setString('serverAddr', serverAddr);
     disconnect();
     _manualClose = false;
@@ -306,15 +508,18 @@ class RelayClient extends ChangeNotifier {
           'id': deviceId,
           'name': deviceName,
           'avatar': await _avatarBase64(),
+          'ver': kProtocolVersion,
         }),
       );
       connected = true;
       _retryCount = 0;
       notifyListeners();
+      Log.i('relay', 'connected: $uri');
       _ch!.stream.listen(_onData, onDone: _onLost, onError: (_) => _onLost());
-    } catch (_) {
+    } catch (e) {
       connected = false;
       notifyListeners();
+      Log.e('relay', 'connect $uri failed', e);
       if (!_manualClose) _scheduleReconnect();
     }
   }
@@ -325,15 +530,36 @@ class RelayClient extends ChangeNotifier {
     _ch?.sink.close();
     _ch = null;
     connected = false;
-    peers = [];
+    _relayPeers = [];
+    _relayIds = {};
+    _rebuildPeers(); // 局域网设备不受中继断开影响
+  }
+
+  /// 被服务器踢下线/拉黑/白名单拦截: 停止自动重连, 等用户手动重连
+  void _onBlocked(String reason) {
+    blockedReason = reason;
+    Log.w('relay', 'blocked by server: $reason');
+    _notify('连接被服务器断开', blockedText(reason));
+    disconnect(); // 置 _manualClose, _onLost 不再安排重连
+    notifyListeners();
+  }
+
+  /// 用户已知晓被拦提示 (保持断开状态; 重连后由 connect 清除)
+  void clearBlocked() {
+    blockedReason = null;
     notifyListeners();
   }
 
   void _onLost() {
     connected = false;
-    peers = [];
-    // 断线时进行中的传输标记失败 (接收侧保留 .part, 可断点续传)
+    _relayPeers = [];
+    _relayIds = {};
+    _rebuildPeers();
+    if (!_manualClose) Log.w('relay', 'connection lost');
+    // 断线时进行中的传输标记失败 (接收侧保留 .part, 可断点续传);
+    // 走局域网直连的传输不受中继掉线影响
     for (final t in transfers) {
+      if (_lanActive && _lan.links.containsKey(t.peerId)) continue;
       if (t.status == TransferStatus.transferring ||
           t.status == TransferStatus.accepted) {
         t.status = TransferStatus.failed;
@@ -352,33 +578,223 @@ class RelayClient extends ChangeNotifier {
   }
 
   void _scheduleReconnect() {
-    if (serverAddr.isEmpty) return;
+    if (serverAddr.isEmpty || !_relayActive) return;
     _reconnectTimer?.cancel();
     // 指数退避: 3s → 6s → 12s → 24s → 48s → 60s 封顶
     final secs = (3 << _retryCount).clamp(3, 60);
     if (_retryCount < 5) _retryCount++;
-    _reconnectTimer = Timer(
-      Duration(seconds: secs),
-      () => connect(serverAddr),
-    );
+    Log.i('relay', 'reconnect in ${secs}s (retry #$_retryCount)');
+    _reconnectTimer = Timer(Duration(seconds: secs), () => connect(serverAddr));
   }
 
-  void _send(Map<String, dynamic> msg) => _ch?.sink.add(jsonEncode(msg));
+  /// 合并中继在线列表与局域网发现列表 (同一设备两边都在时标记为两者)
+  void _rebuildPeers() {
+    // 头像变化时让缓存失效 (与旧列表对比)
+    final oldAvatar = {for (final p in peers) p.id: p.avatar};
+    final map = <String, Peer>{};
+    for (final p in _relayPeers) {
+      map[p.id] = Peer(
+        id: p.id,
+        name: p.name,
+        avatar: p.avatar,
+        viaRelay: true,
+      );
+    }
+    if (_lanActive) {
+      for (final e in _lan.peers.entries) {
+        final info = e.value;
+        final ex = map[e.key];
+        map[e.key] = Peer(
+          id: info.id,
+          name: ex?.name ?? info.name,
+          avatar: ex?.avatar ?? info.avatar,
+          viaRelay: ex != null,
+          viaLan: true,
+        );
+      }
+    }
+    for (final p in map.values) {
+      if (oldAvatar[p.id] != p.avatar) _avatarBytesCache.remove(p.id);
+    }
+    peers = map.values.toList();
+    notifyListeners();
+  }
+
+  /// 发送控制消息; 对端在局域网内时优先走直连, 连不上回退中继
+  void _send(Map<String, dynamic> msg) {
+    final to = msg['to'] as String?;
+    if (to != null && _lanActive && _lan.peers.containsKey(to)) {
+      unawaited(_sendViaLan(to, msg));
+      return;
+    }
+    _ch?.sink.add(jsonEncode(msg));
+  }
+
+  Future<void> _sendViaLan(String to, Map<String, dynamic> msg) async {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    // 直连连续失败后退避: 60s 内直接走中继 (宣告还在但 TCP 不可达的场景,
+    // 如 NAT 后的模拟器, 避免每条消息都白等 3s 连接超时)
+    if ((_lanFailUntil[to] ?? 0) < now) {
+      final link = await _lan.ensureLink(to);
+      if (link != null && !link.closed) {
+        _lanFailCount.remove(to);
+        link.sendJson(msg);
+        return;
+      }
+      final n = (_lanFailCount[to] ?? 0) + 1;
+      if (n >= 2) {
+        _lanFailUntil[to] = now + 60000;
+        _lanFailCount.remove(to);
+      } else {
+        _lanFailCount[to] = n;
+      }
+    }
+    _ch?.sink.add(jsonEncode(msg)); // 回退中继
+  }
+
+  /// 发送二进制文件块; 有直连走直连
+  void _sendBinary(String to, Uint8List bytes) {
+    final link = _lanActive ? _lan.links[to] : null;
+    if (link != null && !link.closed) {
+      link.sendBinary(bytes);
+      return;
+    }
+    _ch?.sink.add(bytes);
+  }
+
+  /// 到该对端的传输通道是否可用 (直连或中继)
+  bool _transportUp(String peerId) =>
+      (_lanActive && _lan.links[peerId]?.closed == false) ||
+      (_relayActive && connected && _relayIds.contains(peerId));
+
+  /// 局域网直连连续失败计数/退避截止
+  final Map<String, int> _lanFailCount = {};
+  final Map<String, int> _lanFailUntil = {};
+
+  // ---------- 局域网 ----------
+
+  /// 局域网发现/直连状态文本 (设置页展示)
+  String get lanStatusText {
+    if (!_lanActive) return '已停用 (仅中继模式)';
+    final udp = _lan.udpBound ? 'UDP ${LanManager.udpPort}' : 'UDP 绑定失败';
+    final tcp = _lan.boundTcpPort != 0
+        ? 'TCP ${_lan.boundTcpPort}'
+        : 'TCP 绑定失败';
+    return '$udp · $tcp';
+  }
+
+  /// 本机所有网卡 (设置页展示 IP 用)
+  Future<List<NetworkInterface>> localInterfaces() async {
+    try {
+      return await NetworkInterface.list(
+        type: InternetAddressType.IPv4,
+        includeLoopback: true,
+      );
+    } catch (_) {
+      return [];
+    }
+  }
+
+  /// 解析 "ip" 或 "ip:port" (端口缺省 45678); 非法输入返回 null
+  Future<(InternetAddress, int)?> _parseTarget(String input) async {
+    var host = input.trim();
+    var port = LanManager.tcpPort;
+    final i = host.lastIndexOf(':');
+    if (i > 0 && !host.contains(']')) {
+      // ipv4:port 形式 (IPv6 需 [addr]:port, 暂不支持)
+      final p = int.tryParse(host.substring(i + 1));
+      if (p == null || p <= 0 || p > 65535) return null;
+      port = p;
+      host = host.substring(0, i);
+    }
+    var addr = InternetAddress.tryParse(host);
+    if (addr == null) {
+      try {
+        final list = await InternetAddress.lookup(
+          host,
+          type: InternetAddressType.IPv4,
+        );
+        if (list.isEmpty) return null;
+        addr = list.first;
+      } catch (_) {
+        return null;
+      }
+    }
+    return (addr, port);
+  }
+
+  /// 手动添加局域网设备: 输入 "ip" 或 "ip:port", 直连并握手;
+  /// 成功返回对端 peerId, 失败返回 null
+  Future<String?> addManualLanPeer(String input) async {
+    if (!_lanActive) return null; // 仅中继模式下局域网直连已停用
+    final parsed = await _parseTarget(input);
+    if (parsed == null) return null;
+    final (addr, port) = parsed;
+    final target = '${addr.address}:$port';
+    final peerId = await _lan.connectTo(addr, port, manualTarget: target);
+    if (peerId == null) return null;
+    if (!manualLanTargets.contains(target)) {
+      manualLanTargets.add(target);
+      (await SharedPreferences.getInstance()).setStringList(
+        'manualLanPeers',
+        manualLanTargets,
+      );
+    }
+    notifyListeners();
+    return peerId;
+  }
+
+  /// 启动时重连已保存的手动设备
+  Future<void> _connectManual(String target, {bool persist = true}) async {
+    final parsed = await _parseTarget(target);
+    if (parsed == null) return;
+    final (addr, port) = parsed;
+    await _lan.connectTo(addr, port, manualTarget: target);
+  }
+
+  /// 删除手动添加的设备; 对应连接断开, 设备从列表移除
+  /// (若对方仍能通过广播发现, 几秒内会重新出现)
+  Future<void> removeManualLanPeer(String target) async {
+    manualLanTargets.remove(target);
+    (await SharedPreferences.getInstance()).setStringList(
+      'manualLanPeers',
+      manualLanTargets,
+    );
+    String? removeId;
+    for (final e in _lan.peers.entries) {
+      if (e.value.manualTarget == target) removeId = e.key;
+    }
+    if (removeId != null) {
+      _lan.peers.remove(removeId);
+      _lan.links.remove(removeId)?.close();
+      _rebuildPeers();
+    }
+    notifyListeners();
+  }
 
   void _onData(dynamic data) {
+    // 畸形消息不影响连接 (中继流上抛异常会触发 onError 误重连)
+    try {
+      _handleData(data);
+    } catch (e) {
+      Log.e('proto', 'handleData error', e);
+    }
+  }
+
+  void _handleData(dynamic data) {
     if (data is String) {
       final m = jsonDecode(data) as Map<String, dynamic>;
       switch (m['type']) {
+        case 'blocked':
+          _onBlocked(m['reason'] as String? ?? 'kick');
+          break;
         case 'peers':
-          final next = (m['peers'] as List)
+          _relayPeers = (m['peers'] as List)
               .map((e) => Peer.fromJson(e))
               .where((p) => p.id != deviceId)
               .toList();
-          // 头像变化时让缓存失效
-          for (final p in next) {
-            if (peerAvatar(p.id) != p.avatar) _avatarBytesCache.remove(p.id);
-          }
-          peers = next;
+          _relayIds = _relayPeers.map((p) => p.id).toSet();
+          _rebuildPeers();
           _resendUndelivered();
           _abortTransfersWithOfflinePeers();
           break;
@@ -416,7 +832,7 @@ class RelayClient extends ChangeNotifier {
           if (!(_appForeground && activePeerId == from)) {
             unread[from] = (unread[from] ?? 0) + 1;
             _unreadChanged();
-            _notify(peerName(from), m['text'] as String);
+            _notify(peerName(from), m['text'] as String, payload: from);
           }
           break;
         case 'chat_ack':
@@ -443,9 +859,22 @@ class RelayClient extends ChangeNotifier {
                     existing.status == TransferStatus.canceled)) {
               existing.status = TransferStatus.waiting;
               ChatDb.upsertTransfer(existing);
-              _fileOfferCtrl.add(existing);
-              if (!(_appForeground && activePeerId == existing.peerId)) {
-                _notify(peerName(existing.peerId), '向您发送文件: ${existing.fileName}');
+              if (isTrusted(existing.peerId)) {
+                // 信任设备: 自动续传, 不再询问
+                Log.i(
+                  'transfer',
+                  'auto-resume ${existing.fileName} from trusted ${existing.peerId}',
+                );
+                unawaited(acceptFile(existing));
+              } else {
+                _fileOfferCtrl.add(existing);
+                if (!(_appForeground && activePeerId == existing.peerId)) {
+                  _notify(
+                    peerName(existing.peerId),
+                    '向您发送文件: ${existing.fileName}',
+                    payload: existing.peerId,
+                  );
+                }
               }
             }
             break;
@@ -461,12 +890,34 @@ class RelayClient extends ChangeNotifier {
           ChatDb.upsertTransfer(t);
           // 保证会话出现在消息列表 (纯文件会话没有文字消息)
           chats.putIfAbsent(t.peerId, () => []);
+          if (isTrusted(t.peerId)) {
+            // 信任设备: 自动接受 (断点续传逻辑在 acceptFile 内)
+            Log.i(
+              'transfer',
+              'auto-accept ${t.fileName} from trusted ${t.peerId}',
+            );
+            unawaited(acceptFile(t));
+            if (!(_appForeground && activePeerId == t.peerId)) {
+              unread[t.peerId] = (unread[t.peerId] ?? 0) + 1;
+              _unreadChanged();
+              _notify(
+                peerName(t.peerId),
+                '正在自动接收: ${t.fileName}',
+                payload: t.peerId,
+              );
+            }
+            break;
+          }
           _fileOfferCtrl.add(t); // 触发全局接收弹窗
           // 与聊天消息一致: 前台且正在和对方聊天时不计未读不弹系统通知
           if (!(_appForeground && activePeerId == t.peerId)) {
             unread[t.peerId] = (unread[t.peerId] ?? 0) + 1;
             _unreadChanged();
-            _notify(peerName(t.peerId), '向您发送文件: ${t.fileName}');
+            _notify(
+              peerName(t.peerId),
+              '向您发送文件: ${t.fileName}',
+              payload: t.peerId,
+            );
           }
           break;
         case 'file_accept':
@@ -480,7 +931,18 @@ class RelayClient extends ChangeNotifier {
               if (offset < 0 || offset > t.fileSize) offset = 0;
               t.status = TransferStatus.accepted;
               ChatDb.upsertTransfer(t);
-              _startSend(t, offset);
+              if (queueSends && _sendingPeers.contains(t.peerId)) {
+                // 同一对端已有发送任务: 排队, 当前任务完成后自动开始
+                (_sendQueue[t.peerId] ??= []).add(t.transferId);
+                _queuedOffsets[t.transferId] = offset;
+                Log.i(
+                  'transfer',
+                  'queued ${t.fileName} (send to ${t.peerId} busy)',
+                );
+              } else {
+                _sendingPeers.add(t.peerId);
+                unawaited(_startSend(t, offset));
+              }
             }
           }
           break;
@@ -521,10 +983,7 @@ class RelayClient extends ChangeNotifier {
         case 'file_done':
           final t = _find(m['transferId']);
           if (t != null && !t.outgoing) {
-            _finishIncoming(
-              t,
-              sha256: m['sha256'] as String?,
-            );
+            _finishIncoming(t, sha256: m['sha256'] as String?);
           }
           break;
       }
@@ -540,6 +999,7 @@ class RelayClient extends ChangeNotifier {
       sink.add(chunk);
       _recvHash[tid]?.input.add(chunk);
       t.bytesDone += chunk.length;
+      t.sampleSpeed();
       if (t.status == TransferStatus.accepted ||
           t.status == TransferStatus.waiting) {
         t.status = TransferStatus.transferring;
@@ -575,7 +1035,7 @@ class RelayClient extends ChangeNotifier {
   void _abortTransfersWithOfflinePeers() {
     var changed = false;
     for (final t in transfers) {
-      if (isOnline(t.peerId)) continue;
+      if (_transportUp(t.peerId)) continue;
       final busy =
           t.status == TransferStatus.transferring ||
           t.status == TransferStatus.accepted;
@@ -585,6 +1045,15 @@ class RelayClient extends ChangeNotifier {
           _aborted.add(t.transferId);
           final w = _sendWaiters.remove(t.transferId);
           if (w != null && !w.isCompleted) w.complete();
+          // 还在队列里未启动的: 发送循环不会跑到, 直接出队标记失败
+          if ((_sendQueue[t.peerId] ?? const []).contains(t.transferId)) {
+            _sendQueue[t.peerId]!.remove(t.transferId);
+            _queuedOffsets.remove(t.transferId);
+            _aborted.remove(t.transferId);
+            t.status = TransferStatus.failed;
+            ChatDb.upsertTransfer(t);
+            Log.i('transfer', 'queued ${t.fileName} failed (peer offline)');
+          }
         } else {
           _closeIncoming(t.transferId, deletePart: false);
           t.status = TransferStatus.failed;
@@ -686,7 +1155,6 @@ class RelayClient extends ChangeNotifier {
 
   /// 重发所有未送达消息 (peers 刷新后调用; 直接查库, 不受分页加载影响)
   Future<void> _resendUndelivered() async {
-    if (!connected) return;
     for (final pid in chats.keys) {
       if (!isOnline(pid)) continue;
       for (final msg in await ChatDb.undelivered(pid)) {
@@ -918,6 +1386,19 @@ class RelayClient extends ChangeNotifier {
     _sendAcked[tid] = offset;
     _lastNotifyBytes = offset;
     notifyListeners();
+    // 通道参数: 局域网直连块大窗口大, 中继保守 (服务器按帧转发有开销)
+    final viaLan = _lanActive && _lan.links[t.peerId]?.closed == false;
+    final chunkSize = viaLan ? 256 * 1024 : 64 * 1024;
+    var window = viaLan ? 16 * 1024 * 1024 : 8 * 1024 * 1024;
+    final windowCap = viaLan ? 128 * 1024 * 1024 : 32 * 1024 * 1024;
+    var waitMs = 0; // 累计被窗口卡住的时间
+    var evalAt =
+        DateTime.now().millisecondsSinceEpoch + 2000; // 下次评估窗口的时间点
+    Log.i(
+      'transfer',
+      'send start ${t.fileName} -> ${t.peerId} '
+          '(${viaLan ? "lan" : "relay"}, offset=$offset)',
+    );
     RandomAccessFile? raf;
     try {
       final hash = _HashState();
@@ -930,19 +1411,18 @@ class RelayClient extends ChangeNotifier {
         await raf.setPosition(offset);
       }
       final tidBytes = ascii.encode(tid);
-      const chunkSize = 64 * 1024;
-      const window = 8 * 1024 * 1024; // 未确认字节上限 (背压)
       while (true) {
         while (t.bytesDone - (_sendAcked[tid] ?? 0) >= window) {
           // 窗口满: 等接收端 file_progress 回执
           if (_canceled.contains(tid) ||
               _aborted.contains(tid) ||
-              !connected) {
+              !_transportUp(t.peerId)) {
             throw StateError('aborted');
           }
           final before = _sendAcked[tid] ?? 0;
           final w = Completer<void>();
           _sendWaiters[tid] = w;
+          final waitStart = DateTime.now().millisecondsSinceEpoch;
           try {
             await w.future.timeout(
               const Duration(seconds: 120),
@@ -955,11 +1435,25 @@ class RelayClient extends ChangeNotifier {
           } finally {
             _sendWaiters.remove(tid);
           }
+          waitMs += DateTime.now().millisecondsSinceEpoch - waitStart;
         }
         if (_canceled.contains(tid) ||
             _aborted.contains(tid) ||
-            !connected) {
+            !_transportUp(t.peerId)) {
           throw StateError('aborted');
+        }
+        // 自适应窗口: 若发送端超过 1/3 时间在等回执, 说明窗口是瓶颈, 翻倍扩
+        final nowMs = DateTime.now().millisecondsSinceEpoch;
+        if (nowMs >= evalAt) {
+          if (waitMs * 3 > nowMs - (evalAt - 2000) && window < windowCap) {
+            window = window * 2 > windowCap ? windowCap : window * 2;
+            Log.i(
+              'transfer',
+              'window up -> ${window ~/ (1024 * 1024)}MB ($tid)',
+            );
+          }
+          waitMs = 0;
+          evalAt = nowMs + 2000;
         }
         final chunk = await raf.read(chunkSize);
         if (chunk.isEmpty) break;
@@ -967,13 +1461,13 @@ class RelayClient extends ChangeNotifier {
         final b = BytesBuilder()
           ..add(tidBytes)
           ..add(chunk);
-        _ch?.sink.add(b.toBytes());
+        _sendBinary(t.peerId, b.toBytes());
         t.bytesDone += chunk.length;
+        t.sampleSpeed();
         if (t.bytesDone - _lastNotifyBytes >= 1024 * 1024) {
           _lastNotifyBytes = t.bytesDone;
           notifyListeners();
         }
-        await Future.delayed(const Duration(milliseconds: 1));
       }
       hash.input.close();
       t.status = TransferStatus.done; // 发送完成; 校验失败会被 file_result 改判
@@ -984,24 +1478,50 @@ class RelayClient extends ChangeNotifier {
         'sha256': hash.hex,
         'size': t.bytesDone,
       });
+      Log.i('transfer', 'send done ${t.fileName} (${t.bytesDone}B)');
       // 等待接收端校验结果的窗口期: 期间对端掉线要改判失败 (防小文件误判完成)
       _unverified.add(tid);
       Timer(const Duration(seconds: 30), () => _unverified.remove(tid));
       _cleanupTemp(t);
-    } catch (_) {
+    } catch (e) {
       t.status = _canceled.contains(tid)
           ? TransferStatus.canceled
           : TransferStatus.failed; // 失败可从 bytesDone 续传
-      if (t.status == TransferStatus.canceled) _cleanupTemp(t);
+      if (t.status == TransferStatus.canceled) {
+        Log.i('transfer', 'send canceled ${t.fileName}');
+        _cleanupTemp(t);
+      } else {
+        Log.e('transfer', 'send failed ${t.fileName}', e);
+      }
     } finally {
       await raf?.close();
       _aborted.remove(tid);
       _sendAcked.remove(tid);
       final w = _sendWaiters.remove(tid);
       if (w != null && !w.isCompleted) w.complete();
+      _sendingPeers.remove(t.peerId);
+      _pumpSendQueue(t.peerId); // 本对端队列里的下一个接着发
     }
     ChatDb.upsertTransfer(t);
     notifyListeners();
+  }
+
+  /// 发送队列泵: 当前发送结束后启动该对端队列里的下一个
+  void _pumpSendQueue(String peerId) {
+    final q = _sendQueue[peerId];
+    if (q == null) return;
+    while (q.isNotEmpty) {
+      final nextId = q.removeAt(0);
+      final offset = _queuedOffsets.remove(nextId) ?? 0;
+      final next = _find(nextId);
+      if (next != null && next.status == TransferStatus.accepted) {
+        _sendingPeers.add(peerId);
+        Log.i('transfer', 'dequeue ${next.fileName}');
+        unawaited(_startSend(next, offset));
+        return;
+      }
+    }
+    _sendQueue.remove(peerId);
   }
 
   /// 接受文件; 若已有 .part 临时文件则从其长度偏移处续传
@@ -1090,6 +1610,11 @@ class RelayClient extends ChangeNotifier {
     _canceled.add(t.transferId);
     final w = _sendWaiters.remove(t.transferId);
     if (w != null && !w.isCompleted) w.complete();
+    // 若还在发送队列里排队: 直接出队 (队列泵会跳过非 accepted 状态, 这里顺手清掉)
+    if ((_sendQueue[t.peerId] ?? const []).contains(t.transferId)) {
+      _sendQueue[t.peerId]!.remove(t.transferId);
+      _queuedOffsets.remove(t.transferId);
+    }
     // 显式取消: 半成品 .part 没有保留价值
     await _closeIncoming(t.transferId, deletePart: true);
     t.status = TransferStatus.canceled;
@@ -1212,6 +1737,11 @@ class RelayClient extends ChangeNotifier {
     }
     if (!ok) {
       // 数据不可信: 删掉 .part, 重试时从头再来
+      Log.e(
+        'transfer',
+        'recv verify failed ${t.fileName} '
+            '(${t.bytesDone}/${t.fileSize}B, sha match: ${sha256 == null ? "n/a" : (hash?.hex == sha256)})',
+      );
       t.bytesDone = 0;
       if (t.savePath != null) {
         try {
@@ -1221,6 +1751,9 @@ class RelayClient extends ChangeNotifier {
       }
     }
     t.status = ok ? TransferStatus.done : TransferStatus.failed;
+    if (ok) {
+      Log.i('transfer', 'recv done ${t.fileName} (${t.bytesDone}B)');
+    }
     ChatDb.upsertTransfer(t);
     _send({'type': 'file_result', 'to': t.peerId, 'transferId': tid, 'ok': ok});
     notifyListeners();

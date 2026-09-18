@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
@@ -16,7 +17,14 @@ import '../db.dart';
 import '../main.dart';
 import '../models.dart';
 import 'file_preview_page.dart';
+import 'slidable_close.dart';
 import 'video_thumbs.dart';
+
+/// 取 widget 在屏幕上的全局矩形 (长按菜单定位用)
+Rect _rectOf(BuildContext ctx) {
+  final box = ctx.findRenderObject() as RenderBox;
+  return box.localToGlobal(Offset.zero) & box.size;
+}
 
 /// 聊天标签页: 显示有会话记录的对端列表
 class ChatsTabPage extends StatelessWidget {
@@ -53,168 +61,189 @@ class ChatsTabPage extends StatelessWidget {
       children: [
         const SizedBox(height: 8),
         Expanded(
-          child: ids.isEmpty
-              ? const _Empty(icon: Icons.forum_outlined, text: '暂无会话')
-              : ListView.builder(
-                  padding: const EdgeInsets.symmetric(horizontal: 16),
-                  itemCount: ids.length,
-                  itemBuilder: (_, i) {
-                    final id = ids[i];
-                    final msgs = c.chats[id]!;
-                    final last = _lastPreview(c, id, msgs);
-                    final n = c.unread[id] ?? 0;
-                    final name = c.peerName(id);
-                    final online = c.isOnline(id);
-                    // 左滑露出删除按钮, 点击按钮再弹选项
-                    return Slidable(
-                      key: Key('conv_$id'),
-                      endActionPane: ActionPane(
-                        motion: const DrawerMotion(),
-                        extentRatio: 0.24,
-                        children: [
-                          CustomSlidableAction(
-                            onPressed: (_) => _confirmDeleteConversation(
-                              context,
-                              c,
-                              id,
-                              name,
-                            ),
-                            backgroundColor: Colors.transparent,
-                            child: Container(
-                              margin: const EdgeInsets.symmetric(
-                                vertical: 5,
-                                horizontal: 3,
-                              ),
-                              decoration: BoxDecoration(
-                                color: AppTheme.red,
-                                borderRadius: BorderRadius.circular(6),
-                              ),
-                              alignment: Alignment.center,
-                              child: const Column(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Icon(
-                                    Icons.delete_outline,
-                                    size: 22,
-                                    color: Colors.white,
-                                  ),
-                                  SizedBox(height: 3),
-                                  Text(
-                                    '删除',
-                                    style: TextStyle(
-                                      fontSize: 12,
-                                      color: Colors.white,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ),
-                        ],
+          // 下拉刷新: 刷新会话对端在线状态 + 补发未送达消息
+          child: RefreshIndicator(
+            color: AppTheme.green,
+            onRefresh: () => c.refreshPeers(),
+            child: ids.isEmpty
+                // 空态用可滚动容器包一层, 否则无法下拉
+                ? ListView(
+                    physics: const AlwaysScrollableScrollPhysics(),
+                    children: [
+                      SizedBox(
+                        height: MediaQuery.of(context).size.height * 0.25,
                       ),
-                      child: Container(
-                        margin: const EdgeInsets.symmetric(vertical: 4),
-                        decoration: BoxDecoration(
-                          border: Border.all(color: AppTheme.lineOf(context)),
-                          borderRadius: BorderRadius.circular(6),
-                        ),
-                        child: ListTile(
-                          contentPadding: const EdgeInsets.symmetric(
-                            horizontal: 14,
-                            vertical: 2,
-                          ),
-                          shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(6),
-                          ),
-                          leading: Builder(
-                            builder: (_) {
-                              final bytes = c.peerAvatarBytes(id);
-                              final p = bytes != null
-                                  ? MemoryImage(bytes)
-                                  : null;
-                              return Container(
-                                width: 36,
-                                height: 36,
-                                alignment: Alignment.center,
-                                decoration: BoxDecoration(
-                                  color: online
-                                      ? AppTheme.green
-                                      : AppTheme.softOf(context),
-                                  borderRadius: BorderRadius.circular(6),
-                                  border: online
-                                      ? null
-                                      : Border.all(
-                                          color: AppTheme.lineOf(context),
-                                        ),
-                                  image: p != null
-                                      ? DecorationImage(
-                                          image: p,
-                                          fit: BoxFit.cover,
-                                        )
-                                      : null,
+                      const _Empty(icon: Icons.forum_outlined, text: '暂无会话'),
+                    ],
+                  )
+                : SlidableCloseOnOutsideTap(
+                    child: ListView.builder(
+                      // 列表不足一屏时也能下拉
+                      physics: const AlwaysScrollableScrollPhysics(),
+                      padding: const EdgeInsets.symmetric(horizontal: 16),
+                      itemCount: ids.length,
+                      itemBuilder: (_, i) {
+                        final id = ids[i];
+                        final msgs = c.chats[id]!;
+                        final last = _lastPreview(c, id, msgs);
+                        final n = c.unread[id] ?? 0;
+                        final name = c.peerName(id);
+                        final online = c.isOnline(id);
+                        // 左滑露出删除按钮, 点击按钮再弹选项
+                        return Slidable(
+                          key: Key('conv_$id'),
+                          endActionPane: ActionPane(
+                            motion: const DrawerMotion(),
+                            extentRatio: 0.27,
+                            children: [
+                              CustomSlidableAction(
+                                onPressed: (_) => _confirmDeleteConversation(
+                                  context,
+                                  c,
+                                  id,
+                                  name,
                                 ),
-                                child: p != null
-                                    ? null
-                                    : Text(
-                                        name.isNotEmpty
-                                            ? name[0].toUpperCase()
-                                            : '?',
-                                        style: TextStyle(
-                                          color: online
-                                              ? Colors.white
-                                              : AppTheme.grey,
-                                          fontWeight: FontWeight.w600,
-                                          fontSize: 14,
-                                        ),
-                                      ),
-                              );
-                            },
-                          ),
-                          title: Text(
-                            name,
-                            style: const TextStyle(
-                              fontWeight: FontWeight.w600,
-                              fontSize: 14,
-                            ),
-                          ),
-                          subtitle: Text(
-                            last,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(
-                              fontSize: 12,
-                              color: AppTheme.grey,
-                            ),
-                          ),
-                          trailing: n > 0
-                              ? Container(
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 7,
-                                    vertical: 2,
+                                backgroundColor: Colors.transparent,
+                                padding: EdgeInsets.zero,
+                                child: Container(
+                                  margin: const EdgeInsets.symmetric(
+                                    vertical: 5,
+                                    horizontal: 3,
                                   ),
                                   decoration: BoxDecoration(
                                     color: AppTheme.red,
-                                    borderRadius: BorderRadius.circular(10),
+                                    borderRadius: BorderRadius.circular(6),
                                   ),
-                                  child: Text(
-                                    '$n',
-                                    style: const TextStyle(
-                                      color: Colors.white,
-                                      fontSize: 11,
-                                    ),
+                                  alignment: Alignment.center,
+                                  child: const Column(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Icon(
+                                        Icons.delete_outline,
+                                        size: 22,
+                                        color: Colors.white,
+                                      ),
+                                      SizedBox(height: 3),
+                                      Text(
+                                        '删除',
+                                        style: TextStyle(
+                                          fontSize: 12,
+                                          color: Colors.white,
+                                        ),
+                                      ),
+                                    ],
                                   ),
-                                )
-                              : null,
-                          onTap: () => Navigator.pushNamed(
-                            context,
-                            '/chat',
-                            arguments: id,
+                                ),
+                              ),
+                            ],
                           ),
-                        ),
-                      ),
-                    );
-                  },
-                ),
+                          child: Container(
+                            margin: const EdgeInsets.symmetric(vertical: 4),
+                            decoration: BoxDecoration(
+                              border: Border.all(
+                                color: AppTheme.lineOf(context),
+                              ),
+                              borderRadius: BorderRadius.circular(6),
+                            ),
+                            child: ListTile(
+                              contentPadding: const EdgeInsets.symmetric(
+                                horizontal: 14,
+                                vertical: 2,
+                              ),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(6),
+                              ),
+                              leading: Builder(
+                                builder: (_) {
+                                  final bytes = c.peerAvatarBytes(id);
+                                  final p = bytes != null
+                                      ? MemoryImage(bytes)
+                                      : null;
+                                  return Container(
+                                    width: 36,
+                                    height: 36,
+                                    alignment: Alignment.center,
+                                    decoration: BoxDecoration(
+                                      color: online
+                                          ? AppTheme.green
+                                          : AppTheme.softOf(context),
+                                      borderRadius: BorderRadius.circular(6),
+                                      border: online
+                                          ? null
+                                          : Border.all(
+                                              color: AppTheme.lineOf(context),
+                                            ),
+                                      image: p != null
+                                          ? DecorationImage(
+                                              image: p,
+                                              fit: BoxFit.cover,
+                                            )
+                                          : null,
+                                    ),
+                                    child: p != null
+                                        ? null
+                                        : Text(
+                                            name.isNotEmpty
+                                                ? name[0].toUpperCase()
+                                                : '?',
+                                            style: TextStyle(
+                                              color: online
+                                                  ? Colors.white
+                                                  : AppTheme.grey,
+                                              fontWeight: FontWeight.w600,
+                                              fontSize: 14,
+                                            ),
+                                          ),
+                                  );
+                                },
+                              ),
+                              title: Text(
+                                name,
+                                style: const TextStyle(
+                                  fontWeight: FontWeight.w600,
+                                  fontSize: 14,
+                                ),
+                              ),
+                              subtitle: Text(
+                                last,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  fontSize: 12,
+                                  color: AppTheme.grey,
+                                ),
+                              ),
+                              trailing: n > 0
+                                  ? Container(
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 7,
+                                        vertical: 2,
+                                      ),
+                                      decoration: BoxDecoration(
+                                        color: AppTheme.red,
+                                        borderRadius: BorderRadius.circular(10),
+                                      ),
+                                      child: Text(
+                                        '$n',
+                                        style: const TextStyle(
+                                          color: Colors.white,
+                                          fontSize: 11,
+                                        ),
+                                      ),
+                                    )
+                                  : null,
+                              onTap: () => Navigator.pushNamed(
+                                context,
+                                '/chat',
+                                arguments: id,
+                              ),
+                            ),
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+          ),
         ),
       ],
     );
@@ -378,10 +407,10 @@ class _ChatPageState extends State<ChatPage> {
     final started = DateTime.now();
     // 只抓取不拼接: 滚动结束后再拼, 否则惯性滑动中列表变长会穿透多页
     c.fetchOlderHistory(peerId!).then((older) async {
-      // 加载动画至少显示 2s, 让加载过程可感知
+      // 加载动画至少显示 500ms, 让加载过程可感知
       final elapsed = DateTime.now().difference(started).inMilliseconds;
-      if (elapsed < 2000) {
-        await Future.delayed(Duration(milliseconds: 2000 - elapsed));
+      if (elapsed < 500) {
+        await Future.delayed(Duration(milliseconds: 500 - elapsed));
       }
       _loadingMore = false;
       if (older.isNotEmpty) {
@@ -694,15 +723,16 @@ class _ChatPageState extends State<ChatPage> {
                                 return _FileBubble(
                                   t: item,
                                   highlight: item.ts == _highlightTs,
-                                  onLongPress: () =>
-                                      _showTransferActions(context, c, item),
+                                  onLongPress: (r) =>
+                                      _showTransferActions(context, c, item, r),
                                 );
                               }
                               final m = item as ChatMessage;
                               return _Bubble(
                                 message: m,
                                 highlight: m.ts == _highlightTs,
-                                onLongPress: () => _showActions(context, c, m),
+                                onLongPress: (r) =>
+                                    _showActions(context, c, m, r),
                               );
                             },
                           ),
@@ -736,7 +766,8 @@ class _ChatPageState extends State<ChatPage> {
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  c.connected
+                  // 任一通道可达 (中继或局域网直连) 即可发送
+                  c.isOnline(peerId!)
                       ? Padding(
                           padding: const EdgeInsets.fromLTRB(8, 8, 8, 8),
                           child: Row(
@@ -860,7 +891,7 @@ class _ChatPageState extends State<ChatPage> {
                           padding: const EdgeInsets.symmetric(vertical: 14),
                           alignment: Alignment.center,
                           child: const Text(
-                            '中继未连接,无法发送消息',
+                            '对方不在线,无法发送消息',
                             style: TextStyle(
                               fontSize: 13,
                               color: AppTheme.grey,
@@ -877,12 +908,12 @@ class _ChatPageState extends State<ChatPage> {
     );
   }
 
-  /// 微信风格 + 号面板: 相册 / 拍摄 / 拍视频 / 文件 / 文件夹
+  /// 微信风格 + 号面板: 相册 / 拍照 / 拍视频 / 文件 / 文件夹
   Widget _buildPanel() {
     final picker = ImagePicker();
     final items = <(IconData, String, VoidCallback)>[
       (
-        Icons.photo_library_outlined,
+        Icons.photo_outlined,
         '相册',
         () => _sendMediaMulti(
           () => picker.pickMultipleMedia(maxWidth: 2048),
@@ -890,8 +921,8 @@ class _ChatPageState extends State<ChatPage> {
         ),
       ),
       (
-        Icons.photo_camera_outlined,
-        '拍摄',
+        Icons.camera_alt_outlined,
+        '拍照',
         () => _sendMedia(
           () => picker.pickImage(source: ImageSource.camera, maxWidth: 2048),
           '图片',
@@ -906,7 +937,7 @@ class _ChatPageState extends State<ChatPage> {
         ),
       ),
       (
-        Icons.insert_drive_file_outlined,
+        Icons.description_outlined,
         '文件',
         () {
           setState(() => _showPanel = false);
@@ -1013,7 +1044,7 @@ class _ChatPageState extends State<ChatPage> {
     final t = _ctrl.text.trim();
     if (t.isEmpty) return;
     final c = context.read<RelayClient>();
-    if (!c.connected) return;
+    // 不在线时消息留在本地, 对方上线 (中继或局域网) 后自动重发
     if (!c.isOnline(peerId!)) {
       ScaffoldMessenger.of(
         context,
@@ -1037,9 +1068,7 @@ class _ChatPageState extends State<ChatPage> {
     }
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(sent > 0 ? '已发送 $sent 个文件请求' : '对方不在线, 无法发送文件'),
-        ),
+        SnackBar(content: Text(sent > 0 ? '已发送 $sent 个文件请求' : '对方不在线, 无法发送文件')),
       );
     }
   }
@@ -1126,107 +1155,135 @@ class _ChatPageState extends State<ChatPage> {
     BuildContext context,
     RelayClient c,
     FileTransfer t,
+    Rect anchor,
   ) {
     // waiting 状态可取消删除; 只有真正在传输中才禁止
     final busy =
         t.status == TransferStatus.accepted ||
         t.status == TransferStatus.transferring;
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: AppTheme.cardOf(context),
-      constraints: const BoxConstraints(maxWidth: 250),
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(10)),
-      ),
-      builder: (ctx) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const SizedBox(height: 6),
-            Container(width: 26, height: 3, color: AppTheme.lineOf(context)),
-            const SizedBox(height: 2),
-            ListTile(
-              dense: true,
-              minTileHeight: 34,
-              horizontalTitleGap: 8,
-              contentPadding: const EdgeInsets.symmetric(horizontal: 14),
-              leading: const Icon(Icons.insert_drive_file_outlined, size: 15),
-              title: Text(
-                t.fileName,
-                style: const TextStyle(fontSize: 12.5),
-                overflow: TextOverflow.ellipsis,
-              ),
-            ),
-            ListTile(
-              dense: true,
-              minTileHeight: 34,
-              horizontalTitleGap: 8,
-              contentPadding: const EdgeInsets.symmetric(horizontal: 14),
-              leading: const Icon(Icons.delete_outline, size: 15),
-              title: Text(
-                busy
-                    ? '传输进行中,暂不能删除'
-                    : (t.status == TransferStatus.waiting ? '取消并删除记录' : '删除记录'),
-                style: const TextStyle(fontSize: 12.5),
-              ),
-              enabled: !busy,
-              onTap: () {
-                Navigator.pop(ctx);
-                c.deleteTransfer(t);
-              },
-            ),
-            const SizedBox(height: 4),
-          ],
+    // 文件已落到本地 (收到的已完成 / 发出的源文件) 才能打开所在位置
+    final revealable = t.savePath != null && File(t.savePath!).existsSync();
+    _showBubbleMenu(anchor, [
+      if (revealable)
+        (label: '打开位置', onTap: () => revealTransferInFolder(context, t)),
+      if (!busy)
+        (
+          label: t.status == TransferStatus.waiting ? '取消并删除' : '删除记录',
+          onTap: () => c.deleteTransfer(t),
         ),
-      ),
-    );
+    ]);
   }
 
-  void _showActions(BuildContext context, RelayClient c, ChatMessage m) {
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: AppTheme.cardOf(context),
-      constraints: const BoxConstraints(maxWidth: 250),
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(10)),
+  void _showActions(
+    BuildContext context,
+    RelayClient c,
+    ChatMessage m,
+    Rect anchor,
+  ) {
+    _showBubbleMenu(anchor, [
+      (
+        label: '复制',
+        onTap: () {
+          Clipboard.setData(ClipboardData(text: m.text));
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(const SnackBar(content: Text('已复制')));
+        },
       ),
-      builder: (ctx) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const SizedBox(height: 6),
-            Container(width: 26, height: 3, color: AppTheme.lineOf(context)),
-            const SizedBox(height: 2),
-            ListTile(
-              dense: true,
-              minTileHeight: 34,
-              horizontalTitleGap: 8,
-              contentPadding: const EdgeInsets.symmetric(horizontal: 14),
-              leading: const Icon(Icons.copy, size: 15),
-              title: const Text('复制', style: TextStyle(fontSize: 12.5)),
-              onTap: () {
-                Clipboard.setData(ClipboardData(text: m.text));
-                Navigator.pop(ctx);
-                ScaffoldMessenger.of(
-                  context,
-                ).showSnackBar(const SnackBar(content: Text('已复制')));
-              },
+      (label: '删除', onTap: () => c.deleteMessage(peerId!, m)),
+    ]);
+  }
+
+  /// 微信风格: 长按气泡后菜单浮在气泡正上方 (上方空间不够时放下面),
+  /// 深色圆角横排, 带指向气泡的小三角; 点外部/返回键关闭
+  void _showBubbleMenu(
+    Rect anchor,
+    List<({String label, VoidCallback onTap})> actions,
+  ) {
+    if (actions.isEmpty) return;
+    // Windows 自定义标题栏把导航区压低 38px: localToGlobal 是相对窗口的,
+    // 换算成 Overlay (弹窗绘制区) 的坐标, 否则菜单整体偏低
+    final overlayBox =
+        Overlay.of(context).context.findRenderObject()! as RenderBox;
+    final overlayOrigin = overlayBox.localToGlobal(Offset.zero);
+    anchor = anchor.shift(-overlayOrigin);
+    final mq = MediaQuery.of(context);
+    const menuH = 44.0;
+    // 估算宽度仅用于把菜单钳制在屏幕内, 实际居中由 FractionalTranslation 保证
+    final estW = actions.fold<double>(
+      0,
+      (s, a) => s + a.label.length * 14.0 + 28,
+    );
+    final cx = anchor.center.dx.clamp(
+      estW / 2 + 8,
+      mq.size.width - estW / 2 - 8,
+    );
+    final above = anchor.top - mq.padding.top > menuH + 24;
+    showGeneralDialog(
+      context: context,
+      barrierDismissible: true,
+      barrierLabel: '关闭',
+      barrierColor: Colors.transparent,
+      pageBuilder: (dlgCtx, _, _) => Stack(
+        children: [
+          // 指向气泡的小三角
+          Positioned(
+            left: cx - 5,
+            top: above ? anchor.top - 13 : anchor.bottom + 3,
+            child: Transform.rotate(
+              angle: math.pi / 4,
+              child: Container(
+                width: 10,
+                height: 10,
+                color: const Color(0xFF4C4C4C),
+              ),
             ),
-            ListTile(
-              dense: true,
-              minTileHeight: 34,
-              horizontalTitleGap: 8,
-              contentPadding: const EdgeInsets.symmetric(horizontal: 14),
-              leading: const Icon(Icons.delete_outline, size: 15),
-              title: const Text('删除', style: TextStyle(fontSize: 12.5)),
-              onTap: () {
-                Navigator.pop(ctx);
-                c.deleteMessage(peerId!, m);
-              },
+          ),
+          Positioned(
+            left: cx,
+            top: above ? anchor.top - menuH - 8 : anchor.bottom + 8,
+            child: FractionalTranslation(
+              translation: const Offset(-0.5, 0),
+              child: Material(
+                color: const Color(0xFF4C4C4C),
+                borderRadius: BorderRadius.circular(8),
+                clipBehavior: Clip.antiAlias,
+                child: SizedBox(
+                  height: menuH,
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      for (var i = 0; i < actions.length; i++) ...[
+                        if (i > 0)
+                          Container(
+                            width: 0.5,
+                            height: 18,
+                            color: Colors.white24,
+                          ),
+                        InkWell(
+                          onTap: () {
+                            Navigator.pop(dlgCtx);
+                            actions[i].onTap();
+                          },
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 14),
+                            child: Text(
+                              actions[i].label,
+                              style: const TextStyle(
+                                fontSize: 13,
+                                color: Colors.white,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
             ),
-            const SizedBox(height: 4),
-          ],
-        ),
+          ),
+        ],
       ),
     );
   }
@@ -1339,7 +1396,7 @@ class _TailPainter extends CustomPainter {
 /// 聊天内的文件传输气泡 (微信风格)
 class _FileBubble extends StatelessWidget {
   final FileTransfer t;
-  final VoidCallback? onLongPress;
+  final ValueChanged<Rect>? onLongPress; // 参数为气泡的全局矩形 (用于菜单定位)
   final bool highlight;
   const _FileBubble({
     required this.t,
@@ -1507,12 +1564,17 @@ class _FileBubble extends StatelessWidget {
             _Avatar(name: peerName, me: false, peerId: t.peerId),
             const SizedBox(width: 10),
           ],
-          GestureDetector(
-            onLongPress: onLongPress,
-            onTap: t.status == TransferStatus.done
-                ? () => openTransfer(context, t)
-                : null,
-            child: content,
+          Builder(
+            builder: (bubbleCtx) => GestureDetector(
+              onLongPress: onLongPress == null
+                  ? null
+                  : () => onLongPress!(_rectOf(bubbleCtx)),
+              // 发出的文件本地本来就有, 任何状态都可打开; 收到的要等完成
+              onTap: (t.outgoing || t.status == TransferStatus.done)
+                  ? () => openTransfer(context, t)
+                  : null,
+              child: content,
+            ),
           ),
           if (fromMe) ...[
             const SizedBox(width: 10),
@@ -1575,7 +1637,7 @@ class _FileBubble extends StatelessWidget {
 /// 微信风格文字气泡
 class _Bubble extends StatelessWidget {
   final ChatMessage message;
-  final VoidCallback onLongPress;
+  final ValueChanged<Rect> onLongPress; // 参数为气泡的全局矩形 (用于菜单定位)
   final bool highlight;
   const _Bubble({
     required this.message,
@@ -1609,25 +1671,27 @@ class _Bubble extends StatelessWidget {
             ),
           ],
           Flexible(
-            child: GestureDetector(
-              onLongPress: onLongPress,
-              child: Container(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 12,
-                  vertical: 10,
-                ),
-                decoration: BoxDecoration(
-                  color: bubbleColor,
-                  borderRadius: BorderRadius.circular(6),
-                ),
-                child: Text.rich(
-                  _linkify(m.text),
-                  style: TextStyle(
-                    fontSize: 16,
-                    height: 1.35,
-                    color: m.fromMe
-                        ? Colors.black87
-                        : AppTheme.bubbleInkOf(context),
+            child: Builder(
+              builder: (bubbleCtx) => GestureDetector(
+                onLongPress: () => onLongPress(_rectOf(bubbleCtx)),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 10,
+                  ),
+                  decoration: BoxDecoration(
+                    color: bubbleColor,
+                    borderRadius: BorderRadius.circular(6),
+                  ),
+                  child: Text.rich(
+                    _linkify(m.text),
+                    style: TextStyle(
+                      fontSize: 16,
+                      height: 1.35,
+                      color: m.fromMe
+                          ? Colors.black87
+                          : AppTheme.bubbleInkOf(context),
+                    ),
                   ),
                 ),
               ),

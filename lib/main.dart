@@ -13,6 +13,7 @@ import 'ui/chat_page.dart';
 import 'ui/chat_search_page.dart';
 import 'ui/devices_page.dart';
 import 'ui/file_preview_page.dart';
+import 'ui/log_page.dart';
 import 'ui/settings_page.dart';
 import 'ui/transfers_page.dart';
 import 'ui/video_player_page.dart';
@@ -384,6 +385,10 @@ class _CloudSendAppState extends State<CloudSendApp> {
       _offerQueue.add(t);
       _pumpOfferDialog();
     });
+    // 点击系统通知 (Android): 跳转到对应会话
+    c.onNotificationOpenChat = (peerId) {
+      _navigatorKey.currentState?.pushNamed('/chat', arguments: peerId);
+    };
   }
 
   @override
@@ -410,9 +415,78 @@ class _CloudSendAppState extends State<CloudSendApp> {
     _offerShowing = false;
   }
 
+  bool _blockedShowing = false;
+
+  /// 被服务器踢下线/拉黑: 全局弹窗, 可选手动重连
+  Future<void> _showBlockedDialog(RelayClient c) async {
+    if (_blockedShowing) return;
+    _blockedShowing = true;
+    final reason = c.blockedReason!;
+    try {
+      final ctx = _navigatorKey.currentContext;
+      if (ctx == null) return;
+      final reconnect = await showDialog<bool>(
+        context: ctx,
+        barrierDismissible: false,
+        builder: (dctx) => AlertDialog(
+          backgroundColor: AppTheme.cardOf(dctx),
+          surfaceTintColor: Colors.transparent,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(8),
+            side: BorderSide(color: AppTheme.lineOf(dctx)),
+          ),
+          title: const Text(
+            '连接已断开',
+            style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+          ),
+          content: Text(
+            RelayClient.blockedText(reason),
+            style: const TextStyle(fontSize: 13, color: AppTheme.grey),
+          ),
+          actionsPadding: const EdgeInsets.fromLTRB(14, 0, 14, 12),
+          actions: [
+            OutlinedButton(
+              style: OutlinedButton.styleFrom(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 14,
+                  vertical: 10,
+                ),
+              ),
+              onPressed: () => Navigator.pop(dctx, false),
+              child: const Text('知道了'),
+            ),
+            FilledButton(
+              style: FilledButton.styleFrom(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 14,
+                  vertical: 10,
+                ),
+              ),
+              onPressed: () => Navigator.pop(dctx, true),
+              child: const Text('重新连接'),
+            ),
+          ],
+        ),
+      );
+      if (reconnect == true) {
+        c.connect(c.serverAddr); // connect 内部会清除 blockedReason
+      } else if (c.blockedReason == reason) {
+        c.clearBlocked(); // 保持断开, 仅关闭提示
+      }
+    } finally {
+      _blockedShowing = false;
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final c = context.watch<RelayClient>();
+    // 被服务器踢下线/拉黑时弹全局提示 (build 里不能直接弹窗, 延后到帧末)
+    if (c.blockedReason != null) {
+      WidgetsBinding.instance.addPostFrameCallback(
+        (_) => _showBlockedDialog(c),
+      );
+    }
     return MaterialApp(
       title: 'cloudSend',
       debugShowCheckedModeBanner: false,
@@ -436,6 +510,7 @@ class _CloudSendAppState extends State<CloudSendApp> {
         '/settings': (_) => const SettingsPage(),
         '/file_preview': (_) => const FilePreviewPage(),
         '/transfers': (_) => const TransfersPage(),
+        '/log': (_) => const LogPage(),
         '/image_view': (_) => const ImageViewPage(),
         '/video_view': (_) => const VideoPlayerPage(),
         '/zip_view': (_) => const ZipPreviewPage(),
@@ -736,17 +811,18 @@ class _HomePageState extends State<HomePage> {
             : Align(
                 alignment: Alignment.centerLeft,
                 child: Container(
-                  width: 224,
-                  height: 36,
+                  width: 188,
+                  height: 31,
                   decoration: BoxDecoration(
                     color: AppTheme.cardOf(context),
-                    borderRadius: BorderRadius.circular(18),
+                    borderRadius: BorderRadius.circular(15.5),
                     border: Border.all(color: AppTheme.lineOf(context)),
                   ),
                   child: Row(children: [_seg('消息', 0), _seg('传输记录', 1)]),
                 ),
               ),
         actions: [
+          _RefreshAction(),
           if (_tab == 1)
             _CircleAction(
               tooltip: '搜索',
@@ -802,16 +878,16 @@ class _HomePageState extends State<HomePage> {
         onTap: () => setState(() => _chatSub = idx),
         child: AnimatedContainer(
           duration: const Duration(milliseconds: 150),
-          margin: const EdgeInsets.all(3),
+          margin: const EdgeInsets.all(2.5),
           alignment: Alignment.center,
           decoration: BoxDecoration(
             color: selected ? AppTheme.green : Colors.transparent,
-            borderRadius: BorderRadius.circular(15),
+            borderRadius: BorderRadius.circular(13),
           ),
           child: Text(
             label,
             style: TextStyle(
-              fontSize: 13.5,
+              fontSize: 12.5,
               fontWeight: FontWeight.w600,
               color: selected ? Colors.white : AppTheme.grey,
             ),
@@ -827,10 +903,15 @@ class _CircleAction extends StatelessWidget {
   final IconData icon;
   final String tooltip;
   final VoidCallback onTap;
+
+  /// 自定义内容 (如旋转动画), 缺省用 icon
+  final Widget? child;
+
   const _CircleAction({
     required this.icon,
     required this.tooltip,
     required this.onTap,
+    this.child,
   });
 
   @override
@@ -850,9 +931,54 @@ class _CircleAction extends StatelessWidget {
               shape: BoxShape.circle,
               border: Border.all(color: AppTheme.lineOf(context)),
             ),
-            child: Icon(icon, size: 17, color: AppTheme.inkOf(context)),
+            child:
+                child ?? Icon(icon, size: 17, color: AppTheme.inkOf(context)),
           ),
         ),
+      ),
+    );
+  }
+}
+
+/// 顶栏刷新按钮: 点击触发 refreshPeers, 刷新期间图标转圈 (防连点)
+class _RefreshAction extends StatefulWidget {
+  @override
+  State<_RefreshAction> createState() => _RefreshActionState();
+}
+
+class _RefreshActionState extends State<_RefreshAction>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _spin = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 700),
+  );
+
+  Future<void> _refresh() async {
+    if (_spin.isAnimating) return; // 刷新中忽略连点
+    _spin.repeat();
+    try {
+      await context.read<RelayClient>().refreshPeers();
+    } finally {
+      _spin.stop();
+      _spin.reset();
+    }
+  }
+
+  @override
+  void dispose() {
+    _spin.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return _CircleAction(
+      tooltip: '刷新',
+      icon: Icons.refresh,
+      onTap: _refresh,
+      child: RotationTransition(
+        turns: _spin,
+        child: Icon(Icons.refresh, size: 17, color: AppTheme.inkOf(context)),
       ),
     );
   }

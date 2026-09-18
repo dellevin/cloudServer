@@ -7,6 +7,7 @@ import 'package:provider/provider.dart';
 
 import '../client.dart';
 import '../main.dart';
+import 'devices_page.dart';
 
 /// 设置页 (微信「我 → 设置」风格: 灰底 + 通栏白色分组)
 class SettingsPage extends StatelessWidget {
@@ -32,28 +33,53 @@ class SettingsPage extends StatelessWidget {
           const _ProfileCard(),
           const SizedBox(height: 10),
 
-          // ---- 中继服务器 ----
+          // ---- 功能模式 ----
           _Group(
             children: [
               _Tile(
-                icon: Icons.dns_outlined,
-                title: '服务器',
-                value: c.serverAddr.isEmpty ? '未设置' : c.serverAddr,
-                // 连接中也可编辑, 保存后自动断开旧连接并重连新地址
-                onTap: () => _editField(
-                  context,
-                  title: '服务器地址',
-                  hint: '例如 1.2.3.4:8787 或 ws://example.com/ws',
-                  initial: c.serverAddr,
-                  onSubmit: (v) {
-                    if (v.isNotEmpty) c.connect(v);
-                  },
-                ),
+                icon: Icons.alt_route,
+                title: '功能模式',
+                value: switch (c.connMode) {
+                  'relay' => '仅中继',
+                  'lan' => '仅局域网',
+                  _ => '局域网 + 中继',
+                },
+                onTap: () => _pickConnMode(context, c),
               ),
-              _ServerStatusTile(),
             ],
           ),
           const SizedBox(height: 10),
+
+          // ---- 中继服务器 (仅局域网模式下隐藏) ----
+          if (c.connMode != 'lan') ...[
+            _Group(
+              children: [
+                _Tile(
+                  icon: Icons.dns_outlined,
+                  title: '服务器',
+                  value: c.serverAddr.isEmpty ? '未设置' : c.serverAddr,
+                  // 连接中也可编辑, 保存后自动断开旧连接并重连新地址
+                  onTap: () => _editField(
+                    context,
+                    title: '服务器地址',
+                    hint: '例如 1.2.3.4:8787 或 ws://example.com/ws',
+                    initial: c.serverAddr,
+                    onSubmit: (v) {
+                      if (v.isNotEmpty) c.connect(v);
+                    },
+                  ),
+                ),
+                _ServerStatusTile(),
+              ],
+            ),
+            const SizedBox(height: 10),
+          ],
+
+          // ---- 局域网 (仅中继模式下隐藏) ----
+          if (c.connMode != 'relay') ...[
+            const _NetworkGroup(),
+            const SizedBox(height: 10),
+          ],
 
           // ---- 通用 ----
           _Group(
@@ -66,6 +92,15 @@ class SettingsPage extends StatelessWidget {
               const _SaveDirTile(),
               const _ClearCacheTile(),
               _Tile(
+                icon: Icons.playlist_play,
+                title: '多文件排队发送',
+                trailing: Switch(
+                  value: c.queueSends,
+                  onChanged: (v) => c.setQueueSends(v),
+                ),
+                onTap: () => c.setQueueSends(!c.queueSends),
+              ),
+              _Tile(
                 icon: Icons.dark_mode_outlined,
                 title: '深色模式',
                 trailing: Switch(
@@ -73,6 +108,18 @@ class SettingsPage extends StatelessWidget {
                   onChanged: (v) => c.setDarkMode(v),
                 ),
                 onTap: () => c.setDarkMode(!c.darkMode),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+
+          // ---- 诊断 ----
+          _Group(
+            children: [
+              _Tile(
+                icon: Icons.article_outlined,
+                title: '运行日志',
+                onTap: () => Navigator.pushNamed(context, '/log'),
               ),
             ],
           ),
@@ -98,6 +145,69 @@ class SettingsPage extends StatelessWidget {
           ),
           const SizedBox(height: 24),
         ],
+      ),
+    );
+  }
+
+  /// 功能模式选择底弹: 局域网+中继 / 仅中继 / 仅局域网
+  static void _pickConnMode(BuildContext context, RelayClient c) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: AppTheme.cardOf(context),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(10)),
+      ),
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const SizedBox(height: 6),
+            Center(
+              child: Container(
+                width: 26,
+                height: 3,
+                color: AppTheme.lineOf(context),
+              ),
+            ),
+            const Padding(
+              padding: EdgeInsets.fromLTRB(16, 12, 16, 6),
+              child: Text(
+                '功能模式',
+                style: TextStyle(fontSize: 12, color: AppTheme.grey),
+              ),
+            ),
+            for (final (mode, title, desc) in [
+              ('both', '局域网 + 中继 (推荐)', '优先走局域网直连；传输失败或离开局域网时自动切换中继保证连接'),
+              ('relay', '仅中继', '只通过中继服务器连接，关闭局域网发现与直连'),
+              ('lan', '仅局域网', '只在局域网内使用，不连接中继服务器'),
+            ])
+              ListTile(
+                dense: true,
+                contentPadding: const EdgeInsets.symmetric(horizontal: 16),
+                title: Text(title, style: const TextStyle(fontSize: 14)),
+                subtitle: Padding(
+                  padding: const EdgeInsets.only(top: 2),
+                  child: Text(
+                    desc,
+                    style: const TextStyle(
+                      fontSize: 11.5,
+                      color: AppTheme.grey,
+                      height: 1.4,
+                    ),
+                  ),
+                ),
+                trailing: c.connMode == mode
+                    ? const Icon(Icons.check, size: 18, color: AppTheme.green)
+                    : null,
+                onTap: () {
+                  Navigator.pop(ctx);
+                  c.setConnMode(mode);
+                },
+              ),
+            const SizedBox(height: 8),
+          ],
+        ),
       ),
     );
   }
@@ -394,6 +504,228 @@ class _ProfileCard extends StatelessWidget {
           ],
         ),
       ),
+    );
+  }
+}
+
+/// 局域网分组: 直连状态 / 本机 IP / 手动设备
+class _NetworkGroup extends StatefulWidget {
+  const _NetworkGroup();
+
+  @override
+  State<_NetworkGroup> createState() => _NetworkGroupState();
+}
+
+class _NetworkGroupState extends State<_NetworkGroup> {
+  List<NetworkInterface>? _ifs;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final ifs = await context.read<RelayClient>().localInterfaces();
+    if (mounted) setState(() => _ifs = ifs);
+  }
+
+  /// 概要: 优先显示第一个非回环 IPv4, 否则显示接口数
+  String get _ipSummary {
+    final ifs = _ifs;
+    if (ifs == null) return '…';
+    for (final i in ifs) {
+      for (final a in i.addresses) {
+        if (!a.isLoopback) return a.address;
+      }
+    }
+    final all = ifs.expand((i) => i.addresses).toList();
+    return all.isEmpty ? '无' : '${all.length} 个地址';
+  }
+
+  void _showIps(BuildContext context) {
+    final ifs = _ifs ?? [];
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: AppTheme.cardOf(context),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(10)),
+      ),
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const SizedBox(height: 6),
+            Center(
+              child: Container(
+                width: 26,
+                height: 3,
+                color: AppTheme.lineOf(context),
+              ),
+            ),
+            const Padding(
+              padding: EdgeInsets.fromLTRB(16, 12, 16, 6),
+              child: Text(
+                '本机 IP 地址 (点按复制, 对方可输入此地址手动连接)',
+                style: TextStyle(fontSize: 12, color: AppTheme.grey),
+              ),
+            ),
+            Flexible(
+              child: ListView(
+                shrinkWrap: true,
+                children: [
+                  for (final i in ifs)
+                    for (final a in i.addresses)
+                      ListTile(
+                        dense: true,
+                        minTileHeight: 36,
+                        contentPadding: const EdgeInsets.symmetric(
+                          horizontal: 16,
+                        ),
+                        title: Text(
+                          a.address,
+                          style: const TextStyle(
+                            fontSize: 13.5,
+                            fontFamily: 'monospace',
+                          ),
+                        ),
+                        subtitle: Text(
+                          i.name,
+                          style: const TextStyle(
+                            fontSize: 11,
+                            color: AppTheme.grey,
+                          ),
+                        ),
+                        trailing: a.isLoopback
+                            ? const Text(
+                                '回环',
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  color: AppTheme.grey,
+                                ),
+                              )
+                            : null,
+                        onTap: () {
+                          Clipboard.setData(ClipboardData(text: a.address));
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(content: Text('已复制 ${a.address}')),
+                          );
+                        },
+                      ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _showManualPeers(BuildContext context, RelayClient c) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: AppTheme.cardOf(context),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(10)),
+      ),
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setSheet) => SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const SizedBox(height: 6),
+              Center(
+                child: Container(
+                  width: 26,
+                  height: 3,
+                  color: AppTheme.lineOf(context),
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 12, 8, 6),
+                child: Row(
+                  children: [
+                    const Expanded(
+                      child: Text(
+                        '手动添加的设备',
+                        style: TextStyle(fontSize: 12, color: AppTheme.grey),
+                      ),
+                    ),
+                    TextButton.icon(
+                      onPressed: () => showAddManualPeerDialog(context),
+                      icon: const Icon(Icons.add, size: 15),
+                      label: const Text('添加', style: TextStyle(fontSize: 12)),
+                    ),
+                  ],
+                ),
+              ),
+              if (c.manualLanTargets.isEmpty)
+                const Padding(
+                  padding: EdgeInsets.fromLTRB(16, 4, 16, 12),
+                  child: Text(
+                    '用于广播不可达的场景 (如 Android 模拟器)。\n添加后即使重启应用也会自动重连。',
+                    style: TextStyle(
+                      fontSize: 11.5,
+                      color: AppTheme.grey,
+                      height: 1.5,
+                    ),
+                  ),
+                )
+              else
+                for (final t in c.manualLanTargets)
+                  ListTile(
+                    dense: true,
+                    minTileHeight: 36,
+                    contentPadding: const EdgeInsets.symmetric(horizontal: 16),
+                    title: Text(
+                      t,
+                      style: const TextStyle(
+                        fontSize: 13.5,
+                        fontFamily: 'monospace',
+                      ),
+                    ),
+                    trailing: IconButton(
+                      icon: const Icon(
+                        Icons.delete_outline,
+                        size: 18,
+                        color: AppTheme.grey,
+                      ),
+                      onPressed: () async {
+                        await c.removeManualLanPeer(t);
+                        setSheet(() {});
+                      },
+                    ),
+                  ),
+              const SizedBox(height: 8),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.watch<RelayClient>();
+    return _Group(
+      children: [
+        _Tile(icon: Icons.lan_outlined, title: '局域网直连', value: c.lanStatusText),
+        _Tile(
+          icon: Icons.wifi,
+          title: '本机 IP',
+          value: _ipSummary,
+          onTap: () => _showIps(context),
+        ),
+        _Tile(
+          icon: Icons.add_link,
+          title: '手动设备',
+          value: '${c.manualLanTargets.length} 个',
+          onTap: () => _showManualPeers(context, c),
+        ),
+      ],
     );
   }
 }
