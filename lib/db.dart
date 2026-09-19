@@ -19,6 +19,12 @@ class ChatMessage {
   /// 仅对 fromMe=true 有意义: 被对方拒收 (对方已拉黑本机)
   bool rejected;
 
+  /// 已被撤回 (双方都可能; 撤回后 text 不再展示, 只显示占位)
+  bool recalled;
+
+  /// 仅对 fromMe=true 有意义: 对方已读 (收到 chat_read 回执)
+  bool read;
+
   ChatMessage({
     this.id,
     required this.peerId,
@@ -27,6 +33,8 @@ class ChatMessage {
     required this.ts,
     this.delivered = true,
     this.rejected = false,
+    this.recalled = false,
+    this.read = false,
   });
 
   Map<String, dynamic> toMap() => {
@@ -37,6 +45,8 @@ class ChatMessage {
     'ts': ts,
     'delivered': delivered ? 1 : 0,
     'rejected': rejected ? 1 : 0,
+    'recalled': recalled ? 1 : 0,
+    'readFlag': read ? 1 : 0,
   };
 
   factory ChatMessage.fromMap(Map<String, dynamic> m) => ChatMessage(
@@ -47,6 +57,45 @@ class ChatMessage {
     ts: m['ts'] as int,
     delivered: (m['delivered'] as int? ?? 1) == 1,
     rejected: (m['rejected'] as int? ?? 0) == 1,
+    recalled: (m['recalled'] as int? ?? 0) == 1,
+    read: (m['readFlag'] as int? ?? 0) == 1,
+  );
+}
+
+/// 剪贴板同步条目: 文本直接存内容, 文件存路径 (kind = text/file)
+class ClipItem {
+  final int? id;
+  final String kind; // text / file
+  final String content; // 文本内容 或 文件路径
+  final int ts;
+  final bool fromMe; // true=本机剪贴板上传, false=对端同步过来
+  final String peerId; // 来源/去向设备
+
+  ClipItem({
+    this.id,
+    required this.kind,
+    required this.content,
+    required this.ts,
+    required this.fromMe,
+    required this.peerId,
+  });
+
+  Map<String, dynamic> toMap() => {
+    'id': id,
+    'kind': kind,
+    'content': content,
+    'ts': ts,
+    'fromMe': fromMe ? 1 : 0,
+    'peerId': peerId,
+  };
+
+  factory ClipItem.fromMap(Map<String, dynamic> m) => ClipItem(
+    id: m['id'] as int?,
+    kind: m['kind'] as String,
+    content: m['content'] as String,
+    ts: m['ts'] as int,
+    fromMe: (m['fromMe'] as int) == 1,
+    peerId: m['peerId'] as String,
   );
 }
 
@@ -62,13 +111,16 @@ class ChatDb {
     final base = await getDatabasesPath();
     _db = await openDatabase(
       p.join(base, 'cloudsend_chat.db'),
-      version: 4,
+      version: 6,
       onCreate: (d, v) async {
         await d.execute(
-          'CREATE TABLE messages(id INTEGER PRIMARY KEY AUTOINCREMENT, peerId TEXT NOT NULL, fromMe INTEGER NOT NULL, text TEXT NOT NULL, ts INTEGER NOT NULL, delivered INTEGER NOT NULL DEFAULT 1, rejected INTEGER NOT NULL DEFAULT 0)',
+          'CREATE TABLE messages(id INTEGER PRIMARY KEY AUTOINCREMENT, peerId TEXT NOT NULL, fromMe INTEGER NOT NULL, text TEXT NOT NULL, ts INTEGER NOT NULL, delivered INTEGER NOT NULL DEFAULT 1, rejected INTEGER NOT NULL DEFAULT 0, recalled INTEGER NOT NULL DEFAULT 0, readFlag INTEGER NOT NULL DEFAULT 0)',
         );
         await d.execute(
           'CREATE TABLE transfers(transferId TEXT PRIMARY KEY, peerId TEXT NOT NULL, fileName TEXT NOT NULL, fileSize INTEGER NOT NULL, outgoing INTEGER NOT NULL, status TEXT NOT NULL, savePath TEXT, ts INTEGER NOT NULL)',
+        );
+        await d.execute(
+          'CREATE TABLE clip_items(id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, content TEXT NOT NULL, ts INTEGER NOT NULL, fromMe INTEGER NOT NULL, peerId TEXT NOT NULL)',
         );
       },
       onUpgrade: (d, oldV, newV) async {
@@ -85,6 +137,19 @@ class ChatDb {
         if (oldV < 4) {
           await d.execute(
             'ALTER TABLE messages ADD COLUMN rejected INTEGER NOT NULL DEFAULT 0',
+          );
+        }
+        if (oldV < 5) {
+          await d.execute(
+            'ALTER TABLE messages ADD COLUMN recalled INTEGER NOT NULL DEFAULT 0',
+          );
+          await d.execute(
+            'ALTER TABLE messages ADD COLUMN readFlag INTEGER NOT NULL DEFAULT 0',
+          );
+        }
+        if (oldV < 6) {
+          await d.execute(
+            'CREATE TABLE clip_items(id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, content TEXT NOT NULL, ts INTEGER NOT NULL, fromMe INTEGER NOT NULL, peerId TEXT NOT NULL)',
           );
         }
       },
@@ -123,6 +188,25 @@ class ChatDb {
         {'rejected': 0, 'delivered': 0},
         where: 'peerId = ? AND ts = ?',
         whereArgs: [peerId, ts],
+      );
+
+  /// 标记某条消息已撤回 (按 peerId + ts 定位)
+  static Future<void> markRecalled(String peerId, int ts) async =>
+      (await db).update(
+        'messages',
+        {'recalled': 1},
+        where: 'peerId = ? AND ts = ?',
+        whereArgs: [peerId, ts],
+      );
+
+  /// 把发给某对端、ts <= readTs 的外发消息全部标记已读
+  /// (已读回执按会话最新读位置一次性推进, 不必逐条确认)
+  static Future<void> markReadUpTo(String peerId, int readTs) async =>
+      (await db).update(
+        'messages',
+        {'readFlag': 1},
+        where: 'peerId = ? AND fromMe = 1 AND ts <= ?',
+        whereArgs: [peerId, readTs],
       );
 
   /// 删除与某对端的整个会话
@@ -212,6 +296,78 @@ class ChatDb {
     return rows.map((r) => r['peerId'] as String).toList();
   }
 
+  // ---------- 剪贴板同步记录 ----------
+
+  static Future<int> insertClip(ClipItem c) async =>
+      (await db).insert('clip_items', c.toMap());
+
+  /// 组装搜索/日期范围的 WHERE 子句
+  static (String?, List<Object?>?) _clipWhere(
+    String? query,
+    int? dayStart,
+    int? dayEnd,
+  ) {
+    final where = StringBuffer();
+    final args = <Object?>[];
+    if (query != null && query.isNotEmpty) {
+      // 转义 LIKE 通配符, 与聊天搜索一致
+      final like =
+          '%${query.replaceAll('\\', '\\\\').replaceAll('%', '\\%').replaceAll('_', '\\_')}%';
+      where.write("content LIKE ? ESCAPE '\\'");
+      args.add(like);
+    }
+    if (dayStart != null && dayEnd != null) {
+      if (where.isNotEmpty) where.write(' AND ');
+      where.write('ts >= ? AND ts < ?');
+      args.add(dayStart);
+      args.add(dayEnd);
+    }
+    return (
+      where.isEmpty ? null : where.toString(),
+      args.isEmpty ? null : args,
+    );
+  }
+
+  /// 时间倒序分页拉取 (可带搜索词/单日范围)
+  static Future<List<ClipItem>> clipHistory({
+    int limit = 50,
+    int offset = 0,
+    String? query,
+    int? dayStart,
+    int? dayEnd,
+  }) async {
+    final (where, args) = _clipWhere(query, dayStart, dayEnd);
+    final rows = await (await db).query(
+      'clip_items',
+      where: where,
+      whereArgs: args,
+      orderBy: 'ts DESC, id DESC',
+      limit: limit,
+      offset: offset,
+    );
+    return rows.map(ClipItem.fromMap).toList();
+  }
+
+  /// 符合条件的总条数 (配合分页)
+  static Future<int> clipCount({
+    String? query,
+    int? dayStart,
+    int? dayEnd,
+  }) async {
+    final (where, args) = _clipWhere(query, dayStart, dayEnd);
+    final rows = await (await db).rawQuery(
+      'SELECT COUNT(*) FROM clip_items${where == null ? '' : ' WHERE $where'}',
+      args,
+    );
+    return (rows.first.values.first as int?) ?? 0;
+  }
+
+  static Future<int> deleteClip(int id) async =>
+      (await db).delete('clip_items', where: 'id = ?', whereArgs: [id]);
+
+  static Future<int> clearClips() async =>
+      (await db).delete('clip_items');
+
   // ---------- 传输记录持久化 ----------
 
   static Future<void> upsertTransfer(FileTransfer t) async {
@@ -233,7 +389,7 @@ class ChatDb {
 
   static Future<List<FileTransfer>> loadTransfers() async {
     final rows = await (await db).query('transfers', orderBy: 'ts ASC');
-    return rows
+    final list = rows
         .map(
           (m) => FileTransfer(
             transferId: m['transferId'] as String,
@@ -248,16 +404,24 @@ class ChatDb {
                 TransferStatus.failed,
           ),
         )
-        // 重启后,未完成的传输标记为失败
-        .map((t) {
-          if (t.status == TransferStatus.waiting ||
-              t.status == TransferStatus.accepted ||
-              t.status == TransferStatus.transferring) {
-            t.status = TransferStatus.failed;
-          }
-          t.bytesDone = t.status == TransferStatus.done ? t.fileSize : 0;
-          return t;
-        })
         .toList();
+    // 重启后未完成的传输标记为失败, 并回写 DB (否则 DB 行永远是
+    // transferring, 与内存状态不一致; bytesDone 由调用方按 .part 长度恢复)
+    final d = await db;
+    for (final t in list) {
+      if (t.status == TransferStatus.waiting ||
+          t.status == TransferStatus.accepted ||
+          t.status == TransferStatus.transferring) {
+        t.status = TransferStatus.failed;
+        await d.update(
+          'transfers',
+          {'status': t.status.name},
+          where: 'transferId = ?',
+          whereArgs: [t.transferId],
+        );
+      }
+      t.bytesDone = t.status == TransferStatus.done ? t.fileSize : 0;
+    }
+    return list;
   }
 }

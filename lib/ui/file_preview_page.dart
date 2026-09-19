@@ -1,13 +1,18 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:gal/gal.dart';
 import 'package:open_filex/open_filex.dart';
+import 'package:provider/provider.dart';
+import 'package:share_plus/share_plus.dart';
 
+import '../client.dart';
 import '../l10n.dart';
 import '../main.dart';
 import '../models.dart';
-import 'action_dialog.dart';
+import 'app_dialog.dart';
 import 'app_toast.dart';
 
 /// 文本类扩展名: 应用内预览
@@ -59,37 +64,109 @@ const videoExts = {'mp4', 'mkv', 'avi', 'mov', 'flv', 'webm', 'm4v', '3gp'};
 /// 可应用内预览的压缩包扩展名
 const archiveExts = {'zip'};
 
+/// 可应用内预览的 Office 扩展名 (仅新格式; 老 .doc/.xls 是 OLE2 二进制不支持)
+const docExts = {'docx'};
+const excelExts = {'xlsx'};
+
 bool isImageFile(String name) => imageExts.contains(_ext(name));
 bool isVideoFile(String name) => videoExts.contains(_ext(name));
 bool isArchiveFile(String name) => archiveExts.contains(_ext(name));
 bool isTextFile(String name) => _textExts.contains(_ext(name));
+bool isDocFile(String name) => docExts.contains(_ext(name));
+bool isExcelFile(String name) => excelExts.contains(_ext(name));
 
 /// 点击传输记录: 文本/图片/视频/压缩包走应用内预览, 其他(音频/文档)交给系统默认程序
-Future<void> openTransfer(BuildContext context, FileTransfer t) async {
+/// tempPreview=true 表示这是远程浏览的临时预览文件, 查看页会显示「下载」按钮
+Future<void> openTransfer(
+  BuildContext context,
+  FileTransfer t, {
+  bool tempPreview = false,
+}) async {
   final path = t.savePath;
-  if (path == null || !File(path).existsSync()) {
+  if (path == null) {
     AppToast.show(context, tr('file_gone'));
     return;
   }
-  if (_textExts.contains(_ext(t.fileName))) {
-    Navigator.pushNamed(context, '/file_preview', arguments: path);
+  return openPath(context, path, t.fileName, tempPreview: tempPreview);
+}
+
+/// 按路径打开任意本地文件 (剪贴板记录等无 FileTransfer 对象的场景复用)
+Future<void> openPath(
+  BuildContext context,
+  String path,
+  String name, {
+  bool tempPreview = false,
+}) async {
+  if (!File(path).existsSync()) {
+    AppToast.show(context, tr('file_gone'));
     return;
   }
-  if (isImageFile(t.fileName)) {
-    Navigator.pushNamed(context, '/image_view', arguments: path);
+  // 临时预览标记随路由参数带给查看页 (String 旧参数兼容见 parseViewerArgs)
+  final Object args = tempPreview ? (path, true) : path;
+  if (_textExts.contains(_ext(name))) {
+    Navigator.pushNamed(context, '/file_preview', arguments: args);
     return;
   }
-  if (isVideoFile(t.fileName)) {
-    Navigator.pushNamed(context, '/video_view', arguments: path);
+  if (isImageFile(name)) {
+    Navigator.pushNamed(context, '/image_view', arguments: args);
     return;
   }
-  if (isArchiveFile(t.fileName)) {
-    Navigator.pushNamed(context, '/zip_view', arguments: path);
+  if (isVideoFile(name)) {
+    Navigator.pushNamed(context, '/video_view', arguments: args);
+    return;
+  }
+  if (isArchiveFile(name)) {
+    Navigator.pushNamed(context, '/zip_view', arguments: args);
+    return;
+  }
+  if (isDocFile(name)) {
+    Navigator.pushNamed(context, '/docx_view', arguments: args);
+    return;
+  }
+  if (isExcelFile(name)) {
+    Navigator.pushNamed(context, '/xlsx_view', arguments: args);
     return;
   }
   final r = await OpenFilex.open(path);
   if (r.type != ResultType.done && context.mounted) {
     AppToast.show(context, trf('open_fail', {'msg': r.message}));
+  }
+}
+
+/// 解析查看页路由参数: 兼容 String(仅路径) 与 (path, tempPreview)
+(String, bool) parseViewerArgs(Object? args) =>
+    args is (String, bool) ? args : (args as String, false);
+
+/// 远程浏览预览页的「下载」: 临时预览文件已完整在缓存里,
+/// 复制到下载目录即真正落盘 (重名自动追加 (1)(2)…), 返回保存路径
+Future<String?> downloadTempPreview(BuildContext context, String path) async {
+  try {
+    final dir = await context.read<RelayClient>().downloadDir();
+    final name = path.split(RegExp(r'[\\/]')).last;
+    final dot = name.lastIndexOf('.');
+    var dest = '$dir${Platform.pathSeparator}$name';
+    var i = 1;
+    while (await File(dest).exists()) {
+      dest = dot > 0
+          ? '$dir${Platform.pathSeparator}${name.substring(0, dot)}($i)${name.substring(dot)}'
+          : '$dir${Platform.pathSeparator}$name($i)';
+      i++;
+    }
+    await File(path).copy(dest);
+    if (context.mounted) {
+      AppToast.show(
+        context,
+        trf('dir_saved_to', {'dir': dest}),
+        actionLabel: tr('open'),
+        onAction: () => OpenFilex.open(dest),
+      );
+    }
+    return dest;
+  } catch (e) {
+    if (context.mounted) {
+      AppToast.show(context, trf('save_fail', {'err': e}));
+    }
+    return null;
   }
 }
 
@@ -158,13 +235,13 @@ Future<String?> confirmDeleteDialog(
   required String title,
   String? message,
 }) {
-  return showActionDialog<String>(
+  return AppDialog.actions<String>(
     context,
     title: title,
     message: message,
     actions: [
-      (label: tr('del_record_only'), value: 'record', danger: false),
-      (label: tr('del_record_file'), value: 'both', danger: true),
+      AppDialogAction(tr('del_record_only'), 'record'),
+      AppDialogAction(tr('del_record_file'), 'both', danger: true),
     ],
   );
 }
@@ -180,13 +257,62 @@ Future<String?> confirmDeleteTransfer(BuildContext context, FileTransfer t) {
   );
 }
 
-/// 图片全屏查看页 (可缩放)
+/// 图片全屏查看页 (可缩放; 支持保存到相册/另存为与系统分享)
 class ImageViewPage extends StatelessWidget {
   const ImageViewPage({super.key});
 
+  /// 保存图片: 移动端写入系统相册, 桌面端弹「另存为」
+  static Future<void> _save(BuildContext context, String path) async {
+    try {
+      if (Platform.isAndroid || Platform.isIOS) {
+        if (!await Gal.hasAccess()) {
+          if (!await Gal.requestAccess()) {
+            if (context.mounted) AppToast.show(context, tr('no_permission'));
+            return;
+          }
+        }
+        await Gal.putImage(path);
+        if (context.mounted) AppToast.show(context, tr('saved_to_gallery'));
+        return;
+      }
+      final name = path.split(RegExp(r'[\\/]')).last;
+      final out = await FilePicker.platform.saveFile(
+        dialogTitle: tr('save_image'),
+        fileName: name,
+      );
+      if (out == null) return; // 用户取消
+      await File(path).copy(out);
+      if (context.mounted) {
+        AppToast.show(context, trf('dir_saved_to', {'dir': out}));
+      }
+    } catch (e) {
+      if (context.mounted) {
+        AppToast.show(context, trf('save_fail', {'err': e}));
+      }
+    }
+  }
+
+  static Future<void> _share(BuildContext context, String path) async {
+    try {
+      final name = path.split(RegExp(r'[\\/]')).last;
+      final r = await SharePlus.instance.share(
+        ShareParams(files: [XFile(path)], text: name),
+      );
+      if (r.status == ShareResultStatus.unavailable && context.mounted) {
+        AppToast.show(context, tr('unsupported'));
+      }
+    } catch (e) {
+      if (context.mounted) {
+        AppToast.show(context, trf('share_fail', {'err': e}));
+      }
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
-    final path = ModalRoute.of(context)!.settings.arguments as String;
+    final (path, tempPreview) = parseViewerArgs(
+      ModalRoute.of(context)!.settings.arguments,
+    );
     final name = path.split(RegExp(r'[\\/]')).last;
     // 限制解码分辨率防 OOM (留 2x 余量供双指放大)
     final cacheWidth =
@@ -200,6 +326,27 @@ class ImageViewPage extends StatelessWidget {
         backgroundColor: Colors.black,
         foregroundColor: Colors.white,
         title: Text(name, style: const TextStyle(fontSize: 14)),
+        actions: [
+          // 远程浏览的临时预览: 只留「下载」(复制到下载目录) + 分享;
+          // 普通打开: 「保存」(相册/另存为) + 分享
+          if (tempPreview)
+            IconButton(
+              tooltip: tr('download'),
+              icon: const Icon(Icons.save_alt),
+              onPressed: () => downloadTempPreview(context, path),
+            )
+          else
+            IconButton(
+              tooltip: tr('save_image'),
+              icon: const Icon(Icons.download_outlined),
+              onPressed: () => _save(context, path),
+            ),
+          IconButton(
+            tooltip: tr('share'),
+            icon: const Icon(Icons.share_outlined),
+            onPressed: () => _share(context, path),
+          ),
+        ],
       ),
       body: Center(
         child: InteractiveViewer(
@@ -226,7 +373,9 @@ class FilePreviewPage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final path = ModalRoute.of(context)!.settings.arguments as String;
+    final (path, tempPreview) = parseViewerArgs(
+      ModalRoute.of(context)!.settings.arguments,
+    );
     final name = path.split(RegExp(r'[\\/]')).last;
     return Scaffold(
       backgroundColor: AppTheme.bgSoft,
@@ -237,6 +386,14 @@ class FilePreviewPage extends StatelessWidget {
           preferredSize: Size.fromHeight(1),
           child: Divider(height: 1),
         ),
+        actions: [
+          if (tempPreview)
+            IconButton(
+              tooltip: tr('download'),
+              icon: const Icon(Icons.save_alt),
+              onPressed: () => downloadTempPreview(context, path),
+            ),
+        ],
       ),
       body: FutureBuilder<String>(
         future: _readText(path),

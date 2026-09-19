@@ -6,6 +6,7 @@ import 'package:provider/provider.dart';
 import '../client.dart';
 import '../l10n.dart';
 import '../main.dart';
+import 'app_dialog.dart';
 import 'app_toast.dart';
 
 /// 黑名单管理页 (微信「通讯录黑名单」风格):
@@ -127,44 +128,13 @@ class BlocklistPage extends StatelessWidget {
 
   /// 手动添加拉黑 IP: 校验格式与重复
   Future<void> _addIp(BuildContext context, RelayClient c) async {
-    final ctrl = TextEditingController();
-    final input = await showDialog<String>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: AppTheme.cardOf(ctx),
-        surfaceTintColor: Colors.transparent,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-        title: Text(
-          tr('add_ip_title'),
-          style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
-        ),
-        content: TextField(
-          controller: ctrl,
-          autofocus: true,
-          keyboardType: TextInputType.url,
-          decoration: InputDecoration(hintText: tr('add_ip_hint')),
-          onSubmitted: (_) => Navigator.pop(ctx, ctrl.text.trim()),
-        ),
-        actionsPadding: const EdgeInsets.fromLTRB(14, 0, 14, 12),
-        actions: [
-          OutlinedButton(
-            style: OutlinedButton.styleFrom(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-            ),
-            onPressed: () => Navigator.pop(ctx),
-            child: Text(tr('cancel')),
-          ),
-          FilledButton(
-            style: FilledButton.styleFrom(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-            ),
-            onPressed: () => Navigator.pop(ctx, ctrl.text.trim()),
-            child: Text(tr('ok')),
-          ),
-        ],
-      ),
+    final input = await AppDialog.input(
+      context,
+      title: tr('add_ip_title'),
+      hint: tr('add_ip_hint'),
+      keyboardType: TextInputType.url,
     );
-    if (input == null || input.isEmpty || !context.mounted) return;
+    if (input == null || !context.mounted) return;
     if (InternetAddress.tryParse(input) == null) {
       AppToast.show(context, tr('invalid_ip'));
       return;

@@ -5,10 +5,14 @@
 list(APPEND FLUTTER_PLUGIN_LIST
   desktop_drop
   file_selector_windows
+  gal
   media_kit_libs_windows_video
   media_kit_video
+  pasteboard
   permission_handler_windows
   screen_retriever_windows
+  share_plus
+  tray_manager
   url_launcher_windows
   window_manager
 )

@@ -3,9 +3,11 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:provider/provider.dart';
+import 'package:tray_manager/tray_manager.dart';
 import 'package:window_manager/window_manager.dart';
 
 import 'client.dart';
@@ -14,10 +16,17 @@ import 'models.dart';
 import 'ui/chat_page.dart';
 import 'ui/chat_search_page.dart';
 import 'ui/blocklist_page.dart';
+import 'ui/clip_exts_page.dart';
+import 'ui/clipboard_page.dart';
 import 'ui/devices_page.dart';
 import 'ui/file_preview_page.dart';
 import 'ui/log_page.dart';
+import 'ui/office_preview_page.dart';
+import 'ui/qr_pair_page.dart';
+import 'ui/remote_file_page.dart';
 import 'ui/remote_fs_page.dart';
+import 'ui/about_page.dart';
+import 'ui/app_dialog.dart';
 import 'ui/settings_page.dart';
 import 'ui/transfers_page.dart';
 import 'ui/video_player_page.dart';
@@ -53,9 +62,89 @@ void main() async {
   final client = RelayClient();
   await client.init();
   await l10n.init();
+  // Windows: 系统托盘 (关窗最小化不退出, 传输不中断)
+  if (Platform.isWindows) {
+    await _TrayController(client).init();
+  }
   runApp(
     ChangeNotifierProvider.value(value: client, child: const CloudSendApp()),
   );
+}
+
+/// Windows 系统托盘: 关窗时最小化到托盘 (传输不被杀), 左键复原窗口,
+/// 右键菜单「显示/退出」。退出菜单项是真正的进程退出路径
+class _TrayController with WindowListener, TrayListener {
+  final RelayClient client;
+  _TrayController(this.client);
+
+  Future<void> init() async {
+    windowManager.addListener(this);
+    trayManager.addListener(this);
+    await windowManager.setPreventClose(true);
+    // 打包后资产在 data/flutter_assets 下; 调试期相对工程根也能找到
+    final exeDir = File(Platform.resolvedExecutable).parent.path;
+    final bundled =
+        '$exeDir${Platform.pathSeparator}data${Platform.pathSeparator}'
+        'flutter_assets${Platform.pathSeparator}assets${Platform.pathSeparator}icon.ico';
+    await trayManager.setIcon(
+      await File(bundled).exists() ? bundled : 'assets/icon.ico',
+    );
+    _refreshMenu();
+    // 传输状态变化时刷新提示文案 (托盘中能看到还在传)
+    client.addListener(_refreshMenu);
+  }
+
+  void _refreshMenu() {
+    final active = client.transfers
+        .where(
+          (t) =>
+              t.status == TransferStatus.accepted ||
+              t.status == TransferStatus.transferring,
+        )
+        .length;
+    trayManager.setToolTip(
+      active > 0
+          ? 'cloudSend · ${trf('tray_busy', {'n': active})}'
+          : 'cloudSend',
+    );
+    trayManager.setContextMenu(
+      Menu(
+        items: [
+          MenuItem(key: 'show', label: tr('tray_show')),
+          MenuItem.separator(),
+          MenuItem(key: 'quit', label: tr('tray_quit')),
+        ],
+      ),
+    );
+  }
+
+  @override
+  void onWindowClose() async {
+    // 拦截关闭: 隐藏到托盘, 传输继续在后台跑
+    await windowManager.hide();
+  }
+
+  @override
+  void onTrayIconMouseDown() async {
+    await windowManager.show();
+    await windowManager.focus();
+  }
+
+  @override
+  void onTrayIconRightMouseDown() {
+    trayManager.popUpContextMenu();
+  }
+
+  @override
+  void onTrayMenuItemClick(MenuItem menuItem) async {
+    if (menuItem.key == 'show') {
+      await windowManager.show();
+      await windowManager.focus();
+    } else if (menuItem.key == 'quit') {
+      await windowManager.setPreventClose(false);
+      await windowManager.close();
+    }
+  }
 }
 
 /// 启动时请求「所有文件访问」权限 (已授权则直接跳过, 不打扰)
@@ -67,6 +156,9 @@ Future<void> _requestAllFilesAccess() async {
     }
   } catch (_) {}
 }
+
+/// 应用版本号 (与 pubspec.yaml 保持一致)
+const kAppVersion = '0.1.9';
 
 /// 微信风格主题
 class AppTheme {
@@ -424,10 +516,10 @@ class _CloudSendAppState extends State<CloudSendApp> {
       final ctx = _navigatorKey.currentContext;
       // 可能已在聊天页/传输记录里处理过了
       if (ctx == null || t.status != TransferStatus.waiting) continue;
-      await showDialog<void>(
-        context: ctx,
+      await AppDialog.custom<void>(
+        ctx,
         barrierDismissible: false,
-        builder: (dctx) => _FileOfferDialog(t: t),
+        child: _FileOfferDialog(t: t),
       );
     }
     _offerShowing = false;
@@ -443,48 +535,13 @@ class _CloudSendAppState extends State<CloudSendApp> {
     try {
       final ctx = _navigatorKey.currentContext;
       if (ctx == null) return;
-      final reconnect = await showDialog<bool>(
-        context: ctx,
+      final reconnect = await AppDialog.confirm(
+        ctx,
+        title: tr('dlg_disconnected'),
+        message: RelayClient.blockedText(reason),
+        okLabel: tr('reconnect'),
+        cancelLabel: tr('got_it'),
         barrierDismissible: false,
-        builder: (dctx) => AlertDialog(
-          backgroundColor: AppTheme.cardOf(dctx),
-          surfaceTintColor: Colors.transparent,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(8),
-            side: BorderSide(color: AppTheme.lineOf(dctx)),
-          ),
-          title: Text(
-            tr('dlg_disconnected'),
-            style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
-          ),
-          content: Text(
-            RelayClient.blockedText(reason),
-            style: const TextStyle(fontSize: 13, color: AppTheme.grey),
-          ),
-          actionsPadding: const EdgeInsets.fromLTRB(14, 0, 14, 12),
-          actions: [
-            OutlinedButton(
-              style: OutlinedButton.styleFrom(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 14,
-                  vertical: 10,
-                ),
-              ),
-              onPressed: () => Navigator.pop(dctx, false),
-              child: Text(tr('got_it')),
-            ),
-            FilledButton(
-              style: FilledButton.styleFrom(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 14,
-                  vertical: 10,
-                ),
-              ),
-              onPressed: () => Navigator.pop(dctx, true),
-              child: Text(tr('reconnect')),
-            ),
-          ],
-        ),
       );
       if (reconnect == true) {
         c.connect(c.serverAddr); // connect 内部会清除 blockedReason
@@ -519,6 +576,14 @@ class _CloudSendAppState extends State<CloudSendApp> {
         theme: AppTheme.theme,
         darkTheme: AppTheme.darkTheme,
         themeMode: darkMode ? ThemeMode.dark : ThemeMode.light,
+        // 系统组件 (日期选择器/对话框按钮等) 跟随应用语言
+        locale: l10n.isEn ? const Locale('en') : const Locale('zh'),
+        localizationsDelegates: const [
+          GlobalMaterialLocalizations.delegate,
+          GlobalWidgetsLocalizations.delegate,
+          GlobalCupertinoLocalizations.delegate,
+        ],
+        supportedLocales: const [Locale('zh'), Locale('en')],
         navigatorKey: _navigatorKey,
         // Windows: 顶部叠加自定义标题栏
         builder: Platform.isWindows
@@ -534,13 +599,22 @@ class _CloudSendAppState extends State<CloudSendApp> {
           '/chat': (_) => const ChatPage(),
           '/chat_search': (_) => const ChatSearchPage(),
           '/blocklist': (_) => const BlocklistPage(),
+          '/clip_exts': (_) => const ClipExtsPage(),
           '/file_preview': (_) => const FilePreviewPage(),
           '/transfers': (_) => const TransfersPage(),
           '/log': (_) => const LogPage(),
+          '/qr_pair': (_) => const QrPairPage(),
           '/image_view': (_) => const ImageViewPage(),
           '/video_view': (_) => const VideoPlayerPage(),
           '/zip_view': (_) => const ZipPreviewPage(),
+          '/docx_view': (_) => const DocxViewPage(),
+          '/xlsx_view': (_) => const XlsxViewPage(),
           '/remote_fs': (_) => const RemoteFsPage(),
+          '/remote_file': (_) => const RemoteFilePage(),
+          '/settings_conn': (_) => const ConnSettingsPage(),
+          '/settings_general': (_) => const GeneralSettingsPage(),
+          '/settings_clip': (_) => const ClipSettingsPage(),
+          '/about': (_) => const AboutPage(),
         },
       ),
     );
@@ -673,123 +747,122 @@ class _FileOfferDialog extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final c = context.read<RelayClient>();
+    // watch 订阅状态: 60s 超时变 failed / 已在别处响应后自动关掉弹窗,
+    // 不再停留在一个点了没反应的死界面上
+    final c = context.watch<RelayClient>();
+    if (t.status != TransferStatus.waiting) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (context.mounted) Navigator.maybePop(context);
+      });
+    }
     final name = c.peerName(t.peerId);
     final avatarBytes = c.peerAvatarBytes(t.peerId);
-    return AlertDialog(
-      backgroundColor: AppTheme.cardOf(context),
-      surfaceTintColor: Colors.transparent,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-      contentPadding: const EdgeInsets.fromLTRB(20, 20, 20, 8),
-      content: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          // 来源设备
-          Container(
-            width: 52,
-            height: 52,
-            alignment: Alignment.center,
-            decoration: BoxDecoration(
-              color: const Color(0xFF576B95),
-              borderRadius: BorderRadius.circular(10),
-              image: avatarBytes != null
-                  ? DecorationImage(
-                      image: MemoryImage(avatarBytes),
-                      fit: BoxFit.cover,
-                    )
-                  : null,
-            ),
-            child: avatarBytes != null
-                ? null
-                : Text(
-                    name.isNotEmpty ? name[0].toUpperCase() : '?',
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontWeight: FontWeight.w600,
-                      fontSize: 20,
-                    ),
-                  ),
-          ),
-          const SizedBox(height: 10),
-          Text(
-            trf('offer_sends_you', {'name': name}),
-            style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
-          ),
-          const SizedBox(height: 14),
-          // 文件信息卡片
-          Container(
-            width: double.infinity,
-            padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(
-              color: AppTheme.softOf(context),
-              borderRadius: BorderRadius.circular(8),
-            ),
-            child: Row(
-              children: [
-                Container(
-                  width: 36,
-                  height: 36,
-                  alignment: Alignment.center,
-                  decoration: BoxDecoration(
-                    color: AppTheme.isDark(context)
-                        ? const Color(0xFF0E3B24)
-                        : const Color(0xFFE7F6EC),
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                  child: const Icon(
-                    Icons.insert_drive_file_outlined,
-                    size: 19,
-                    color: AppTheme.green,
-                  ),
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(20, 18, 20, 14),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              // 来源设备
+              Container(
+                width: 52,
+                height: 52,
+                alignment: Alignment.center,
+                decoration: BoxDecoration(
+                  color: const Color(0xFF576B95),
+                  borderRadius: BorderRadius.circular(10),
+                  image: avatarBytes != null
+                      ? DecorationImage(
+                          image: MemoryImage(avatarBytes),
+                          fit: BoxFit.cover,
+                        )
+                      : null,
                 ),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        t.fileName,
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
+                child: avatarBytes != null
+                    ? null
+                    : Text(
+                        name.isNotEmpty ? name[0].toUpperCase() : '?',
                         style: const TextStyle(
-                          fontSize: 13,
+                          color: Colors.white,
                           fontWeight: FontWeight.w600,
+                          fontSize: 20,
                         ),
                       ),
-                      const SizedBox(height: 2),
-                      Text(
-                        _fmt(t.fileSize),
-                        style: const TextStyle(
-                          fontSize: 11,
-                          color: AppTheme.grey,
-                        ),
-                      ),
-                    ],
-                  ),
+              ),
+              const SizedBox(height: 10),
+              Text(
+                trf('offer_sends_you', {'name': name}),
+                style: const TextStyle(
+                  fontSize: 15,
+                  fontWeight: FontWeight.w600,
                 ),
-              ],
-            ),
+              ),
+              const SizedBox(height: 14),
+              // 文件信息卡片
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: AppTheme.softOf(context),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Row(
+                  children: [
+                    Container(
+                      width: 36,
+                      height: 36,
+                      alignment: Alignment.center,
+                      decoration: BoxDecoration(
+                        color: AppTheme.isDark(context)
+                            ? const Color(0xFF0E3B24)
+                            : const Color(0xFFE7F6EC),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: const Icon(
+                        Icons.insert_drive_file_outlined,
+                        size: 19,
+                        color: AppTheme.green,
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            t.fileName,
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              fontSize: 13,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                          const SizedBox(height: 2),
+                          Text(
+                            _fmt(t.fileSize),
+                            style: const TextStyle(
+                              fontSize: 11,
+                              color: AppTheme.grey,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
           ),
-        ],
-      ),
-      actionsPadding: const EdgeInsets.fromLTRB(16, 4, 16, 14),
-      actions: [
-        Row(
-          children: [
-            Expanded(
-              child: OutlinedButton(
-                onPressed: () => _act(context, c, false),
-                child: Text(tr('reject')),
-              ),
-            ),
-            const SizedBox(width: 10),
-            Expanded(
-              child: FilledButton(
-                onPressed: () => _act(context, c, true),
-                child: Text(tr('accept')),
-              ),
-            ),
-          ],
+        ),
+        AppDialog.buttons(
+          context,
+          okLabel: tr('accept'),
+          cancelLabel: tr('reject'),
+          onOk: (dctx) => _act(dctx, c, true),
+          onCancel: (dctx) => _act(dctx, c, false),
         ),
       ],
     );
@@ -804,8 +877,9 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage> {
-  int _tab = 0; // 0=设备 1=聊天 2=设置
+  int _tab = 1; // 0=设备 1=聊天 2=剪贴板 3=设置 (默认打开聊天)
   int _chatSub = 0; // 聊天 tab 内: 0=消息 1=传输记录
+  final _clipKey = GlobalKey<ClipboardPageState>(); // AppBar 搜索/刷新调它
 
   @override
   Widget build(BuildContext context) {
@@ -832,14 +906,16 @@ class _HomePageState extends State<HomePage> {
                   const Padding(
                     padding: EdgeInsets.only(top: 2),
                     child: Text(
-                      'v1.0.0',
+                      'v$kAppVersion',
                       style: TextStyle(fontSize: 10.5, color: AppTheme.grey),
                     ),
                   ),
                 ],
               )
-            : _tab == 2
+            : _tab == 3
             ? Text(tr('settings'))
+            : _tab == 2
+            ? Text(tr('seg_clipboard'))
             : Align(
                 alignment: Alignment.centerLeft,
                 child: Container(
@@ -860,6 +936,18 @@ class _HomePageState extends State<HomePage> {
               ),
         actions: [
           if (_tab < 2) _RefreshAction(),
+          if (_tab == 2) ...[
+            _CircleAction(
+              tooltip: tr('refresh'),
+              icon: Icons.refresh,
+              onTap: () => _clipKey.currentState?.reload(),
+            ),
+            _CircleAction(
+              tooltip: tr('search'),
+              icon: Icons.search,
+              onTap: () => _clipKey.currentState?.openSearch(),
+            ),
+          ],
           if (_tab == 1)
             _CircleAction(
               tooltip: tr('search'),
@@ -876,14 +964,17 @@ class _HomePageState extends State<HomePage> {
       body: IndexedStack(
         index: _tab == 0
             ? 0
+            : _tab == 3
+            ? 4
             : _tab == 2
             ? 3
             : _chatSub + 1,
-        children: const [
-          DevicesPage(),
-          ChatsTabPage(),
-          TransfersPage(embedded: true),
-          SettingsPage(embedded: true),
+        children: [
+          const DevicesPage(),
+          const ChatsTabPage(),
+          const TransfersPage(embedded: true),
+          ClipboardPage(key: _clipKey),
+          const SettingsPage(embedded: true),
         ],
       ),
       bottomNavigationBar: NavigationBar(
@@ -901,6 +992,10 @@ class _HomePageState extends State<HomePage> {
               child: const Icon(Icons.chat_bubble_outline),
             ),
             label: tr('tab_chat'),
+          ),
+          NavigationDestination(
+            icon: const Icon(Icons.content_paste_outlined),
+            label: tr('seg_clipboard'),
           ),
           NavigationDestination(
             icon: const Icon(Icons.settings_outlined),

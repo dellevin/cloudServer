@@ -2,18 +2,16 @@
   "mode": "off",
   "black": {
     "ids": [],
-    "ips": [
-      "192.168.31.60",
-      "192.168.31.48"
-    ]
+    "ips": []
   },
   "white": {
-    "ids": [
-      "a60b3f48-a2c0-4776-90b7-30bc97335ca6",
-      "05aafce0-ced2-429a-9fed-283b9b9c709f",
-      "ad96bc2e-58b6-470c-aecc-209ad9922e31",
-      "e2981bb8-e31b-4248-a5ea-b3707a9e3dc4"
-    ],
+    "ids": [],
     "ips": []
+  },
+  "limits": {
+    "device_bps": 0,
+    "transfer_bps": 0,
+    "global_bps": 0,
+    "per_device": {}
   }
 }

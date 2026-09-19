@@ -48,12 +48,17 @@ class LanLink {
   int? remotePort; // 我方连出时对方的服务端口
   bool manual = false; // 由「手动添加」发起
   String? manualTarget;
+  bool isP2p = false; // 经中继信令打洞建立的跨网段直连
   Completer<String>? greeted; // 握手完成时补上 peerId (手动连接流程用)
 
   void Function(dynamic frame)? onFrame; // String (JSON) 或 Uint8List (二进制)
   void Function()? onClosed;
 
   Uint8List _pending = Uint8List(0);
+
+  // 单帧长度上限: 文件块 256KB + 36B 头, JSON 含 base64 头像/目录列表,
+  // 16MB 留足余量; 超限即视为恶意/故障对端, 直接断连防 _pending 无限累积 OOM
+  static const int maxFrameLen = 16 * 1024 * 1024;
 
   LanLink(this._socket, {required this.inbound, this.peerId}) {
     _socket.listen(
@@ -71,6 +76,10 @@ class LanLink {
     while (_pending.length >= 5) {
       final kind = _pending[0];
       final len = ByteData.sublistView(_pending, 1, 5).getUint32(0);
+      if (len > maxFrameLen) {
+        close();
+        return;
+      }
       if (_pending.length < 5 + len) break;
       final payload = Uint8List.sublistView(_pending, 5, 5 + len);
       _pending = Uint8List.sublistView(_pending, 5 + len);
@@ -144,6 +153,10 @@ class LanManager {
   /// 拉黑拦截 (由 RelayClient 注入): 返回 true 时
   /// 拒绝该 IP 的 TCP 接入与 UDP 宣告
   bool Function(String ip)? shouldBlockIp;
+
+  /// P2P 打洞握手校验 (由 RelayClient 注入): hello 带 p2p/token 字段时
+  /// 回调校验是否为进行中的打洞会话, 返回 false 则连接被拒绝
+  bool Function(LanLink link, Map<String, dynamic> hello)? validateP2pHello;
 
   final Map<String, LanPeerInfo> peers = {};
   final Map<String, LanLink> links = {};
@@ -365,7 +378,7 @@ class LanManager {
     });
   }
 
-  void _sendHello(LanLink link) {
+  void _sendHello(LanLink link, {Map<String, dynamic>? extra}) {
     link.sendJson({
       'type': 'hello',
       'id': deviceId,
@@ -373,7 +386,18 @@ class LanManager {
       'avatar': _lastAvatar,
       'ver': kProtocolVersion,
       'platform': Platform.operatingSystem,
+      ...?extra,
     });
+  }
+
+  /// 收养一条打洞成功的 socket (由 RelayClient 的打洞流程调用):
+  /// 接线、登记并发送带 p2p 凭证的 hello (对端据此校验放行)
+  void adoptP2pLink(LanLink link, String peerId, String sid, String token) {
+    link.isP2p = true;
+    link.peerId = peerId;
+    _wireLink(link);
+    _register(link, peerId);
+    _sendHello(link, extra: {'p2p': sid, 'token': token});
   }
 
   void _handleFrame(LanLink link, dynamic frame) {
@@ -405,6 +429,14 @@ class LanManager {
     if (id == null || id.isEmpty || id == deviceId) {
       link.close();
       return;
+    }
+    // P2P 打洞握手: 必须由 RelayClient 校验会话凭证, 不是打洞方一律拒绝
+    if (m['p2p'] is String) {
+      link.isP2p = true;
+      if (validateP2pHello?.call(link, m) != true) {
+        link.close();
+        return;
+      }
     }
     // 拉黑的设备不断开链路: 其消息在 RelayClient._onData 按类型拦截并回拒收,
     // 链路保留拒收回执 (chat_reject/file_reject) 才能送达对方

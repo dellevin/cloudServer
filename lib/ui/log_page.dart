@@ -7,6 +7,7 @@ import '../client.dart';
 import '../l10n.dart';
 import '../log.dart';
 import '../main.dart';
+import 'app_dialog.dart';
 import 'app_toast.dart';
 
 /// 运行日志查看页: 显示日志尾部, 可刷新/导出到下载目录/清空
@@ -59,40 +60,14 @@ class _LogPageState extends State<LogPage> {
   }
 
   Future<void> _clear() async {
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (dctx) => AlertDialog(
-        backgroundColor: AppTheme.cardOf(dctx),
-        surfaceTintColor: Colors.transparent,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-        title: Text(
-          tr('clear_log_title'),
-          style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
-        ),
-        content: Text(
-          tr('clear_log_msg'),
-          style: const TextStyle(fontSize: 13, color: AppTheme.grey),
-        ),
-        actionsPadding: const EdgeInsets.fromLTRB(14, 0, 14, 12),
-        actions: [
-          OutlinedButton(
-            style: OutlinedButton.styleFrom(
-              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-            ),
-            onPressed: () => Navigator.pop(dctx, false),
-            child: Text(tr('cancel')),
-          ),
-          FilledButton(
-            style: FilledButton.styleFrom(
-              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-            ),
-            onPressed: () => Navigator.pop(dctx, true),
-            child: Text(tr('clear_all')),
-          ),
-        ],
-      ),
+    final ok = await AppDialog.confirm(
+      context,
+      title: tr('clear_log_title'),
+      message: tr('clear_log_msg'),
+      okLabel: tr('clear_all'),
+      danger: true,
     );
-    if (ok == true) {
+    if (ok) {
       await Log.clear();
       await _reload();
     }

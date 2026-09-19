@@ -1,13 +1,16 @@
 /// 协议版本号: register / 局域网宣告 / hello 均携带, 便于将来协议升级时识别对端
-const int kProtocolVersion = 1;
+/// v2: register 支持接入密码 key; 支持 P2P 打洞信令 (p2p_*)
+/// v3: 支持 E2EE 信封消息 (enc; 仅当双方都 v3+ 且设置了接入密码时启用)
+const int kProtocolVersion = 3;
 
 class Peer {
   final String id;
   final String name;
-  final String? avatar; // base64 PNG (96x96)
+  final String? avatar; // base64 JPEG (96x96; 旧版本为 PNG, 解码端自适应)
   final String? platform; // windows / android / linux / macos / ios (旧版未上报为 null)
-  final bool viaLan; // 局域网发现
+  final bool viaLan; // 局域网发现 (或已建立 P2P 直连)
   final bool viaRelay; // 中继服务器在线
+  final int ver; // 对端协议版本 (0 = 旧版未上报)
   Peer({
     required this.id,
     required this.name,
@@ -15,6 +18,7 @@ class Peer {
     this.platform,
     this.viaLan = false,
     this.viaRelay = false,
+    this.ver = 0,
   });
 
   factory Peer.fromJson(Map<String, dynamic> j) => Peer(
@@ -23,6 +27,7 @@ class Peer {
     avatar: j['avatar'] as String?,
     platform: j['platform'] as String?,
     viaRelay: true,
+    ver: j['ver'] as int? ?? 0,
   );
 }
 
@@ -50,6 +55,10 @@ class FileTransfer {
   /// 瞬态: 远程浏览页「预览」拉取的临时传输 — 存缓存目录、不入库、
   /// 不出现在聊天/传输记录 UI, 重启即弃
   bool ephemeral = false;
+
+  /// 瞬态: 剪贴板同步的传输 — 接收侧存「下载目录/cloudSend/clipboard」,
+  /// 完成后写入 clip_items 记录 (剪贴板页展示, 不进传输记录)
+  bool clipboard = false;
 
   FileTransfer({
     required this.transferId,

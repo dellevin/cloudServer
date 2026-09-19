@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_slidable/flutter_slidable.dart';
@@ -11,6 +12,7 @@ import '../models.dart';
 import 'app_toast.dart';
 import 'file_preview_page.dart';
 import 'slidable_close.dart';
+import 'video_thumbs.dart';
 
 class TransfersPage extends StatefulWidget {
   /// embedded=true 时嵌入主界面 (不带 Scaffold/AppBar)
@@ -30,12 +32,14 @@ class _TransfersPageState extends State<TransfersPage> {
   int _shown = _pageSize;
   final ScrollController _ctrl = ScrollController();
 
-  /// existsSync 结果缓存: key = path|status|bytesDone,
-  /// 传输状态/进度变化自动失效重查, 避免进度通知刷屏时反复同步 stat
+  /// existsSync 结果缓存: key = path|status,
+  /// 传输状态变化自动失效重查, 避免进度通知刷屏时反复同步 stat
+  /// (之前 key 还带 bytesDone, 每个进度 tick 新增一条, Map 无界增长)
   final Map<String, bool> _existsCache = {};
 
   bool _fileExists(String path, TransferStatus st, int bytes) {
-    final key = '$path|${st.name}|$bytes';
+    if (_existsCache.length > 500) _existsCache.clear(); // 兜底上限
+    final key = '$path|${st.name}';
     return _existsCache.putIfAbsent(key, () => File(path).existsSync());
   }
 
@@ -519,7 +523,6 @@ class TransferCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final c = context.read<RelayClient>();
-    final (icon, iconColor) = _fileVisual(t.fileName);
     return Material(
       color: selected
           ? (AppTheme.isDark(context)
@@ -552,16 +555,8 @@ class TransferCard extends StatelessWidget {
                         ),
                         const SizedBox(width: 8),
                       ],
-                      // 文件类型图标: 彩色软底方块
-                      Container(
-                        width: 40,
-                        height: 40,
-                        decoration: BoxDecoration(
-                          color: iconColor.withValues(alpha: 0.12),
-                          borderRadius: BorderRadius.circular(8),
-                        ),
-                        child: Icon(icon, size: 20, color: iconColor),
-                      ),
+                      // 图片/视频显示缩略图, 其他为彩色软底类型图标
+                      _leading(),
                       const SizedBox(width: 12),
                       Expanded(
                         child: Column(
@@ -621,34 +616,41 @@ class TransferCard extends StatelessWidget {
                     Row(
                       children: [
                         Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              ClipRRect(
-                                borderRadius: BorderRadius.circular(2),
-                                child: LinearProgressIndicator(
-                                  value: t.progress,
-                                  minHeight: 4,
-                                  color: AppTheme.green,
-                                  backgroundColor: AppTheme.lineOf(context),
-                                ),
-                              ),
-                              const SizedBox(height: 6),
-                              Text(
-                                [
-                                  '${_fmt(t.bytesDone)} / ${_fmt(t.fileSize)} · ${(t.progress * 100).toStringAsFixed(0)}%',
-                                  // 传输中显示实时速度与预计剩余时间
-                                  if (t.status == TransferStatus.transferring &&
-                                      t.speedBps > 0)
-                                    '${_fmt(t.speedBps.round())}/s · ${trf('eta_left', {'eta': _etaText(t.etaSeconds)})}',
-                                ].join(' · '),
-                                style: const TextStyle(
-                                  fontSize: 10.5,
-                                  color: AppTheme.grey,
-                                  fontFamily: 'monospace',
-                                ),
-                              ),
-                            ],
+                          // 进度区订阅轻量 tick: 5Hz 进度刷新只重建这一小块,
+                          // 不再触发整页 rebuild (bytesDone/speed 读的是同一对象, 拿到即最新)
+                          child: ValueListenableBuilder<int>(
+                            valueListenable: c.progressTick,
+                            builder: (context, _, _) {
+                              return Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  ClipRRect(
+                                    borderRadius: BorderRadius.circular(2),
+                                    child: LinearProgressIndicator(
+                                      value: t.progress,
+                                      minHeight: 4,
+                                      color: AppTheme.green,
+                                      backgroundColor: AppTheme.lineOf(context),
+                                    ),
+                                  ),
+                                  const SizedBox(height: 6),
+                                  Text(
+                                    [
+                                      '${_fmt(t.bytesDone)} / ${_fmt(t.fileSize)} · ${(t.progress * 100).toStringAsFixed(0)}%',
+                                      // 传输中显示实时速度与预计剩余时间
+                                      if (t.status == TransferStatus.transferring &&
+                                          t.speedBps > 0)
+                                        '${_fmt(t.speedBps.round())}/s · ${trf('eta_left', {'eta': _etaText(t.etaSeconds)})}',
+                                    ].join(' · '),
+                                    style: const TextStyle(
+                                      fontSize: 10.5,
+                                      color: AppTheme.grey,
+                                      fontFamily: 'monospace',
+                                    ),
+                                  ),
+                                ],
+                              );
+                            },
                           ),
                         ),
                         const SizedBox(width: 8),
@@ -746,6 +748,69 @@ class TransferCard extends StatelessWidget {
         ],
       ),
     );
+  }
+
+  /// 文件类型图标: 彩色软底方块
+  Widget _iconBox() {
+    final (icon, iconColor) = _fileVisual(t.fileName);
+    return Container(
+      width: 40,
+      height: 40,
+      decoration: BoxDecoration(
+        color: iconColor.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Icon(icon, size: 20, color: iconColor),
+    );
+  }
+
+  /// 已完成的图片/视频本地文件显示缩略图; 失败/缺失回退类型图标
+  Widget _leading() {
+    final path = t.savePath;
+    final canThumb = path != null && t.status == TransferStatus.done;
+    if (canThumb && isImageFile(t.fileName)) {
+      return ClipRRect(
+        borderRadius: BorderRadius.circular(8),
+        child: Image.file(
+          File(path),
+          width: 40,
+          height: 40,
+          fit: BoxFit.cover,
+          cacheWidth: 120,
+          errorBuilder: (_, _, _) => _iconBox(),
+        ),
+      );
+    }
+    if (canThumb && isVideoFile(t.fileName)) {
+      return ClipRRect(
+        borderRadius: BorderRadius.circular(8),
+        child: SizedBox(
+          width: 40,
+          height: 40,
+          child: FutureBuilder<Uint8List?>(
+            future: VideoThumbs.get(path),
+            builder: (_, snap) {
+              final bytes = snap.data;
+              if (bytes == null) return _iconBox();
+              return Stack(
+                fit: StackFit.expand,
+                children: [
+                  Image.memory(bytes, fit: BoxFit.cover),
+                  const Center(
+                    child: Icon(
+                      Icons.play_circle_fill,
+                      size: 18,
+                      color: Colors.white70,
+                    ),
+                  ),
+                ],
+              );
+            },
+          ),
+        ),
+      );
+    }
+    return _iconBox();
   }
 
   /// 文件类型图标与配色

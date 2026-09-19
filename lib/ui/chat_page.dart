@@ -18,7 +18,7 @@ import '../db.dart';
 import '../l10n.dart';
 import '../main.dart';
 import '../models.dart';
-import 'action_dialog.dart';
+import 'app_dialog.dart';
 import 'app_toast.dart';
 import 'file_preview_page.dart';
 import 'slidable_close.dart';
@@ -235,13 +235,13 @@ class ChatsTabPage extends StatelessWidget {
     String peerId,
     String name,
   ) async {
-    final choice = await showActionDialog<String>(
+    final choice = await AppDialog.actions<String>(
       context,
       title: tr('del_conv_title'),
       message: trf('del_conv_message', {'name': name}),
       actions: [
-        (label: tr('del_conv_hide'), value: 'hide', danger: false),
-        (label: tr('del_conv_all'), value: 'delete', danger: true),
+        AppDialogAction(tr('del_conv_hide'), 'hide'),
+        AppDialogAction(tr('del_conv_all'), 'delete', danger: true),
       ],
     );
     if (choice == 'hide') c.hideConversation(peerId);
@@ -462,6 +462,7 @@ class _ChatPageState extends State<ChatPage> {
       c.loadHistory(peerId!).then((_) {
         _prevNewestTs = _newestTsOf(c); // 已有历史不计入「新消息」角标
         _jumpToHighlight();
+        c.sendReadReceipt(peerId!); // 打开会话即回已读 (以对方最新消息 ts 为已读位置)
       });
     }
   }
@@ -1287,6 +1288,17 @@ class _ChatPageState extends State<ChatPage> {
           AppToast.show(context, tr('copied'));
         },
       ),
+      // 撤回: 仅我方 2 分钟内的消息 (与微信一致)
+      if (c.canRecall(m))
+        (
+          label: tr('recall'),
+          onTap: () async {
+            final ok = await c.recallMessage(peerId!, m);
+            if (!ok && context.mounted) {
+              AppToast.show(context, tr('recall_too_late'));
+            }
+          },
+        ),
       (label: tr('delete'), onTap: () => c.deleteMessage(peerId!, m)),
     ]);
   }
@@ -1506,6 +1518,7 @@ class _FileBubble extends StatelessWidget {
   static final Map<String, bool> _existsCache = {};
 
   static bool _fileExists(String path, TransferStatus st) {
+    if (_existsCache.length > 500) _existsCache.clear(); // 兜底上限 (静态存活期长)
     final key = '$path|${st.name}';
     return _existsCache.putIfAbsent(key, () => File(path).existsSync());
   }
@@ -1628,13 +1641,17 @@ class _FileBubble extends StatelessWidget {
             if (t.status == TransferStatus.transferring ||
                 t.status == TransferStatus.accepted) ...[
               const SizedBox(height: 10),
-              ClipRRect(
-                borderRadius: BorderRadius.circular(3),
-                child: LinearProgressIndicator(
-                  value: t.progress,
-                  minHeight: 3,
-                  color: AppTheme.green,
-                  backgroundColor: AppTheme.lineOf(context),
+              // 订阅轻量进度 tick: 5Hz 刷新只重建进度条, 不重建整个聊天列表
+              ValueListenableBuilder<int>(
+                valueListenable: c.progressTick,
+                builder: (context, _, _) => ClipRRect(
+                  borderRadius: BorderRadius.circular(3),
+                  child: LinearProgressIndicator(
+                    value: t.progress,
+                    minHeight: 3,
+                    color: AppTheme.green,
+                    backgroundColor: AppTheme.lineOf(context),
+                  ),
                 ),
               ),
             ],
@@ -1769,6 +1786,18 @@ class _Bubble extends StatelessWidget {
   Widget build(BuildContext context) {
     final m = message;
     final c = context.read<RelayClient>();
+    // 已撤回: 居中灰色占位条 (微信风格), 不显示气泡
+    if (m.recalled) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 6),
+          child: Text(
+            m.fromMe ? tr('recalled_me') : tr('recalled_peer'),
+            style: const TextStyle(fontSize: 12, color: AppTheme.grey),
+          ),
+        ),
+      );
+    }
     final bubbleColor = m.fromMe ? green : AppTheme.bubbleOf(context);
     return Container(
       color: highlight ? const Color(0x3307C160) : null,
@@ -1802,6 +1831,18 @@ class _Bubble extends StatelessWidget {
             const Padding(
               padding: EdgeInsets.only(top: 16, right: 4),
               child: Icon(Icons.schedule, size: 14, color: AppTheme.grey),
+            )
+          // 已读回执: 已送达未读=「未读」, 对方已读=「已读」
+          else if (m.fromMe)
+            Padding(
+              padding: const EdgeInsets.only(top: 16, right: 4),
+              child: Text(
+                m.read ? tr('msg_read') : tr('msg_unread'),
+                style: TextStyle(
+                  fontSize: 10,
+                  color: m.read ? AppTheme.green : AppTheme.grey,
+                ),
+              ),
             ),
           Flexible(
             child: Builder(

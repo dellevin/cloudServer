@@ -91,7 +91,6 @@ class TransferForegroundService {
           : '${trf('n_files', {'n': active.length})} $pct%';
       final text = speed > 0 ? '$base · ${_fmtSpeed(speed)}' : base;
       if (!_running) {
-        _running = true;
         _lastUpdate = DateTime.now().millisecondsSinceEpoch;
         await FlutterForegroundTask.startService(
           serviceId: 256,
@@ -102,6 +101,8 @@ class TransferForegroundService {
           ],
           callback: _startCallback,
         );
+        // 启动成功才置位: 先置位又抛异常会永久卡在 update 分支, 保活再也起不来
+        _running = true;
       } else {
         // 节流: 500ms 最多更新一次通知
         final now = DateTime.now().millisecondsSinceEpoch;

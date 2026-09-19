@@ -8,7 +8,7 @@ import 'package:provider/provider.dart';
 import '../client.dart';
 import '../l10n.dart';
 import '../main.dart';
-import 'action_dialog.dart';
+import 'app_dialog.dart';
 import 'app_toast.dart';
 
 /// 设置页 (微信「我 → 设置」风格: 灰底 + 通栏白色分组)
@@ -28,83 +28,31 @@ class SettingsPage extends StatelessWidget {
         const _ProfileCard(),
         const SizedBox(height: 10),
 
-        // ---- 功能模式 ----
+        // ---- 功能分类入口 ----
         _Group(
           children: [
             _Tile(
-              title: tr('mode_title'),
-              value: switch (c.connMode) {
-                'relay' => tr('mode_relay'),
-                'lan' => tr('mode_lan'),
-                _ => tr('mode_both'),
-              },
-              onTap: () => _pickConnMode(context, c),
+              title: tr('settings_conn'),
+              onTap: () => Navigator.pushNamed(context, '/settings_conn'),
+            ),
+            _Tile(
+              title: tr('settings_general'),
+              onTap: () => Navigator.pushNamed(context, '/settings_general'),
+            ),
+            _Tile(
+              title: tr('clip_sync'),
+              onTap: () => Navigator.pushNamed(context, '/settings_clip'),
             ),
           ],
         ),
         const SizedBox(height: 10),
 
-        // ---- 中继服务器 (仅局域网模式下隐藏) ----
-        if (c.connMode != 'lan') ...[
-          _Group(
-            children: [
-              _Tile(
-                title: tr('server'),
-                value: c.serverAddr.isEmpty ? tr('not_set') : c.serverAddr,
-                // 连接中也可编辑, 保存后自动断开旧连接并重连新地址
-                onTap: () => _editField(
-                  context,
-                  title: tr('server_addr_title'),
-                  hint: tr('server_addr_hint'),
-                  initial: c.serverAddr,
-                  onSubmit: (v) {
-                    if (v.isNotEmpty) c.connect(v);
-                  },
-                ),
-              ),
-              _ServerStatusTile(),
-            ],
-          ),
-          const SizedBox(height: 10),
-        ],
-
-        // ---- 局域网 (仅中继模式下隐藏) ----
-        if (c.connMode != 'relay') ...[
-          const _NetworkGroup(),
-          const SizedBox(height: 10),
-        ],
-
-        // ---- 通用 ----
+        // ---- 常用 ----
         _Group(
           children: [
             _Tile(
-              title: tr('seg_transfers'),
-              onTap: () => Navigator.pushNamed(context, '/transfers'),
-            ),
-            const _SaveDirTile(),
-            const _ClearCacheTile(),
-            _Tile(
-              title: tr('blocklist'),
-              value: trf('n_items', {
-                'n': c.blockedPeers.length + c.blockedIps.length,
-              }),
-              onTap: () => Navigator.pushNamed(context, '/blocklist'),
-            ),
-            _Tile(
-              title: tr('queue_sends'),
-              trailing: Switch(
-                value: c.queueSends,
-                onChanged: (v) => c.setQueueSends(v),
-              ),
-              onTap: () => c.setQueueSends(!c.queueSends),
-            ),
-            _Tile(
-              title: tr('compress_images'),
-              trailing: Switch(
-                value: c.compressImages,
-                onChanged: (v) => c.setCompressImages(v),
-              ),
-              onTap: () => c.setCompressImages(!c.compressImages),
+              title: tr('qr_pairing'),
+              onTap: () => Navigator.pushNamed(context, '/qr_pair'),
             ),
             _Tile(
               title: tr('dark_mode'),
@@ -136,15 +84,13 @@ class SettingsPage extends StatelessWidget {
 
         // ---- 关于 ----
         _Group(
-          children: [_Tile(title: '${tr('about')} cloudSend', value: 'v1.0.0')],
-        ),
-
-        const SizedBox(height: 24),
-        Center(
-          child: Text(
-            tr('footer_tip'),
-            style: const TextStyle(fontSize: 11, color: AppTheme.grey),
-          ),
+          children: [
+            _Tile(
+              title: '${tr('about')} cloudSend',
+              value: 'v$kAppVersion',
+              onTap: () => Navigator.pushNamed(context, '/about'),
+            ),
+          ],
         ),
         const SizedBox(height: 24),
       ],
@@ -165,131 +111,96 @@ class SettingsPage extends StatelessWidget {
     );
   }
 
-  /// 功能模式选择底弹: 局域网+中继 / 仅中继 / 仅局域网
-  static void _pickConnMode(BuildContext context, RelayClient c) {
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: AppTheme.cardOf(context),
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(10)),
-      ),
-      builder: (ctx) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const SizedBox(height: 6),
-            Center(
-              child: Container(
-                width: 26,
-                height: 3,
-                color: AppTheme.lineOf(context),
-              ),
-            ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 12, 16, 6),
-              child: Text(
-                tr('mode_title'),
-                style: const TextStyle(fontSize: 12, color: AppTheme.grey),
-              ),
-            ),
-            for (final (mode, title, desc) in [
-              (
-                'both',
-                '${tr('mode_both')} ${tr('mode_both_rec')}',
-                tr('mode_both_desc'),
-              ),
-              ('relay', tr('mode_relay'), tr('mode_relay_desc')),
-              ('lan', tr('mode_lan'), tr('mode_lan_desc')),
-            ])
-              ListTile(
-                dense: true,
-                contentPadding: const EdgeInsets.symmetric(horizontal: 16),
-                title: Text(title, style: const TextStyle(fontSize: 14)),
-                subtitle: Padding(
-                  padding: const EdgeInsets.only(top: 2),
-                  child: Text(
-                    desc,
-                    style: const TextStyle(
-                      fontSize: 11.5,
-                      color: AppTheme.grey,
-                      height: 1.4,
-                    ),
-                  ),
-                ),
-                trailing: c.connMode == mode
-                    ? const Icon(Icons.check, size: 18, color: AppTheme.green)
-                    : null,
-                onTap: () {
-                  Navigator.pop(ctx);
-                  c.setConnMode(mode);
-                },
-              ),
-            const SizedBox(height: 8),
-          ],
+  /// 功能模式选择弹窗: 局域网+中继 / 仅中继 / 仅局域网
+  static void _pickConnMode(BuildContext context, RelayClient c) async {
+    final v = await AppDialog.actions<String>(
+      context,
+      title: tr('mode_title'),
+      actions: [
+        AppDialogAction(
+          '${tr('mode_both')} ${tr('mode_both_rec')}',
+          'both',
+          sub: tr('mode_both_desc'),
+          check: c.connMode == 'both',
         ),
-      ),
+        AppDialogAction(
+          tr('mode_relay'),
+          'relay',
+          sub: tr('mode_relay_desc'),
+          check: c.connMode == 'relay',
+        ),
+        AppDialogAction(
+          tr('mode_lan'),
+          'lan',
+          sub: tr('mode_lan_desc'),
+          check: c.connMode == 'lan',
+        ),
+      ],
+    );
+    if (v != null) c.setConnMode(v);
+  }
+
+  /// 远程预览大小上限选择弹窗 (MB); 选“自定义”可手动输入
+  static Future<void> _pickPreviewLimit(BuildContext context) async {
+    const opts = [5, 10, 20, 50, 100, 200];
+    final v = await AppDialog.actions<int>(
+      context,
+      title: tr('fs_preview_limit'),
+      actions: [
+        for (final mb in opts) AppDialogAction('$mb MB', mb),
+        AppDialogAction(tr('custom'), -1),
+      ],
+    );
+    if (v == null || !context.mounted) return;
+    if (v > 0) {
+      context.read<RelayClient>().setFsPreviewMaxMb(v);
+      return;
+    }
+    // 自定义: 手动输入 MB 数
+    final cur = context.read<RelayClient>().fsPreviewMaxMb;
+    await _editField(
+      context,
+      title: tr('fs_preview_limit'),
+      hint: tr('fs_preview_limit_hint'),
+      initial: '$cur',
+      onSubmit: (s) {
+        final mb = int.tryParse(s);
+        if (mb != null && mb > 0) {
+          context.read<RelayClient>().setFsPreviewMaxMb(mb);
+        }
+      },
     );
   }
 
   /// 语言选择弹窗: 中文 / English
   static Future<void> _pickLanguage(BuildContext context) async {
-    final v = await showActionDialog<String>(
+    final v = await AppDialog.actions<String>(
       context,
       title: tr('language'),
-      actions: const [
-        (label: '中文', value: 'zh', danger: false),
-        (label: 'English', value: 'en', danger: false),
-      ],
+      actions: [AppDialogAction('中文', 'zh'), AppDialogAction('English', 'en')],
     );
     if (v != null) l10n.setLang(v);
   }
 
-  /// 弹窗编辑单个字段
+  /// 弹窗编辑单个字段; obscure=密码遮罩, allowEmpty=允许提交空值 (用于清除)
   static Future<void> _editField(
     BuildContext context, {
     required String title,
     required String hint,
     required String initial,
     required void Function(String) onSubmit,
+    bool obscure = false,
+    bool allowEmpty = false,
   }) async {
-    final ctrl = TextEditingController(text: initial);
-    final result = await showDialog<String>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: AppTheme.cardOf(context),
-        surfaceTintColor: Colors.transparent,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-        title: Text(
-          title,
-          style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
-        ),
-        content: TextField(
-          controller: ctrl,
-          autofocus: true,
-          decoration: InputDecoration(hintText: hint),
-          onSubmitted: (_) => Navigator.pop(ctx, ctrl.text.trim()),
-        ),
-        actionsPadding: const EdgeInsets.fromLTRB(14, 0, 14, 12),
-        actions: [
-          OutlinedButton(
-            style: OutlinedButton.styleFrom(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-            ),
-            onPressed: () => Navigator.pop(ctx),
-            child: Text(tr('cancel')),
-          ),
-          FilledButton(
-            style: FilledButton.styleFrom(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-            ),
-            onPressed: () => Navigator.pop(ctx, ctrl.text.trim()),
-            child: Text(tr('ok')),
-          ),
-        ],
-      ),
+    final result = await AppDialog.input(
+      context,
+      title: title,
+      hint: hint,
+      initial: initial,
+      obscure: obscure,
+      allowEmpty: allowEmpty,
     );
-    if (result != null && result.isNotEmpty) onSubmit(result);
+    if (result != null) onSubmit(result);
   }
 }
 
@@ -469,61 +380,23 @@ class _ProfileCard extends StatelessWidget {
     );
   }
 
-  void _pickAvatar(BuildContext context, RelayClient c) {
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: AppTheme.cardOf(context),
-      constraints: const BoxConstraints(maxWidth: 250),
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(10)),
-      ),
-      builder: (ctx) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const SizedBox(height: 6),
-            Container(width: 26, height: 3, color: AppTheme.lineOf(context)),
-            const SizedBox(height: 2),
-            ListTile(
-              dense: true,
-              minTileHeight: 34,
-              horizontalTitleGap: 8,
-              contentPadding: const EdgeInsets.symmetric(horizontal: 14),
-              leading: const Icon(Icons.photo_library_outlined, size: 15),
-              title: Text(
-                tr('pick_from_file'),
-                style: const TextStyle(fontSize: 12.5),
-              ),
-              onTap: () async {
-                Navigator.pop(ctx);
-                final r = await FilePicker.platform.pickFiles(
-                  type: FileType.image,
-                );
-                final path = r?.files.single.path;
-                if (path != null) c.setAvatar(path);
-              },
-            ),
-            if (c.avatarPath.isNotEmpty)
-              ListTile(
-                dense: true,
-                minTileHeight: 34,
-                horizontalTitleGap: 8,
-                contentPadding: const EdgeInsets.symmetric(horizontal: 14),
-                leading: const Icon(Icons.restart_alt, size: 15),
-                title: Text(
-                  tr('restore_default'),
-                  style: const TextStyle(fontSize: 12.5),
-                ),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  c.setAvatar('');
-                },
-              ),
-            const SizedBox(height: 4),
-          ],
-        ),
-      ),
+  void _pickAvatar(BuildContext context, RelayClient c) async {
+    final v = await AppDialog.actions<String>(
+      context,
+      title: tr('avatar'),
+      actions: [
+        AppDialogAction(tr('pick_from_file'), 'pick'),
+        if (c.avatarPath.isNotEmpty)
+          AppDialogAction(tr('restore_default'), 'reset'),
+      ],
     );
+    if (v == 'pick') {
+      final r = await FilePicker.platform.pickFiles(type: FileType.image);
+      final path = r?.files.single.path;
+      if (path != null) c.setAvatar(path);
+    } else if (v == 'reset') {
+      c.setAvatar('');
+    }
   }
 }
 
@@ -564,171 +437,116 @@ class _NetworkGroupState extends State<_NetworkGroup> {
 
   void _showIps(BuildContext context) {
     final ifs = _ifs ?? [];
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: AppTheme.cardOf(context),
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(10)),
-      ),
-      builder: (ctx) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const SizedBox(height: 6),
-            Center(
-              child: Container(
-                width: 26,
-                height: 3,
-                color: AppTheme.lineOf(context),
-              ),
-            ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 12, 16, 6),
-              child: Text(
-                tr('ip_sheet_title'),
-                style: const TextStyle(fontSize: 12, color: AppTheme.grey),
-              ),
-            ),
-            Flexible(
-              child: ListView(
-                shrinkWrap: true,
-                children: [
-                  for (final i in ifs)
-                    for (final a in i.addresses)
-                      ListTile(
-                        dense: true,
-                        minTileHeight: 36,
-                        contentPadding: const EdgeInsets.symmetric(
-                          horizontal: 16,
+    AppDialog.custom(
+      context,
+      title: tr('ip_sheet_title'),
+      child: ListView(
+        shrinkWrap: true,
+        children: [
+          for (final i in ifs)
+            for (final a in i.addresses)
+              ListTile(
+                dense: true,
+                minTileHeight: 36,
+                contentPadding: const EdgeInsets.symmetric(horizontal: 16),
+                title: Text(
+                  a.address,
+                  style: const TextStyle(
+                    fontSize: 13.5,
+                    fontFamily: 'monospace',
+                  ),
+                ),
+                subtitle: Text(
+                  i.name,
+                  style: const TextStyle(fontSize: 11, color: AppTheme.grey),
+                ),
+                trailing: a.isLoopback
+                    ? Text(
+                        tr('loopback'),
+                        style: const TextStyle(
+                          fontSize: 11,
+                          color: AppTheme.grey,
                         ),
-                        title: Text(
-                          a.address,
-                          style: const TextStyle(
-                            fontSize: 13.5,
-                            fontFamily: 'monospace',
-                          ),
-                        ),
-                        subtitle: Text(
-                          i.name,
-                          style: const TextStyle(
-                            fontSize: 11,
-                            color: AppTheme.grey,
-                          ),
-                        ),
-                        trailing: a.isLoopback
-                            ? Text(
-                                tr('loopback'),
-                                style: const TextStyle(
-                                  fontSize: 11,
-                                  color: AppTheme.grey,
-                                ),
-                              )
-                            : null,
-                        onTap: () {
-                          Clipboard.setData(ClipboardData(text: a.address));
-                          AppToast.show(
-                            context,
-                            trf('copied_addr', {'addr': a.address}),
-                          );
-                        },
-                      ),
-                ],
+                      )
+                    : null,
+                onTap: () {
+                  Clipboard.setData(ClipboardData(text: a.address));
+                  AppToast.show(
+                    context,
+                    trf('copied_addr', {'addr': a.address}),
+                  );
+                },
               ),
-            ),
-            const SizedBox(height: 8),
-          ],
-        ),
+          const SizedBox(height: 8),
+        ],
       ),
     );
   }
 
   void _showManualPeers(BuildContext context, RelayClient c) {
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: AppTheme.cardOf(context),
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(10)),
+    AppDialog.custom(
+      context,
+      title: tr('manual_devices_title'),
+      trailing: TextButton.icon(
+        onPressed: () => _showAddLanTargetDialog(context),
+        icon: const Icon(Icons.add, size: 15),
+        label: Text(tr('add'), style: const TextStyle(fontSize: 12)),
       ),
-      builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setSheet) => SafeArea(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const SizedBox(height: 6),
-              Center(
-                child: Container(
-                  width: 26,
-                  height: 3,
-                  color: AppTheme.lineOf(context),
+      child: StatefulBuilder(
+        builder: (ctx, setSheet) {
+          if (c.manualLanTargets.isEmpty) {
+            return Padding(
+              padding: const EdgeInsets.fromLTRB(16, 4, 16, 16),
+              child: Text(
+                tr('manual_devices_desc'),
+                style: const TextStyle(
+                  fontSize: 11.5,
+                  color: AppTheme.grey,
+                  height: 1.5,
                 ),
               ),
-              Padding(
-                padding: const EdgeInsets.fromLTRB(16, 12, 8, 6),
-                child: Row(
-                  children: [
-                    Expanded(
-                      child: Text(
-                        tr('manual_devices_title'),
+            );
+          }
+          // 设备多了限高滚动, 弹窗高度不随条目数膨胀
+          return ConstrainedBox(
+            constraints: const BoxConstraints(maxHeight: 280),
+            child: Scrollbar(
+              thumbVisibility: true,
+              child: ListView(
+                shrinkWrap: true,
+                padding: const EdgeInsets.only(bottom: 8),
+                children: [
+                  for (final t in c.manualLanTargets)
+                    ListTile(
+                      dense: true,
+                      minTileHeight: 36,
+                      contentPadding: const EdgeInsets.symmetric(
+                        horizontal: 16,
+                      ),
+                      title: Text(
+                        t,
                         style: const TextStyle(
-                          fontSize: 12,
-                          color: AppTheme.grey,
+                          fontSize: 13.5,
+                          fontFamily: 'monospace',
                         ),
                       ),
-                    ),
-                    TextButton.icon(
-                      onPressed: () => _showAddLanTargetDialog(context),
-                      icon: const Icon(Icons.add, size: 15),
-                      label: Text(
-                        tr('add'),
-                        style: const TextStyle(fontSize: 12),
+                      trailing: IconButton(
+                        icon: const Icon(
+                          Icons.delete_outline,
+                          size: 18,
+                          color: AppTheme.grey,
+                        ),
+                        onPressed: () async {
+                          await c.removeManualLanPeer(t);
+                          setSheet(() {});
+                        },
                       ),
                     ),
-                  ],
-                ),
+                ],
               ),
-              if (c.manualLanTargets.isEmpty)
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(16, 4, 16, 12),
-                  child: Text(
-                    tr('manual_devices_desc'),
-                    style: const TextStyle(
-                      fontSize: 11.5,
-                      color: AppTheme.grey,
-                      height: 1.5,
-                    ),
-                  ),
-                )
-              else
-                for (final t in c.manualLanTargets)
-                  ListTile(
-                    dense: true,
-                    minTileHeight: 36,
-                    contentPadding: const EdgeInsets.symmetric(horizontal: 16),
-                    title: Text(
-                      t,
-                      style: const TextStyle(
-                        fontSize: 13.5,
-                        fontFamily: 'monospace',
-                      ),
-                    ),
-                    trailing: IconButton(
-                      icon: const Icon(
-                        Icons.delete_outline,
-                        size: 18,
-                        color: AppTheme.grey,
-                      ),
-                      onPressed: () async {
-                        await c.removeManualLanPeer(t);
-                        setSheet(() {});
-                      },
-                    ),
-                  ),
-              const SizedBox(height: 8),
-            ],
-          ),
-        ),
+            ),
+          );
+        },
       ),
     );
   }
@@ -835,40 +653,14 @@ class _ClearCacheTileState extends State<_ClearCacheTile> {
   }
 
   Future<void> _confirmClear(RelayClient c) async {
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: AppTheme.cardOf(context),
-        surfaceTintColor: Colors.transparent,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-        title: Text(
-          tr('clear_cache'),
-          style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
-        ),
-        content: Text(
-          tr('clear_cache_msg'),
-          style: const TextStyle(fontSize: 13),
-        ),
-        actionsPadding: const EdgeInsets.fromLTRB(14, 0, 14, 12),
-        actions: [
-          OutlinedButton(
-            style: OutlinedButton.styleFrom(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-            ),
-            onPressed: () => Navigator.pop(ctx, false),
-            child: Text(tr('cancel')),
-          ),
-          FilledButton(
-            style: FilledButton.styleFrom(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-            ),
-            onPressed: () => Navigator.pop(ctx, true),
-            child: Text(tr('clear')),
-          ),
-        ],
-      ),
+    final ok = await AppDialog.confirm(
+      context,
+      title: tr('clear_cache'),
+      message: tr('clear_cache_msg'),
+      okLabel: tr('clear'),
+      danger: true,
     );
-    if (ok == true) {
+    if (ok) {
       await c.clearCache();
       await _load();
       if (mounted) {
@@ -947,75 +739,34 @@ class _SaveDirTile extends StatelessWidget {
     );
   }
 
-  void _showMenu(BuildContext context, RelayClient c, String dir) {
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: AppTheme.cardOf(context),
-      constraints: const BoxConstraints(maxWidth: 250),
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(10)),
-      ),
-      builder: (ctx) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const SizedBox(height: 6),
-            Container(width: 26, height: 3, color: AppTheme.lineOf(context)),
-            const SizedBox(height: 2),
-            _menuItem(
-              icon: Icons.folder_open,
-              label: tr('open_folder'),
-              onTap: () {
-                Navigator.pop(ctx);
-                _openDir(context, dir);
-              },
-            ),
-            _menuItem(
-              icon: Icons.drive_file_move_outline,
-              label: tr('change_save_dir'),
-              onTap: () async {
-                Navigator.pop(ctx);
-                final picked = await FilePicker.platform.getDirectoryPath();
-                if (picked != null && picked.isNotEmpty) {
-                  await c.setDownloadDir(picked);
-                  if (context.mounted) {
-                    AppToast.show(context, tr('dir_updated'));
-                  }
-                }
-              },
-            ),
-            _menuItem(
-              icon: Icons.restart_alt,
-              label: tr('reset_save_dir'),
-              onTap: () async {
-                Navigator.pop(ctx);
-                await c.setDownloadDir(null);
-                if (context.mounted) {
-                  AppToast.show(context, tr('dir_reset'));
-                }
-              },
-            ),
-            const SizedBox(height: 4),
-          ],
-        ),
-      ),
+  void _showMenu(BuildContext context, RelayClient c, String dir) async {
+    final v = await AppDialog.actions<String>(
+      context,
+      title: tr('save_dir'),
+      actions: [
+        AppDialogAction(tr('open_folder'), 'open'),
+        AppDialogAction(tr('change_save_dir'), 'change'),
+        AppDialogAction(tr('reset_save_dir'), 'reset'),
+      ],
     );
-  }
-
-  Widget _menuItem({
-    required IconData icon,
-    required String label,
-    required VoidCallback onTap,
-  }) {
-    return ListTile(
-      dense: true,
-      minTileHeight: 34,
-      horizontalTitleGap: 8,
-      contentPadding: const EdgeInsets.symmetric(horizontal: 14),
-      leading: Icon(icon, size: 15),
-      title: Text(label, style: const TextStyle(fontSize: 12.5)),
-      onTap: onTap,
-    );
+    if (!context.mounted) return;
+    switch (v) {
+      case 'open':
+        _openDir(context, dir);
+      case 'change':
+        final picked = await FilePicker.platform.getDirectoryPath();
+        if (picked != null && picked.isNotEmpty) {
+          await c.setDownloadDir(picked);
+          if (context.mounted) {
+            AppToast.show(context, tr('dir_updated'));
+          }
+        }
+      case 'reset':
+        await c.setDownloadDir(null);
+        if (context.mounted) {
+          AppToast.show(context, tr('dir_reset'));
+        }
+    }
   }
 
   Future<void> _openDir(BuildContext context, String dir) async {
@@ -1043,62 +794,15 @@ class _SaveDirTile extends StatelessWidget {
 /// 用于广播不可达的场景 (如 Android 模拟器, 填 10.0.2.2 可连宿主机)。
 Future<void> _showAddLanTargetDialog(BuildContext context) async {
   final c = context.read<RelayClient>();
-  final ctrl = TextEditingController();
-  final input = await showDialog<String>(
-    context: context,
-    builder: (ctx) => AlertDialog(
-      backgroundColor: AppTheme.cardOf(context),
-      surfaceTintColor: Colors.transparent,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-      title: Text(
-        tr('manual_devices'),
-        style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
-      ),
-      content: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          TextField(
-            controller: ctrl,
-            autofocus: true,
-            keyboardType: TextInputType.url,
-            decoration: InputDecoration(hintText: tr('lan_target_hint')),
-            onSubmitted: (_) => Navigator.pop(ctx, ctrl.text.trim()),
-          ),
-          const SizedBox(height: 10),
-          Text(
-            tr('lan_target_desc'),
-            style: const TextStyle(
-              fontSize: 11,
-              color: AppTheme.grey,
-              height: 1.5,
-            ),
-          ),
-        ],
-      ),
-      actionsPadding: const EdgeInsets.fromLTRB(14, 0, 14, 12),
-      actions: [
-        OutlinedButton(
-          style: OutlinedButton.styleFrom(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-          ),
-          onPressed: () => Navigator.pop(ctx),
-          child: Text(tr('cancel')),
-        ),
-        FilledButton(
-          style: FilledButton.styleFrom(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-          ),
-          onPressed: () => Navigator.pop(ctx, ctrl.text.trim()),
-          child: Text(tr('connect')),
-        ),
-      ],
-    ),
+  final input = await AppDialog.input(
+    context,
+    title: tr('manual_devices'),
+    hint: tr('lan_target_hint'),
+    desc: tr('lan_target_desc'),
+    okLabel: tr('connect'),
+    keyboardType: TextInputType.url,
   );
-  // showDialog 完成时退出动画仍在播放, TextField 还在树里;
-  // 立即 dispose 会让动画重建崩 "used after disposed", 延迟到动画结束
-  Future<void>.delayed(const Duration(milliseconds: 300), ctrl.dispose);
-  if (input == null || input.isEmpty || !context.mounted) return;
+  if (input == null || !context.mounted) return;
   AppToast.show(context, tr('connecting'), sticky: true);
   final peerId = await c.addManualLanPeer(input);
   if (!context.mounted) return;
@@ -1106,5 +810,254 @@ Future<void> _showAddLanTargetDialog(BuildContext context) async {
     AppToast.show(context, trf('connected_to', {'name': c.peerName(peerId)}));
   } else {
     AppToast.show(context, tr('connect_fail'));
+  }
+}
+
+/// 设置子页通用 AppBar (标题 + 底部分隔线)
+PreferredSizeWidget _subAppBar(String title) => AppBar(
+  title: Text(title),
+  bottom: const PreferredSize(
+    preferredSize: Size.fromHeight(1),
+    child: Divider(height: 1),
+  ),
+);
+
+/// 连接设置子页: 功能模式 / 中继服务器 / 局域网直连
+class ConnSettingsPage extends StatelessWidget {
+  const ConnSettingsPage({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.watch<RelayClient>();
+    return Scaffold(
+      backgroundColor: AppTheme.softOf(context),
+      appBar: _subAppBar(tr('settings_conn')),
+      body: ListView(
+        children: [
+          const SizedBox(height: 10),
+          // ---- 功能模式 ----
+          _Group(
+            children: [
+              _Tile(
+                title: tr('mode_title'),
+                value: switch (c.connMode) {
+                  'relay' => tr('mode_relay'),
+                  'lan' => tr('mode_lan'),
+                  _ => tr('mode_both'),
+                },
+                onTap: () => SettingsPage._pickConnMode(context, c),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          // ---- 中继服务器 (仅局域网模式下隐藏) ----
+          if (c.connMode != 'lan') ...[
+            _Group(
+              children: [
+                _Tile(
+                  title: tr('server'),
+                  value: c.serverAddr.isEmpty ? tr('not_set') : c.serverAddr,
+                  // 连接中也可编辑, 保存后自动断开旧连接并重连新地址
+                  onTap: () => SettingsPage._editField(
+                    context,
+                    title: tr('server_addr_title'),
+                    hint: tr('server_addr_hint'),
+                    initial: c.serverAddr,
+                    onSubmit: (v) {
+                      if (v.isNotEmpty) c.connect(v);
+                    },
+                  ),
+                ),
+                _Tile(
+                  title: tr('server_key'),
+                  value: c.serverKey.isEmpty
+                      ? tr('not_set')
+                      : '••••••••', // 密码不回显
+                  onTap: () => SettingsPage._editField(
+                    context,
+                    title: tr('server_key'),
+                    hint: tr('server_key_hint'),
+                    initial: c.serverKey,
+                    obscure: true,
+                    allowEmpty: true, // 清空 = 不再发送接入密码
+                    onSubmit: (v) => c.setServerKey(v),
+                  ),
+                ),
+                _ServerStatusTile(),
+              ],
+            ),
+            const SizedBox(height: 10),
+          ],
+          // ---- 局域网 (仅中继模式下隐藏) ----
+          if (c.connMode != 'relay') ...[
+            const _NetworkGroup(),
+            const SizedBox(height: 10),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+/// 通用设置子页: 配对/传输/存储/黑名单 + 各项开关
+class GeneralSettingsPage extends StatelessWidget {
+  const GeneralSettingsPage({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.watch<RelayClient>();
+    return Scaffold(
+      backgroundColor: AppTheme.softOf(context),
+      appBar: _subAppBar(tr('settings_general')),
+      body: ListView(
+        children: [
+          const SizedBox(height: 10),
+          _Group(
+            children: [
+              const _SaveDirTile(),
+              const _ClearCacheTile(),
+              _Tile(
+                title: tr('blocklist'),
+                value: trf('n_items', {
+                  'n': c.blockedPeers.length + c.blockedIps.length,
+                }),
+                onTap: () => Navigator.pushNamed(context, '/blocklist'),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          _Group(
+            children: [
+              _Tile(
+                title: tr('queue_sends'),
+                trailing: Switch(
+                  value: c.queueSends,
+                  onChanged: (v) => c.setQueueSends(v),
+                ),
+                onTap: () => c.setQueueSends(!c.queueSends),
+              ),
+              _Tile(
+                title: tr('p2p_title'),
+                trailing: Switch(
+                  value: c.p2pEnabled,
+                  onChanged: (v) => c.setP2pEnabled(v),
+                ),
+                onTap: () => c.setP2pEnabled(!c.p2pEnabled),
+              ),
+              _Tile(
+                title: tr('compress_images'),
+                trailing: Switch(
+                  value: c.compressImages,
+                  onChanged: (v) => c.setCompressImages(v),
+                ),
+                onTap: () => c.setCompressImages(!c.compressImages),
+              ),
+              _Tile(
+                title: tr('fs_preview_limit'),
+                value: '${c.fsPreviewMaxMb} MB',
+                onTap: () => SettingsPage._pickPreviewLimit(context),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+        ],
+      ),
+    );
+  }
+}
+
+/// 剪贴板同步设置子页
+class ClipSettingsPage extends StatelessWidget {
+  const ClipSettingsPage({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.watch<RelayClient>();
+    return Scaffold(
+      backgroundColor: AppTheme.softOf(context),
+      appBar: _subAppBar(tr('clip_sync')),
+      body: ListView(
+        children: [
+          const SizedBox(height: 10),
+          _Group(
+            children: [
+              _Tile(
+                title: tr('clip_sync'),
+                trailing: Switch(
+                  value: c.clipSyncEnabled,
+                  onChanged: (v) => c.setClipSyncEnabled(v),
+                ),
+                onTap: () => c.setClipSyncEnabled(!c.clipSyncEnabled),
+              ),
+              _Tile(
+                title: tr('clip_auto_paste'),
+                trailing: Switch(
+                  value: c.clipAutoPaste,
+                  onChanged: (v) => c.setClipAutoPaste(v),
+                ),
+                onTap: () => c.setClipAutoPaste(!c.clipAutoPaste),
+              ),
+              _Tile(
+                title: tr('clip_block_archives'),
+                trailing: Switch(
+                  value: c.clipBlockArchives,
+                  onChanged: (v) => c.setClipBlock('archives', v),
+                ),
+                onTap: () => c.setClipBlock('archives', !c.clipBlockArchives),
+              ),
+              _Tile(
+                title: tr('clip_block_images'),
+                trailing: Switch(
+                  value: c.clipBlockImages,
+                  onChanged: (v) => c.setClipBlock('images', v),
+                ),
+                onTap: () => c.setClipBlock('images', !c.clipBlockImages),
+              ),
+              _Tile(
+                title: tr('clip_block_videos'),
+                trailing: Switch(
+                  value: c.clipBlockVideos,
+                  onChanged: (v) => c.setClipBlock('videos', v),
+                ),
+                onTap: () => c.setClipBlock('videos', !c.clipBlockVideos),
+              ),
+              _Tile(
+                title: tr('clip_custom_exts'),
+                value: c.clipBlockedExts.isEmpty
+                    ? tr('not_set')
+                    : c.clipBlockedExts.join(', '),
+                onTap: () => Navigator.pushNamed(context, '/clip_exts'),
+              ),
+            ],
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 6, 16, 0),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  tr('clip_sync_trust_hint'),
+                  style: const TextStyle(
+                    fontSize: 11,
+                    color: AppTheme.grey,
+                    height: 1.5,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  tr('clip_auto_paste_off_hint'),
+                  style: const TextStyle(
+                    fontSize: 11,
+                    color: AppTheme.grey,
+                    height: 1.5,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 10),
+        ],
+      ),
+    );
   }
 }

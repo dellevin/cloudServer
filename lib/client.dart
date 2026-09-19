@@ -10,6 +10,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:image/image.dart' as img;
+import 'package:pasteboard/pasteboard.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -17,19 +18,21 @@ import 'package:uuid/uuid.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import 'db.dart';
+import 'e2ee.dart';
 import 'image_compress.dart';
 import 'l10n.dart';
 import 'lan.dart';
 import 'log.dart';
 import 'models.dart';
 import 'transfer_service.dart';
+import 'ui/video_thumbs.dart';
 
 /// 中继协议:
 /// 文本帧(JSON):
 ///  C->S {type:'register', id, name}
 ///  S->C {type:'peers', peers:[{id,name}...]}
 ///  转发(带 from/to): chat / chat_ack / file_offer / file_accept / file_reject
-///    / file_done / file_progress / file_result / file_cancel
+///    / file_done / file_progress / file_result / file_cancel / clip_text
 /// 二进制帧: 36字节 transferId(ASCII) + 文件数据块, 服务器按 transferId 路由
 ///
 /// 传输可靠性:
@@ -61,8 +64,31 @@ class RelayClient extends ChangeNotifier {
   /// 发送图片前用 Luban 算法压缩 (默认开); 关闭时相册/拍照发原图
   bool compressImages = true;
 
+  // ---- 剪贴板同步 (仅信任设备; 2s 轮询本机剪贴板, 文本/图片/文件) ----
+
+  /// 总开关 (默认开): 关闭后不监听本机剪贴板也不接收对端同步
+  bool clipSyncEnabled = true;
+
+  /// 收到对端剪贴板文本后自动写入本机剪贴板 (默认关: 只进列表, 手动点复制)
+  bool clipAutoPaste = false;
+
+  /// 上传黑名单: 不上传压缩包/图片/视频 (默认全部允许)
+  bool clipBlockArchives = false;
+  bool clipBlockImages = false;
+  bool clipBlockVideos = false;
+
+  /// 上传黑名单: 自定义扩展名 (小写, 不带点, 如 ifo / c)
+  List<String> clipBlockedExts = [];
+
   /// 信任的设备 (设备ID): 这些设备发来的文件自动接受, 不再弹窗询问
   Set<String> trustedPeers = {};
+
+  /// 服务器接入密码 (服务器启用 --access-key 时必须填写, 否则被踢)
+  String serverKey = '';
+
+  /// P2P 打洞直连 (默认开): 中继传输时尝试与对方建立跨网段 TCP 直连,
+  /// 成功后续传数据不走服务器, 失败静默回落中继
+  bool p2pEnabled = true;
 
   /// 拉黑的设备 (设备ID): 其聊天消息静默丢弃, 文件请求自动拒绝
   Set<String> blockedPeers = {};
@@ -72,6 +98,11 @@ class RelayClient extends ChangeNotifier {
 
   /// 拉黑的 IP: 局域网连接/宣告直接忽略 (中继看不到对端 IP, 仅局域网生效)
   Set<String> blockedIps = {};
+
+  /// 历史连接过的设备 (持久化): id → {name, avatar, platform, lastSeen},
+  /// 设备页「未在线」分组的数据源; 上线时由 _rebuildPeers 更新
+  Map<String, Map<String, dynamic>> knownPeers = {};
+
   List<Peer> peers = []; // 中继 + 局域网合并后的在线设备
   List<Peer> _relayPeers = []; // 仅中继服务器下发的在线设备
   Set<String> _relayIds = {};
@@ -103,6 +134,8 @@ class RelayClient extends ChangeNotifier {
     'black_ip' => tr('blocked_black_ip'),
     'white' => tr('blocked_white'),
     'rate' => tr('blocked_rate'),
+    'auth' => tr('blocked_auth'),
+    'auth_ban' => tr('blocked_auth_ban'),
     _ => tr('blocked_unknown'),
   };
 
@@ -110,6 +143,10 @@ class RelayClient extends ChangeNotifier {
   @override
   void notifyListeners() {
     super.notifyListeners();
+    _syncTransferService();
+  }
+
+  void _syncTransferService() {
     if (!Platform.isAndroid || _svcSyncPending) return;
     _svcSyncPending = true;
     scheduleMicrotask(() {
@@ -161,7 +198,9 @@ class RelayClient extends ChangeNotifier {
 
   final Map<String, IOSink> _incoming = {};
   final Map<String, _HashState> _recvHash = {}; // 接收侧累积哈希
+  final Set<String> _accepting = {}; // acceptFile 防重入 (见下方注释)
   final Map<String, int> _recvAcked = {}; // 接收侧上次回执的字节数
+  final Map<String, int> _recvLastTs = {}; // 接收侧最后收到分块的毫秒时间戳
   final Map<String, int> _sendAcked = {}; // 发送侧: 对方已确认收到的字节数
   final Map<String, Completer<void>> _sendWaiters = {}; // 背压等待
   final Set<String> _canceled = {}; // 已取消的 transferId (发送循环据此退出)
@@ -169,6 +208,58 @@ class RelayClient extends ChangeNotifier {
   final Set<String> _unverified = {}; // 已发完但尚未收到接收端校验结果的 transferId
   int _lastNotifyBytes = 0;
   int _lastNotifyTs = 0; // 上次进度通知时间 (高速传输时按 200ms 节流)
+
+  // ---- 失败自动重试 (指数退避, 最多 3 次; 用户取消/拒绝不触发) ----
+  final Map<String, int> _retryAttempts = {}; // transferId -> 已自动重试次数
+  final Map<String, int> _retrySchedules = {}; // transferId -> 已排期次数 (含对端不在线的空转)
+  final Map<String, Timer> _retryTimers = {};
+  static const _maxAutoRetries = 3;
+  static const _maxRetrySchedules = 6;
+
+  /// 网络类失败兜底重试: 2s/4s/8s 退避; 触发时对端不在线则重新排期
+  /// (空转最多 6 次, 防对端长期离线时无限挂定时器)
+  void _autoRetry(FileTransfer t) {
+    if (t.status != TransferStatus.failed) return;
+    if ((_retryAttempts[t.transferId] ?? 0) >= _maxAutoRetries) return;
+    final sched = (_retrySchedules[t.transferId] ?? 0) + 1;
+    if (sched > _maxRetrySchedules) return;
+    _retrySchedules[t.transferId] = sched;
+    _retryTimers[t.transferId]?.cancel();
+    final n = (_retryAttempts[t.transferId] ?? 0) + 1;
+    _retryTimers[t.transferId] = Timer(Duration(seconds: 2 << (n - 1)), () async {
+      _retryTimers.remove(t.transferId);
+      if (!transfers.contains(t) || t.status != TransferStatus.failed) return;
+      if (!isOnline(t.peerId)) {
+        _autoRetry(t); // 对端还没回来: 不消耗重试次数, 重新排期等下一轮
+        return;
+      }
+      final attempt = (_retryAttempts[t.transferId] ?? 0) + 1;
+      _retryAttempts[t.transferId] = attempt;
+      Log.i('transfer', 'auto-retry #$attempt ${t.fileName}');
+      if (t.outgoing) {
+        await retrySend(t);
+      } else {
+        await retryReceive(t);
+      }
+    });
+  }
+
+  /// 重试账本清零: 成功/取消/手动重试时调用, 下次失败重新计 3 次
+  void _resetRetry(String tid) {
+    _retryAttempts.remove(tid);
+    _retrySchedules.remove(tid);
+    _retryTimers.remove(tid)?.cancel();
+  }
+
+  /// 传输进度轻量通知: 进度 tick 走它, 不触发整页重建;
+  /// 进度条用 ValueListenableBuilder 订阅, 状态变化仍走 ChangeNotifier
+  final ValueNotifier<int> progressTick = ValueNotifier<int>(0);
+
+  /// 轻量进度 tick: 进度条走 ValueListenableBuilder, Android 通知进度也要刷
+  void _bumpProgress() {
+    progressTick.value++;
+    _syncTransferService();
+  }
 
   // ---- 发送队列 (queueSends 开启时, 同一对端串行发送) ----
   final Set<String> _sendingPeers = {}; // 当前有发送任务在跑的对端
@@ -188,9 +279,19 @@ class RelayClient extends ChangeNotifier {
     await sp.setString('deviceName', deviceName);
     avatarPath = sp.getString('avatarPath') ?? '';
     serverAddr = sp.getString('serverAddr') ?? '';
+    serverKey = sp.getString('serverKey') ?? '';
+    await E2ee.setPassword(serverKey);
+    p2pEnabled = sp.getBool('p2pEnabled') ?? true;
     connMode = sp.getString('connMode') ?? 'both';
     queueSends = sp.getBool('queueSends') ?? true;
     compressImages = sp.getBool('compressImages') ?? true;
+    fsPreviewMaxMb = sp.getInt('fsPreviewMaxMb') ?? 20;
+    clipSyncEnabled = sp.getBool('clipSyncEnabled') ?? true;
+    clipAutoPaste = sp.getBool('clipAutoPaste') ?? false;
+    clipBlockArchives = sp.getBool('clipBlockArchives') ?? true;
+    clipBlockImages = sp.getBool('clipBlockImages') ?? true;
+    clipBlockVideos = sp.getBool('clipBlockVideos') ?? true;
+    clipBlockedExts = sp.getStringList('clipBlockedExts') ?? [];
     trustedPeers = (sp.getStringList('trustedPeers') ?? []).toSet();
     blockedPeers = (sp.getStringList('blockedPeers') ?? []).toSet();
     blockedIps = (sp.getStringList('blockedIps') ?? []).toSet();
@@ -199,6 +300,16 @@ class RelayClient extends ChangeNotifier {
       if (raw != null) {
         blockedPeerNames = Map<String, String>.from(
           jsonDecode(raw) as Map<String, dynamic>,
+        );
+      }
+    } catch (_) {}
+    try {
+      final raw = sp.getString('knownPeers');
+      if (raw != null) {
+        knownPeers = Map<String, Map<String, dynamic>>.from(
+          (jsonDecode(raw) as Map<String, dynamic>).map(
+            (k, v) => MapEntry(k, Map<String, dynamic>.from(v as Map)),
+          ),
         );
       }
     } catch (_) {}
@@ -244,7 +355,41 @@ class RelayClient extends ChangeNotifier {
     _initLifecycle();
     await _restoreLocalData();
     _updateBadge();
+    // 接收停滞看门狗: 发送端掉线/崩溃时, 接收端不会永远卡在「传输中」
+    Timer.periodic(const Duration(seconds: 10), (_) => _recvWatchdogTick());
+    // 剪贴板同步: 2s 轮询 (桌面端没有剪贴板变更事件; Android 仅前台可读,
+    // 轮询到系统拒绝会拿到 null, 天然静默)
+    Timer.periodic(const Duration(seconds: 2), (_) => _clipTick());
     if (serverAddr.isNotEmpty && _relayActive) connect(serverAddr);
+  }
+
+  /// 传输中但超过 45s 没收到任何分块: 判失败 (.part 保留, 可点续传)
+  void _recvWatchdogTick() {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    for (final t in transfers) {
+      if (t.outgoing) continue;
+      final last = _recvLastTs[t.transferId];
+      if (t.status == TransferStatus.transferring) {
+        if (last == null || now - last < 45000) continue;
+      } else if (t.status == TransferStatus.accepted && t.bytesDone == 0) {
+        // accept 后首分块迟迟不来: 对端在线则可能在排队大文件, 只有
+        // 对端已离线且超 60s 才判失败, 避免误杀正常排队
+        if (last == null || now - last < 60000 || isOnline(t.peerId)) {
+          continue;
+        }
+      } else {
+        continue;
+      }
+      Log.e(
+        'transfer',
+        'recv stalled ${t.fileName} (${t.bytesDone}/${t.fileSize}B), mark failed',
+      );
+      t.status = TransferStatus.failed;
+      unawaited(_closeIncoming(t.transferId, deletePart: false));
+      ChatDb.upsertTransfer(t);
+      notifyListeners();
+      _autoRetry(t);
+    }
   }
 
   /// 构造局域网管理器 (未启动状态; 仅中继模式下作为空实例占位)
@@ -255,6 +400,7 @@ class RelayClient extends ChangeNotifier {
       getAvatarB64: _avatarBase64,
     );
     lan.shouldBlockIp = (ip) => blockedIps.contains(ip);
+    lan.validateP2pHello = _validateP2pHello;
     return lan;
   }
 
@@ -317,6 +463,17 @@ class RelayClient extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// 构造 register 消息 (接入密码非空时携带; 服务器未启用时多余字段被忽略)
+  Future<Map<String, dynamic>> _registerMsg() async => {
+    'type': 'register',
+    'id': deviceId,
+    'name': deviceName,
+    'avatar': await _avatarBase64(),
+    'ver': kProtocolVersion,
+    'platform': Platform.operatingSystem,
+    if (serverKey.isNotEmpty) 'key': serverKey,
+  };
+
   /// 下拉刷新 (设备页/聊天页): 局域网立即重播宣告 + 补连掉线的手动设备;
   /// 中继重新 register 换取最新在线列表 (服务器覆盖旧条目并广播 peers),
   /// 未连接时下拉等同于手动重连。顺带补发未送达消息。
@@ -333,16 +490,7 @@ class RelayClient extends ChangeNotifier {
     }
     if (_relayActive) {
       if (connected) {
-        _ch?.sink.add(
-          jsonEncode({
-            'type': 'register',
-            'id': deviceId,
-            'name': deviceName,
-            'avatar': await _avatarBase64(),
-            'ver': kProtocolVersion,
-            'platform': Platform.operatingSystem,
-          }),
-        );
+        _ch?.sink.add(jsonEncode(await _registerMsg()));
       } else if (serverAddr.isNotEmpty) {
         unawaited(connect(serverAddr));
       }
@@ -474,7 +622,9 @@ class RelayClient extends ChangeNotifier {
       final decoded = img.decodeImage(bytes);
       if (decoded == null) return null;
       final resized = img.copyResizeCropSquare(decoded, size: 96);
-      _avatarB64 = base64Encode(img.encodePng(resized));
+      // 用 JPEG 不用 PNG: 照片内容 PNG 有 20KB+ (base64 超局域网宣告的
+      // 16KB 上限直接被丢弃, 对端永远看不到头像), JPEG 只有 ~4KB
+      _avatarB64 = base64Encode(img.encodeJpg(resized, quality: 85));
       return _avatarB64;
     } catch (_) {
       return null;
@@ -514,19 +664,108 @@ class RelayClient extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// 远程浏览「直接预览」的大小上限 (MB), 超过只能下载; 默认 20MB
+  int fsPreviewMaxMb = 20;
+
+  /// 字节数形式 (浏览页判断用)
+  int get fsPreviewMax => fsPreviewMaxMb * 1024 * 1024;
+
+  /// 设置远程预览大小上限 (持久化)
+  Future<void> setFsPreviewMaxMb(int v) async {
+    fsPreviewMaxMb = v;
+    (await SharedPreferences.getInstance()).setInt('fsPreviewMaxMb', v);
+    Log.i('app', 'fsPreviewMaxMb -> $v');
+    notifyListeners();
+  }
+
+  /// 切换剪贴板同步总开关 (持久化)
+  Future<void> setClipSyncEnabled(bool v) async {
+    clipSyncEnabled = v;
+    (await SharedPreferences.getInstance()).setBool('clipSyncEnabled', v);
+    Log.i('clip', 'clipSyncEnabled -> $v');
+    notifyListeners();
+  }
+
+  /// 切换收到剪贴板文本自动写入本机剪贴板 (持久化)
+  Future<void> setClipAutoPaste(bool v) async {
+    clipAutoPaste = v;
+    (await SharedPreferences.getInstance()).setBool('clipAutoPaste', v);
+    Log.i('clip', 'clipAutoPaste -> $v');
+    notifyListeners();
+  }
+
+  /// 切换剪贴板上传黑名单项 (持久化); which = archives / images / videos
+  Future<void> setClipBlock(String which, bool v) async {
+    switch (which) {
+      case 'archives':
+        clipBlockArchives = v;
+      case 'images':
+        clipBlockImages = v;
+      case 'videos':
+        clipBlockVideos = v;
+      default:
+        return;
+    }
+    (await SharedPreferences.getInstance()).setBool(
+      'clipBlock${which[0].toUpperCase()}${which.substring(1)}',
+      v,
+    );
+    Log.i('clip', 'clipBlock $which -> $v');
+    notifyListeners();
+  }
+
+  /// 设置自定义拦截扩展名列表 (持久化; 输入自动小写、去点、去重)
+  Future<void> setClipBlockedExts(List<String> exts) async {
+    clipBlockedExts = exts
+        .map((e) => e.trim().toLowerCase().replaceFirst(RegExp(r'^\.'), ''))
+        .where((e) => e.isNotEmpty)
+        .toSet()
+        .toList();
+    (await SharedPreferences.getInstance()).setStringList(
+      'clipBlockedExts',
+      clipBlockedExts,
+    );
+    Log.i('clip', 'clipBlockedExts -> $clipBlockedExts');
+    notifyListeners();
+  }
+
+  /// 设置服务器接入密码 (持久化; 已连接时立即重连生效)
+  Future<void> setServerKey(String key) async {
+    serverKey = key.trim();
+    (await SharedPreferences.getInstance()).setString('serverKey', serverKey);
+    unawaited(E2ee.setPassword(serverKey)); // E2EE 密钥随接入密码更新
+    Log.i('app', 'serverKey updated (len=${serverKey.length})');
+    notifyListeners();
+    if (connected) {
+      disconnect();
+      connect(serverAddr);
+    }
+  }
+
+  /// 切换 P2P 打洞直连 (持久化)
+  Future<void> setP2pEnabled(bool v) async {
+    p2pEnabled = v;
+    (await SharedPreferences.getInstance()).setBool('p2pEnabled', v);
+    Log.i('app', 'p2pEnabled -> $v');
+    notifyListeners();
+  }
+
   bool isTrusted(String peerId) => trustedPeers.contains(peerId);
 
   /// 信任/取消信任设备: 信任的设备发来的文件自动接受 (持久化)
   Future<void> setTrusted(String peerId, bool v) async {
     if (v) {
       trustedPeers.add(peerId);
+      // 信任与拉黑互斥: 拉黑状态下信任无意义 (消息照样被丢弃)
+      blockedPeers.remove(peerId);
+      blockedPeerNames.remove(peerId);
     } else {
       trustedPeers.remove(peerId);
     }
-    (await SharedPreferences.getInstance()).setStringList(
-      'trustedPeers',
-      trustedPeers.toList(),
-    );
+    final sp = await SharedPreferences.getInstance();
+    sp.setStringList('trustedPeers', trustedPeers.toList());
+    sp.setStringList('blockedPeers', blockedPeers.toList());
+    sp.setString('blockedPeerNames', jsonEncode(blockedPeerNames));
     Log.i('app', 'trusted $peerId -> $v');
     notifyListeners();
   }
@@ -627,16 +866,7 @@ class RelayClient extends ChangeNotifier {
         return;
       }
       _ch = ch;
-      _ch!.sink.add(
-        jsonEncode({
-          'type': 'register',
-          'id': deviceId,
-          'name': deviceName,
-          'avatar': await _avatarBase64(),
-          'ver': kProtocolVersion,
-          'platform': Platform.operatingSystem,
-        }),
-      );
+      _ch!.sink.add(jsonEncode(await _registerMsg()));
       connected = true;
       _retryCount = 0;
       notifyListeners();
@@ -692,6 +922,10 @@ class RelayClient extends ChangeNotifier {
     connected = false;
     _relayPeers = [];
     _relayIds = {};
+    // 中继断开: 进行中的打洞信令已无法送达, 全部作废 (已建立的直连链路不受影响)
+    for (final s in _punches.values.toList()) {
+      _failPunch(s);
+    }
     _rebuildPeers();
     if (!_manualClose) Log.w('relay', 'connection lost');
     // 断线时进行中的传输标记失败 (接收侧保留 .part, 可断点续传);
@@ -702,6 +936,7 @@ class RelayClient extends ChangeNotifier {
           t.status == TransferStatus.accepted) {
         t.status = TransferStatus.failed;
         ChatDb.upsertTransfer(t);
+        _autoRetry(t); // 重连后退避重试; 触发时对端仍不在线则放弃
       }
     }
     for (final tid in _incoming.keys.toList()) {
@@ -734,14 +969,17 @@ class RelayClient extends ChangeNotifier {
   void _rebuildPeers() {
     // 头像变化时让缓存失效 (与旧列表对比)
     final oldAvatar = {for (final p in peers) p.id: p.avatar};
+    final oldIds = oldAvatar.keys.toSet();
     final map = <String, Peer>{};
     for (final p in _relayPeers) {
       map[p.id] = Peer(
         id: p.id,
         name: p.name,
-        avatar: p.avatar,
+        // 本次没拿到头像时沿用历史记录里的 (局域网宣告可能不带头像)
+        avatar: p.avatar ?? knownPeers[p.id]?['avatar'] as String?,
         platform: p.platform,
         viaRelay: true,
+        ver: p.ver,
       );
     }
     if (_lanActive) {
@@ -751,25 +989,82 @@ class RelayClient extends ChangeNotifier {
         map[e.key] = Peer(
           id: info.id,
           name: ex?.name ?? info.name,
-          avatar: ex?.avatar ?? info.avatar,
+          avatar:
+              ex?.avatar ??
+              info.avatar ??
+              knownPeers[e.key]?['avatar'] as String?,
           platform: ex?.platform ?? info.platform,
           viaRelay: ex != null,
           viaLan: true,
+          ver: info.ver != 0 ? info.ver : (ex?.ver ?? 0),
         );
       }
     }
     for (final p in map.values) {
       if (oldAvatar[p.id] != p.avatar) _avatarBytesCache.remove(p.id);
     }
+    // 登记历史设备: 新上线或资料变化时更新并持久化 (离线后设备页仍可见)
+    var knownChanged = false;
+    for (final p in map.values) {
+      final k = knownPeers[p.id];
+      final appeared = !oldIds.contains(p.id);
+      // 本次没拿到头像时保留已存的, 不能用 null 覆盖掉好数据
+      final avatar = p.avatar ?? k?['avatar'] as String?;
+      if (k == null ||
+          appeared ||
+          k['name'] != p.name ||
+          k['avatar'] != avatar ||
+          k['platform'] != p.platform) {
+        knownPeers[p.id] = {
+          'name': p.name,
+          'avatar': avatar,
+          'platform': p.platform,
+          'lastSeen': DateTime.now().millisecondsSinceEpoch,
+        };
+        knownChanged = true;
+      }
+    }
+    if (knownChanged) {
+      unawaited(
+        SharedPreferences.getInstance().then(
+          (sp) => sp.setString('knownPeers', jsonEncode(knownPeers)),
+        ),
+      );
+    }
     peers = map.values.toList();
     notifyListeners();
   }
 
-  /// 发送控制消息; 对端在局域网内时优先走直连, 连不上回退中继
+  /// 发送控制消息; 满足 E2EE 条件时先加密成 enc 信封再发
   void _send(Map<String, dynamic> msg) {
     final to = msg['to'] as String?;
-    // 拉黑只在消息层拦截 (_onData 丢弃并回拒收), 传输层保持连通,
-    // 否则拒收回执在纯局域网场景根本送不到对方
+    if (to != null && _shouldEncrypt(to, msg)) {
+      // 发送者身份放进密文: 中继注入的外层 from 可被伪造, 内层 from 有 GCM 认证
+      msg['from'] = deviceId;
+      unawaited(() async {
+        _sendRaw(await E2ee.wrap(msg));
+      }());
+      return;
+    }
+    _sendRaw(msg);
+  }
+
+  /// E2EE 条件: 已设接入密码 + 对端协议 v3+ (老端不认识 enc 会丢消息)。
+  /// p2p_* 信令除外: 服务器要往里注入 fromIp, 且 sid/token/端口不算敏感
+  bool _shouldEncrypt(String to, Map<String, dynamic> msg) {
+    if (!E2ee.enabled) return false;
+    final t = msg['type'] as String?;
+    if (t == null || t == 'enc' || t.startsWith('p2p_')) return false;
+    for (final p in peers) {
+      if (p.id == to) return p.ver >= 3;
+    }
+    return false; // 对端不在线列表: 无法确认能力, 保持明文
+  }
+
+  /// 实际发送控制消息; 对端在局域网内时优先走直连, 连不上回退中继
+  /// (拉黑只在消息层拦截, 传输层保持连通, 否则拒收回执在纯局域网场景送不到)
+  void _sendRaw(Map<String, dynamic> msg) {
+    final to = msg['to'] as String?;
     if (to != null && _lanActive && _lan.peers.containsKey(to)) {
       unawaited(_sendViaLan(to, msg));
       return;
@@ -799,16 +1094,6 @@ class RelayClient extends ChangeNotifier {
     _ch?.sink.add(jsonEncode(msg)); // 回退中继
   }
 
-  /// 发送二进制文件块; 有直连走直连
-  void _sendBinary(String to, Uint8List bytes) {
-    final link = _lanActive ? _lan.links[to] : null;
-    if (link != null && !link.closed) {
-      link.sendBinary(bytes);
-      return;
-    }
-    _ch?.sink.add(bytes);
-  }
-
   /// 到该对端的传输通道是否可用 (直连或中继)
   bool _transportUp(String peerId) =>
       (_lanActive && _lan.links[peerId]?.closed == false) ||
@@ -817,6 +1102,184 @@ class RelayClient extends ChangeNotifier {
   /// 局域网直连连续失败计数/退避截止
   final Map<String, int> _lanFailCount = {};
   final Map<String, int> _lanFailUntil = {};
+
+  // ---------- P2P 打洞 (经中继信令建立跨网段 TCP 直连) ----------
+
+  /// 进行中的打洞会话: sid -> 会话
+  final Map<String, _PunchSession> _punches = {};
+
+  /// 触发对该对端的 P2P 打洞 (大 id 一方发起, 避免双向同时打);
+  /// 传输建立时由收发两侧各自调用, 不满足条件时静默跳过
+  void maybeP2p(String peerId) {
+    if (!p2pEnabled || !_relayActive || !connected) return;
+    if (_lan.links[peerId]?.closed == false) return; // 已有直连
+    if (!_relayIds.contains(peerId)) return; // 不在中继在线列表
+    if (blockedPeers.contains(peerId)) return;
+    if (_punches.values.any((s) => s.peerId == peerId)) return; // 打洞进行中
+    // 对端协议 v2 起才认识打洞信令 (旧端收到未知类型会忽略, 但别浪费 12s 等待)
+    final pv = _relayPeers
+        .firstWhere((p) => p.id == peerId, orElse: () => Peer(id: '', name: ''))
+        .ver;
+    if (pv < 2) return;
+    if (deviceId.compareTo(peerId) < 0) return; // 小 id 等对方发起
+    if (_lan.boundTcpPort == 0) return; // 本机 TCP 服务没起来, 无法被连
+    final sid = const Uuid().v4();
+    final token = const Uuid().v4().replaceAll('-', '');
+    final s = _PunchSession(sid, peerId, token, initiator: true);
+    _punches[sid] = s;
+    Log.i('p2p', 'initiate punch to $peerId (sid=${sid.substring(0, 8)})');
+    _send({
+      'type': 'p2p_request',
+      'to': peerId,
+      'sid': sid,
+      'token': token,
+      'port': _lan.boundTcpPort,
+    });
+    Timer(const Duration(seconds: 12), () => _punchTimeout(s));
+  }
+
+  /// 收到打洞请求: 校验后回 accept (附本机监听端口) 并同步开始打洞
+  void _onP2pRequest(Map<String, dynamic> m) {
+    final from = m['from'] as String?;
+    final sid = m['sid'];
+    final token = m['token'];
+    final port = m['port'];
+    final fromIp = m['fromIp'];
+    if (from == null ||
+        sid is! String ||
+        token is! String ||
+        port is! int ||
+        fromIp is! String) {
+      return;
+    }
+    if (!p2pEnabled ||
+        blockedPeers.contains(from) ||
+        _lan.links[from]?.closed == false || // 已有直连: 拒绝, 防止新链路顶替
+        _lan.boundTcpPort == 0 ||
+        port <= 0 ||
+        port > 65535) {
+      _send({'type': 'p2p_decline', 'to': from, 'sid': sid});
+      return;
+    }
+    var s = _punches[sid];
+    if (s == null) {
+      s = _PunchSession(sid, from, token, initiator: false)
+        ..peerIp = fromIp
+        ..peerPort = port;
+      _punches[sid] = s;
+      Timer(const Duration(seconds: 12), () => _punchTimeout(s!));
+    }
+    _send({
+      'type': 'p2p_accept',
+      'to': from,
+      'sid': sid,
+      'token': token,
+      'port': _lan.boundTcpPort,
+    });
+    unawaited(_punch(s));
+  }
+
+  /// 打洞主流程 (对称): 多轮同时对 对端公网IP:port(+0..2) 发起 TCP 连接,
+  /// 双方同步外冲在 NAT 上打出洞; 任一连通即收养为直连链路,
+  /// 入站方向由 _validateP2pHello 验证凭证后放行
+  Future<void> _punch(_PunchSession s) async {
+    final ip = s.peerIp;
+    final port = s.peerPort;
+    if (ip == null || port == null) return;
+    final addr = InternetAddress.tryParse(ip);
+    if (addr == null) return _failPunch(s);
+    try {
+      for (var round = 0; round < 3 && !s.done && !s.failed; round++) {
+        final socks = await Future.wait([
+          for (var d = 0; d < 3; d++) _tryPunchConnect(addr, port + d),
+        ]);
+        for (final sock in socks) {
+          if (sock == null) continue;
+          if (s.done || s.failed) {
+            sock.destroy(); // 已有赢家, 多余的连接立即释放
+            continue;
+          }
+          s.done = true;
+          if (_lan.links[s.peerId]?.closed == false) {
+            // 打洞期间已有直连建立 (UDP 发现/对方连入): 放弃打洞链路,
+            // 防止 _register 顶替健康链路打断在途传输
+            Log.i('p2p', 'discard punched link to ${s.peerId} (link exists)');
+            sock.destroy();
+            continue;
+          }
+          Log.i('p2p', 'punched outbound link to ${s.peerId} ($ip:${sock.port})');
+          final link = LanLink(sock, inbound: false, peerId: s.peerId)
+            ..remotePort = sock.port;
+          _lan.adoptP2pLink(link, s.peerId, s.sid, s.token);
+        }
+        if (s.done) break;
+        await Future.delayed(const Duration(milliseconds: 400));
+      }
+      // 出站没打中时再等入站方向一会儿 (对方可能正在连我们)
+      for (var i = 0; i < 10 && !s.done && !s.failed; i++) {
+        await Future.delayed(const Duration(milliseconds: 500));
+      }
+    } finally {
+      if (s.done) {
+        _punches.remove(s.sid);
+      } else if (!s.failed) {
+        _failPunch(s); // 静默回落中继 (传输本就在走中继)
+      }
+    }
+  }
+
+  /// 单次打洞连接尝试: 2.5s 超时, 失败返回 null
+  Future<Socket?> _tryPunchConnect(InternetAddress addr, int port) async {
+    try {
+      return await Socket.connect(
+        addr,
+        port,
+        timeout: const Duration(milliseconds: 2500),
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// LanManager 回调: 带 p2p 凭证的入站 hello 是否属于进行中的打洞会话
+  bool _validateP2pHello(LanLink link, Map<String, dynamic> hello) {
+    final sid = hello['p2p'];
+    final token = hello['token'];
+    final id = hello['id'];
+    if (sid is! String || token is! String || id is! String) return false;
+    final s = _punches[sid];
+    if (s == null || s.token != token || s.peerId != id || s.failed) return false;
+    // 已有直连: 不放行打洞链路, 防止顶替健康链路打断在途传输
+    if (_lan.links[id]?.closed == false) return false;
+    if (!s.done) {
+      s.done = true;
+      _punches.remove(sid);
+      Log.i('p2p', 'punched inbound link from $id (${link.remoteAddr.address})');
+    }
+    return true;
+  }
+
+  void _punchTimeout(_PunchSession s) {
+    if (s.done || s.failed) {
+      _punches.remove(s.sid);
+      return;
+    }
+    _failPunch(s);
+  }
+
+  /// 打洞失败: 通知对方放弃 (仅发起方), 传输继续走中继
+  void _failPunch(_PunchSession s) {
+    if (s.done || s.failed) {
+      _punches.remove(s.sid);
+      return;
+    }
+    s.failed = true;
+    _punches.remove(s.sid);
+    Log.i('p2p', 'punch to ${s.peerId} failed, stay on relay');
+    if (s.initiator && isOnline(s.peerId)) {
+      _send({'type': 'p2p_abort', 'to': s.peerId, 'sid': s.sid});
+    }
+  }
 
   // ---------- 局域网 ----------
 
@@ -842,6 +1305,19 @@ class RelayClient extends ChangeNotifier {
     } catch (_) {
       return [];
     }
+  }
+
+  /// 局域网 TCP 直连端口 (0 = 未绑定); 二维码配对展示用
+  int get lanTcpPort => _lan.boundTcpPort;
+
+  /// 首个非回环 IPv4 地址 (二维码配对展示用); 无则 null
+  Future<String?> firstLanIp() async {
+    for (final i in await localInterfaces()) {
+      for (final a in i.addresses) {
+        if (!a.isLoopback) return a.address;
+      }
+    }
+    return null;
   }
 
   /// 解析 "ip" 或 "ip:port" (端口缺省 45678); 非法输入返回 null
@@ -930,9 +1406,38 @@ class RelayClient extends ChangeNotifier {
     }
   }
 
+  /// 解密 E2EE 信封并重新走消息分发; 解密失败 (篡改/密钥不一致) 直接丢弃
+  Future<void> _handleEnc(Map<String, dynamic> m) async {
+    final outerFrom = m['from'] as String?;
+    // 外层 from 由中继注入 (诚实中继下可信): 拉黑设备不浪费解密算力
+    if (outerFrom != null && blockedPeers.contains(outerFrom)) {
+      Log.i('app', 'dropped enc from blocked $outerFrom');
+      return;
+    }
+    final inner = await E2ee.unwrap(m);
+    if (inner == null) {
+      Log.w(
+        'e2ee',
+        'decrypt failed from $outerFrom (${E2ee.enabled ? '密钥不一致或被篡改' : '未设置接入密码'})',
+      );
+      return;
+    }
+    // 防冒充: 内层 from 必须与中继注入的外层 from 一致, 否则持密码者可伪造任意设备身份
+    if (outerFrom != null && inner['from'] != outerFrom) {
+      Log.w('e2ee', 'from mismatch: outer=$outerFrom inner=${inner['from']}');
+      return;
+    }
+    _handleData(jsonEncode(inner));
+  }
+
   void _handleData(dynamic data) {
     if (data is String) {
       final m = jsonDecode(data) as Map<String, dynamic>;
+      // E2EE 信封: 先解密再按原始消息分发 (解密是异步的)
+      if (m['type'] == 'enc') {
+        unawaited(_handleEnc(m));
+        return;
+      }
       // 拉黑设备的拦截: chat 回拒收通知 (对方气泡显示红色感叹号, 与微信一致),
       // file_offer 直接回拒绝; 其余控制消息 (我方发出的传输回执等) 正常处理
       final from = m['from'] as String?;
@@ -951,8 +1456,20 @@ class RelayClient extends ChangeNotifier {
           Log.i('app', 'rejected offer from blocked $from');
           return;
         }
-        // 远程文件浏览请求一并丢弃 (不给拉黑设备列目录/发文件)
-        if (m['type'] == 'fs_list' || m['type'] == 'fs_get') {
+        // 远程文件浏览请求一并丢弃 (不给拉黑设备列目录/发文件/取缩略图)
+        if (m['type'] == 'fs_list' ||
+            m['type'] == 'fs_get' ||
+            m['type'] == 'fs_thumb') {
+          Log.i('app', 'dropped ${m['type']} from blocked $from');
+          return;
+        }
+        // 剪贴板同步一并丢弃 (信任校验之外的第二道闸)
+        if (m['type'] == 'clip_text') {
+          Log.i('app', 'dropped clip_text from blocked $from');
+          return;
+        }
+        // 打洞信令一并丢弃 (不与拉黑设备建立任何直连)
+        if (m['type'] is String && (m['type'] as String).startsWith('p2p_')) {
           Log.i('app', 'dropped ${m['type']} from blocked $from');
           return;
         }
@@ -961,6 +1478,34 @@ class RelayClient extends ChangeNotifier {
         case 'blocked':
           _onBlocked(m['reason'] as String? ?? 'kick');
           break;
+        case 'p2p_request':
+          _onP2pRequest(m);
+          return; // 内部信令, 不触发 UI 重建
+        case 'p2p_accept':
+          // 我方发起的打洞被接受: 记下对端公网地址/端口, 开始外冲
+          final ps = _punches[m['sid']];
+          if (ps != null && ps.initiator && !ps.done && !ps.failed) {
+            final fromIp = m['fromIp'];
+            final port = m['port'];
+            if (fromIp is String &&
+                port is int &&
+                m['token'] == ps.token &&
+                port > 0 &&
+                port <= 65535) {
+              ps.peerIp = fromIp;
+              ps.peerPort = port;
+              unawaited(_punch(ps));
+            }
+          }
+          return;
+        case 'p2p_decline':
+        case 'p2p_abort':
+          final ab = _punches.remove(m['sid']);
+          if (ab != null && !ab.done) {
+            ab.failed = true;
+            Log.i('p2p', 'punch ${m['type']} from ${ab.peerId}');
+          }
+          return;
         case 'peers':
           _relayPeers = (m['peers'] as List)
               .map((e) => Peer.fromJson(e))
@@ -1016,6 +1561,9 @@ class RelayClient extends ChangeNotifier {
             unread[from] = (unread[from] ?? 0) + 1;
             _unreadChanged();
             _notify(peerName(from), text, payload: from);
+          } else {
+            // 正在看会话: 立即回已读回执
+            _send({'type': 'chat_read', 'to': from, 'ts': ts});
           }
           break;
         case 'chat_ack':
@@ -1047,6 +1595,43 @@ class RelayClient extends ChangeNotifier {
             }
           }
           Log.w('app', 'chat rejected by $from (blocked by peer)');
+          break;
+        case 'chat_recall':
+          // 对方撤回消息: 本地标记 recalled, 气泡换占位文案
+          final from = m['from'] as String;
+          final ts = m['ts'];
+          if (ts is! int) break;
+          ChatDb.markRecalled(from, ts);
+          final list = chats[from];
+          if (list != null) {
+            for (final msg in list) {
+              if (!msg.fromMe && msg.ts == ts) {
+                msg.recalled = true;
+                break;
+              }
+            }
+          }
+          notifyListeners();
+          break;
+        case 'chat_read':
+          // 已读回执: 对方读到了 readTs, 把我方该会话 ts<=readTs 的消息标记已读
+          final from = m['from'] as String;
+          final readTs = m['ts'];
+          if (readTs is! int) break;
+          ChatDb.markReadUpTo(from, readTs);
+          final list = chats[from];
+          if (list != null) {
+            for (final msg in list) {
+              if (msg.fromMe && msg.ts <= readTs && !msg.read) {
+                msg.read = true;
+              }
+            }
+          }
+          notifyListeners();
+          break;
+        case 'clip_text':
+          // 剪贴板文本同步 (仅信任设备生效, 详见 _handleClipText)
+          unawaited(_handleClipText(m));
           break;
         case 'file_offer':
           final tidRaw = m['transferId'];
@@ -1100,6 +1685,21 @@ class RelayClient extends ChangeNotifier {
             fileSize: sizeRaw,
             outgoing: false,
           );
+          // 剪贴板同步文件: 仅信任设备; 存剪贴板目录、自动接收、
+          // 不弹窗不入传输记录 (完成后写 clip_items, 见 _finishIncoming);
+          // 非信任设备伪造的 clip 标志直接无视, 回落到普通弹窗流程
+          if (m['clip'] == true && clipSyncEnabled && isTrusted(t.peerId)) {
+            t.ephemeral = true;
+            t.clipboard = true;
+            transfers.add(t);
+            ChatDb.upsertTransfer(t);
+            Log.i(
+              'clip',
+              'auto-accept clipboard file ${t.fileName} from ${t.peerId}',
+            );
+            unawaited(_autoAccept(t));
+            break;
+          }
           // 远程浏览页「预览」拉取的小文件: 临时传输 (存缓存、不入库不上 UI),
           // 自动接收, 页面等它完成直接预览, 不弹确认框也不发通知
           final pulled = _consumeFsPull(t.peerId, t.fileName, t.fileSize);
@@ -1154,6 +1754,7 @@ class RelayClient extends ChangeNotifier {
               if (offset < 0 || offset > t.fileSize) offset = 0;
               t.status = TransferStatus.accepted;
               ChatDb.upsertTransfer(t);
+              maybeP2p(t.peerId); // 传输将走中继时尝试升级为 P2P 直连
               if (queueSends && _sendingPeers.contains(t.peerId)) {
                 // 同一对端已有发送任务: 排队, 当前任务完成后自动开始
                 (_sendQueue[t.peerId] ??= []).add(t.transferId);
@@ -1191,11 +1792,28 @@ class RelayClient extends ChangeNotifier {
           // preview = 对方只要临时预览 (本端这条外发记录也不入库不上 UI)
           final from = m['from'] as String;
           final path = m['path'];
+          // 仅信任设备可拉取本机文件, 防中继上的陌生对端任意读盘
+          if (!isTrusted(from)) {
+            Log.i('fs', 'fs_get from untrusted $from, rejected');
+            break;
+          }
           if (path is String && path.isNotEmpty) {
             Log.i('fs', 'fs_get $path from $from');
             unawaited(sendFile(from, path, preview: m['preview'] == true));
           }
           break;
+        case 'fs_thumb':
+          // 对端请求本机文件缩略图 (远程文件浏览列表的预览图)
+          unawaited(_handleFsThumb(m));
+          break;
+        case 'fs_thumb_result':
+          // 缩略图应答: 唤醒 fsThumb 的等待者
+          final w = _fsThumbWaiters.remove(m['req']);
+          if (w != null && !w.isCompleted) {
+            final data = m['data'];
+            w.complete(data is String ? base64Decode(data) : null);
+          }
+          return; // 浏览页自己等 future, 不用全局重建
         case 'file_progress':
           // 接收端回执: 更新已确认字节数, 唤醒背压等待
           final tid = m['transferId'] as String;
@@ -1215,6 +1833,7 @@ class RelayClient extends ChangeNotifier {
                     t.status == TransferStatus.transferring)) {
               t.status = TransferStatus.failed;
               ChatDb.upsertTransfer(t);
+              _autoRetry(t);
             }
           }
           break;
@@ -1243,6 +1862,13 @@ class RelayClient extends ChangeNotifier {
       sink.add(chunk);
       _recvHash[tid]?.input.add(chunk);
       t.bytesDone += chunk.length;
+      if (t.bytesDone > t.fileSize) {
+        // 对端发超了声明大小: 异常/恶意, 掐断防止被写满磁盘
+        Log.w('transfer', 'overflow from ${t.peerId}: ${t.bytesDone}/${t.fileSize}');
+        unawaited(cancelTransfer(t));
+        return;
+      }
+      _recvLastTs[tid] = DateTime.now().millisecondsSinceEpoch;
       t.sampleSpeed();
       if (t.status == TransferStatus.accepted ||
           t.status == TransferStatus.waiting) {
@@ -1261,9 +1887,10 @@ class RelayClient extends ChangeNotifier {
       if (t.bytesDone - _lastNotifyBytes >= 256 * 1024 &&
           DateTime.now().millisecondsSinceEpoch - _lastNotifyTs >= 200) {
         // 节流: 进度推进 256KB 且距上次通知 200ms 以上, 避免高速传输时 UI 频繁重建
+        // 轻量 tick: 只刷新进度条 (ValueListenableBuilder), 不触发整页重建
         _lastNotifyBytes = t.bytesDone;
         _lastNotifyTs = DateTime.now().millisecondsSinceEpoch;
-        notifyListeners();
+        _bumpProgress();
       }
     }
   }
@@ -1310,11 +1937,13 @@ class RelayClient extends ChangeNotifier {
             t.status = TransferStatus.failed;
             ChatDb.upsertTransfer(t);
             Log.i('transfer', 'queued ${t.fileName} failed (peer offline)');
+            _autoRetry(t); // 对端短时间内回来会自动重发
           }
         } else {
           _closeIncoming(t.transferId, deletePart: false);
           t.status = TransferStatus.failed;
           ChatDb.upsertTransfer(t);
+          _autoRetry(t);
         }
         changed = true;
       } else if (t.outgoing &&
@@ -1446,6 +2075,44 @@ class RelayClient extends ChangeNotifier {
     chats[peerId]?.remove(m);
     notifyListeners();
   }
+
+  /// 撤回时限 (微信为 2 分钟): 超时的消息不允许撤回
+  static const recallWindowMs = 2 * 60 * 1000;
+
+  bool canRecall(ChatMessage m) =>
+      m.fromMe &&
+      !m.recalled &&
+      DateTime.now().millisecondsSinceEpoch - m.ts <= recallWindowMs;
+
+  /// 撤回一条我方消息: 本地标记 + 通知对端 (对端不在线则只本地生效,
+  /// 但撤回通知不走离线补发 — 对方上线后看到的是未撤回状态, 从简)
+  Future<bool> recallMessage(String peerId, ChatMessage m) async {
+    if (!canRecall(m)) return false;
+    m.recalled = true;
+    await ChatDb.markRecalled(peerId, m.ts);
+    if (isOnline(peerId)) {
+      _send({'type': 'chat_recall', 'to': peerId, 'ts': m.ts});
+    }
+    notifyListeners();
+    return true;
+  }
+
+  /// 打开会话时回已读回执: 取对方发来的最新一条消息 ts 作为已读位置
+  void sendReadReceipt(String peerId) {
+    if (!isOnline(peerId)) return;
+    final list = chats[peerId];
+    if (list == null) return;
+    var latest = 0;
+    for (final msg in list) {
+      if (!msg.fromMe && msg.ts > latest) latest = msg.ts;
+    }
+    if (latest == 0) return;
+    if (_lastReadSent[peerId] == latest) return; // 已读位置没推进, 不重复发
+    _lastReadSent[peerId] = latest;
+    _send({'type': 'chat_read', 'to': peerId, 'ts': latest});
+  }
+
+  final Map<String, int> _lastReadSent = {}; // peerId -> 已回执的最新 ts
 
   /// 仅从列表移除会话(保留聊天记录,下次启动会恢复)
   void hideConversation(String peerId) {
@@ -1669,6 +2336,7 @@ class RelayClient extends ChangeNotifier {
     bool isTemp = false,
     String? displayName,
     bool preview = false,
+    bool clip = false,
   }) async {
     if (!isOnline(to)) {
       if (isTemp) {
@@ -1688,11 +2356,13 @@ class RelayClient extends ChangeNotifier {
       fileSize: size,
       outgoing: true,
     )..savePath = path;
-    t.ephemeral = preview; // 预览回传: 本端记录同样不入库不上 UI
+    // 预览回传 / 剪贴板同步: 本端记录同样不入库不上 UI
+    t.ephemeral = preview || clip;
+    t.clipboard = clip;
     if (isTemp) _tempSendPaths.add(path);
     transfers.add(t);
     ChatDb.upsertTransfer(t);
-    if (!preview) {
+    if (!preview && !clip) {
       // 保证会话出现在消息列表 (纯文件会话没有文字消息)
       chats.putIfAbsent(to, () => []);
     }
@@ -1702,6 +2372,7 @@ class RelayClient extends ChangeNotifier {
       'transferId': tid,
       'name': t.fileName,
       'size': size,
+      if (clip) 'clip': true,
     });
     notifyListeners();
     // waiting 超时: 60 秒无响应标记失败
@@ -1713,6 +2384,236 @@ class RelayClient extends ChangeNotifier {
       }
     });
     return true;
+  }
+
+  // ---------- 剪贴板同步 (信任设备间) ----------
+
+  // 黑名单用的扩展名集合 (与 ui/file_preview_page.dart 的分类保持一致)
+  static const _clipArchiveExts = {
+    'zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'xz', 'iso',
+  };
+  static const _clipImageExts = {'jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'};
+  static const _clipVideoExts = {
+    'mp4', 'mkv', 'avi', 'mov', 'flv', 'webm', 'm4v', '3gp',
+  };
+
+  /// 文本同步上限: 剪贴板可能粘进整篇日志, 超大文本不值得走消息通道
+  static const _clipTextCap = 256 * 1024;
+
+  // 去重游标: 记录「上次已同步」的内容指纹, 轮询读到相同内容不重发
+  String? _lastClipText;
+  String? _lastClipFilesKey;
+  String? _lastClipImageKey;
+
+  /// 回环抑制: 本机主动写入剪贴板的内容 (自动粘贴/列表页点复制),
+  /// 轮询读到时消费一次并视为已同步, 防止 A→B→A 回声
+  final Set<String> _clipSuppress = {};
+
+  /// 剪贴板记录变更事件 (本地同步/收到对端/收妥文件时触发);
+  /// 独立流是为了让剪贴板页避开 ChangeNotifier 的高频进度通知
+  final StreamController<void> _clipChangeCtrl =
+      StreamController<void>.broadcast();
+  Stream<void> get clipChanges => _clipChangeCtrl.stream;
+  void _clipChanged() {
+    if (!_clipChangeCtrl.isClosed) _clipChangeCtrl.add(null);
+  }
+
+  /// 轮询入口: 总开关 + 有可送达的信任设备才扫描
+  bool _clipScanBusy = false; // 慢扫描 (大文件 stat) 时防止下一轮重入双发
+  void _clipTick() {
+    if (!clipSyncEnabled) return;
+    // Android 后台读剪贴板被系统拒绝 (返回 null), 这里直接跳过省一轮调用
+    if (Platform.isAndroid && !_appForeground) return;
+    if (_clipScanBusy) return;
+    final targets = peers
+        .where((p) => trustedPeers.contains(p.id))
+        .toList(growable: false);
+    if (targets.isEmpty) return;
+    _clipScanBusy = true;
+    unawaited(
+      _clipScan(targets).whenComplete(() => _clipScanBusy = false),
+    );
+  }
+
+  /// 扫描一次剪贴板: 文件 > 图片 > 文本 (复制文件时三者可能同时有值,
+  /// 只取最高优先级的一类; 内容指纹不变则什么都不做)
+  Future<void> _clipScan(List<Peer> targets) async {
+    try {
+      // 1) 文件 (桌面端复制文件; Android 拿到的是 content:// URI, 读不了直接跳过)
+      final rawFiles = await Pasteboard.files();
+      final files = <String>[];
+      for (final path in rawFiles) {
+        if (path.startsWith('content://')) continue;
+        final f = File(path);
+        if (await f.exists() &&
+            (await f.stat()).type == FileSystemEntityType.file) {
+          files.add(path);
+        }
+      }
+      if (files.isNotEmpty) {
+        final parts = <String>[];
+        for (final path in files) {
+          final st = await File(path).stat();
+          parts.add('$path|${st.size}|${st.modified.millisecondsSinceEpoch}');
+        }
+        parts.sort();
+        final key = parts.join('\n');
+        if (_consumeClipSuppress(key)) {
+          _lastClipFilesKey = key;
+          return;
+        }
+        if (key != _lastClipFilesKey) {
+          _markClipSynced(files: key);
+          for (final path in files) {
+            if (_clipExtBlocked(path)) {
+              Log.i('clip', 'skip blocked ext: $path');
+              continue;
+            }
+            final ts = DateTime.now().millisecondsSinceEpoch;
+            await ChatDb.insertClip(
+              ClipItem(
+                kind: 'file',
+                content: path,
+                ts: ts,
+                fromMe: true,
+                peerId: deviceId,
+              ),
+            );
+            for (final t in targets) {
+              unawaited(sendFile(t.id, path, clip: true));
+            }
+          }
+          _clipChanged();
+        }
+        return;
+      }
+      // 2) 图片 (截图/相册复制; pasteboard 统一给 PNG 字节)
+      final bytes = await Pasteboard.image;
+      if (bytes != null && bytes.isNotEmpty) {
+        final key = sha256.convert(bytes).toString();
+        if (_consumeClipSuppress(key)) {
+          _lastClipImageKey = key;
+          return;
+        }
+        if (key != _lastClipImageKey) {
+          _markClipSynced(image: key);
+          if (clipBlockImages) {
+            Log.i('clip', 'skip blocked image (${bytes.length}B)');
+            return;
+          }
+          // 落到剪贴板目录再发: 本地记录指向的文件在列表页可回开
+          final name = 'clip_${DateTime.now().millisecondsSinceEpoch}.png';
+          final path =
+              '${await clipboardDir()}${Platform.pathSeparator}$name';
+          await File(path).writeAsBytes(bytes, flush: true);
+          await ChatDb.insertClip(
+            ClipItem(
+              kind: 'file',
+              content: path,
+              ts: DateTime.now().millisecondsSinceEpoch,
+              fromMe: true,
+              peerId: deviceId,
+            ),
+          );
+          for (final t in targets) {
+            unawaited(sendFile(t.id, path, displayName: name, clip: true));
+          }
+          _clipChanged();
+        }
+        return;
+      }
+      // 3) 文本
+      final text = await Pasteboard.text;
+      if (text == null || text.isEmpty) return;
+      if (_consumeClipSuppress(text)) {
+        _lastClipText = text;
+        return;
+      }
+      if (text == _lastClipText) return;
+      _markClipSynced(text: text);
+      if (text.length > _clipTextCap) {
+        Log.w('clip', 'text too long (${text.length}), skip');
+        return;
+      }
+      final ts = DateTime.now().millisecondsSinceEpoch;
+      await ChatDb.insertClip(
+        ClipItem(
+          kind: 'text',
+          content: text,
+          ts: ts,
+          fromMe: true,
+          peerId: deviceId,
+        ),
+      );
+      for (final t in targets) {
+        _send({'type': 'clip_text', 'to': t.id, 'text': text, 'ts': ts});
+      }
+      _clipChanged();
+    } catch (e) {
+      Log.e('clip', 'scan failed', e);
+    }
+  }
+
+  /// 记录本次已同步的指纹; 三类互斥, 同步一类就清掉另两类的游标
+  /// (复制文件后再复制文本, 指纹比较才不会被旧游标挡住)
+  void _markClipSynced({String? text, String? files, String? image}) {
+    _lastClipText = text;
+    _lastClipFilesKey = files;
+    _lastClipImageKey = image;
+  }
+
+  /// 消费一次回环抑制标记; 集合有界 (>32 直接清空防泄漏)
+  bool _consumeClipSuppress(String value) {
+    if (_clipSuppress.length > 32) _clipSuppress.clear();
+    return _clipSuppress.remove(value);
+  }
+
+  /// 本机把文本写入剪贴板 (自动粘贴 / 剪贴板页点复制): 登记抑制后写入,
+  /// 轮询 2s 内读到该内容不会回传给对方
+  void writeClipText(String text) {
+    _clipSuppress.add(text);
+    Pasteboard.writeText(text);
+  }
+
+  /// 扩展名是否命中上传黑名单
+  bool _clipExtBlocked(String name) {
+    final i = name.lastIndexOf('.');
+    if (i < 0) return false;
+    final ext = name.substring(i + 1).toLowerCase();
+    if (clipBlockedExts.contains(ext)) return true;
+    if (clipBlockArchives && _clipArchiveExts.contains(ext)) return true;
+    if (clipBlockImages && _clipImageExts.contains(ext)) return true;
+    if (clipBlockVideos && _clipVideoExts.contains(ext)) return true;
+    return false;
+  }
+
+  /// 剪贴板同步文件的保存目录: 下载目录/cloudSend/clipboard
+  /// (downloadDir 本身已是 Download/cloudSend 或用户自定义目录)
+  Future<String> clipboardDir() async {
+    final dir = Directory(
+      '${await downloadDir()}${Platform.pathSeparator}clipboard',
+    );
+    await dir.create(recursive: true);
+    return dir.path;
+  }
+
+  /// 收到对端剪贴板文本: 仅信任设备; 默认只进列表,
+  /// clipAutoPaste 打开时才写入本机剪贴板 (并登记回环抑制)
+  Future<void> _handleClipText(Map<String, dynamic> m) async {
+    if (!clipSyncEnabled) return;
+    final from = m['from'] as String;
+    if (!isTrusted(from)) return;
+    final text = m['text'];
+    if (text is! String || text.isEmpty) return;
+    final tsRaw = m['ts'];
+    final ts = tsRaw is int
+        ? tsRaw
+        : DateTime.now().millisecondsSinceEpoch;
+    await ChatDb.insertClip(
+      ClipItem(kind: 'text', content: text, ts: ts, fromMe: false, peerId: from),
+    );
+    if (clipAutoPaste) writeClipText(text);
+    _clipChanged();
   }
 
   // ---------- 远程文件浏览 (浏览对方设备目录/下载) ----------
@@ -1739,10 +2640,68 @@ class RelayClient extends ChangeNotifier {
     }
   }
 
-  /// 请求下载对端设备上的文件 (对方走既有 sendFile 回传, 本端弹接受框)
-  void fsGetFile(String peerId, String path) {
-    if (!isOnline(peerId)) return;
-    _send({'type': 'fs_get', 'to': peerId, 'path': path});
+  /// fs_thumb 的应答等待表: req -> Completer
+  final Map<String, Completer<Uint8List?>> _fsThumbWaiters = {};
+
+  /// 请求对端生成文件缩略图 (图片缩到 128px JPEG / 视频抽帧 PNG);
+  /// 对端不在线/超时/失败返回 null (调用方回退占位图标)
+  Future<Uint8List?> fsThumb(String peerId, String path) async {
+    if (!isOnline(peerId)) return null;
+    final req = const Uuid().v4();
+    final completer = Completer<Uint8List?>();
+    _fsThumbWaiters[req] = completer;
+    _send({'type': 'fs_thumb', 'to': peerId, 'req': req, 'path': path});
+    try {
+      return await completer.future.timeout(const Duration(seconds: 15));
+    } on TimeoutException {
+      return null;
+    } finally {
+      _fsThumbWaiters.remove(req);
+    }
+  }
+
+  /// 被浏览方: 生成缩略图回传 (仅信任设备; 仅图片/视频扩展名)
+  Future<void> _handleFsThumb(Map<String, dynamic> m) async {
+    final from = m['from'] as String;
+    final req = m['req'];
+    final path = m['path'];
+    if (req is! String || path is! String) return;
+    if (!isTrusted(from)) {
+      Log.i('fs', 'fs_thumb from untrusted $from, rejected');
+      return;
+    }
+    Log.i('fs', 'fs_thumb $path from $from');
+    Uint8List? bytes;
+    try {
+      final dot = path.lastIndexOf('.');
+      final ext = dot > 0 ? path.substring(dot + 1).toLowerCase() : '';
+      if (_clipImageExts.contains(ext)) {
+        bytes = await _imageThumb(path);
+      } else if (_clipVideoExts.contains(ext)) {
+        bytes = await VideoThumbs.get(path);
+      }
+    } catch (_) {
+      bytes = null;
+    }
+    _send({
+      'type': 'fs_thumb_result',
+      'to': from,
+      'req': req,
+      if (bytes != null) 'data': base64Encode(bytes),
+    });
+  }
+
+  /// 图片缩略图: 解码→等比缩到 128px→JPEG q70; 超过 100MB 放弃 (防解码 OOM)
+  Future<Uint8List?> _imageThumb(String path) async {
+    final f = File(path);
+    final len = await f.length();
+    if (len <= 0 || len > 100 * 1024 * 1024) return null;
+    final im = img.decodeImage(await f.readAsBytes());
+    if (im == null) return null;
+    final thumb = im.width >= im.height
+        ? img.copyResize(im, width: 128)
+        : img.copyResize(im, height: 128);
+    return Uint8List.fromList(img.encodeJpg(thumb, quality: 70));
   }
 
   /// 我主动从对端拉取并登记自动接收的小文件 (浏览页内直接预览用):
@@ -1784,6 +2743,13 @@ class RelayClient extends ChangeNotifier {
       'req': req,
       'path': path,
     };
+    // 仅信任设备可浏览本机目录, 防中继上的陌生对端枚举全盘文件
+    if (!isTrusted(from)) {
+      Log.i('fs', 'fs_list from untrusted $from, rejected');
+      reply['error'] = 'not_trusted';
+      _send(reply);
+      return;
+    }
     try {
       // Windows 虚拟根: 列出所有磁盘分区 (C:\ D:\ ...)
       if (Platform.isWindows && (path.isEmpty || path == '/')) {
@@ -1852,8 +2818,14 @@ class RelayClient extends ChangeNotifier {
     _sendAcked[tid] = offset;
     _lastNotifyBytes = offset;
     notifyListeners();
+    // 通道在传输开始时锁定, 全程不切换: 中途打洞成功/新直连建立也不换路,
+    // 否则旧路径里排队的中继分块会被新路径的后发分块插队, 接收端乱序写盘,
+    // 最后 SHA 校验必然失败 (限速拉长了中继排队, 乱序窗口被放大到必然触发)
+    final link = _lanActive && _lan.links[t.peerId]?.closed == false
+        ? _lan.links[t.peerId]
+        : null;
+    final viaLan = link != null;
     // 通道参数: 局域网直连块大窗口大, 中继保守 (服务器按帧转发有开销)
-    final viaLan = _lanActive && _lan.links[t.peerId]?.closed == false;
     final chunkSize = viaLan ? 256 * 1024 : 64 * 1024;
     var window = viaLan ? 16 * 1024 * 1024 : 8 * 1024 * 1024;
     final windowCap = viaLan ? 128 * 1024 * 1024 : 32 * 1024 * 1024;
@@ -1876,12 +2848,14 @@ class RelayClient extends ChangeNotifier {
         await raf.setPosition(offset);
       }
       final tidBytes = ascii.encode(tid);
+      // 锁定通道的可用性: 只认开始时的那条路 (新链路建立不算数)
+      bool pinnedUp() => link != null ? !link.closed : connected;
       while (true) {
         while (t.bytesDone - (_sendAcked[tid] ?? 0) >= window) {
           // 窗口满: 等接收端 file_progress 回执
           if (_canceled.contains(tid) ||
               _aborted.contains(tid) ||
-              !_transportUp(t.peerId)) {
+              !pinnedUp()) {
             throw StateError('aborted');
           }
           final before = _sendAcked[tid] ?? 0;
@@ -1904,7 +2878,7 @@ class RelayClient extends ChangeNotifier {
         }
         if (_canceled.contains(tid) ||
             _aborted.contains(tid) ||
-            !_transportUp(t.peerId)) {
+            !pinnedUp()) {
           throw StateError('aborted');
         }
         // 自适应窗口: 若发送端超过 1/3 时间在等回执, 说明窗口是瓶颈, 翻倍扩
@@ -1926,26 +2900,40 @@ class RelayClient extends ChangeNotifier {
         final b = BytesBuilder()
           ..add(tidBytes)
           ..add(chunk);
-        _sendBinary(t.peerId, b.toBytes());
+        // 走锁定的那条通道 (不用 _sendBinary: 它按当前链路状态动态选路)
+        if (link != null) {
+          link.sendBinary(b.toBytes());
+        } else {
+          _ch?.sink.add(b.toBytes());
+        }
         t.bytesDone += chunk.length;
         t.sampleSpeed();
         final notifyNow = DateTime.now().millisecondsSinceEpoch;
         if (t.bytesDone - _lastNotifyBytes >= 1024 * 1024 &&
             notifyNow - _lastNotifyTs >= 200) {
+          // 轻量 tick: 只刷新进度条, 不触发整页重建
           _lastNotifyBytes = t.bytesDone;
           _lastNotifyTs = notifyNow;
-          notifyListeners();
+          _bumpProgress();
         }
       }
       hash.input.close();
       t.status = TransferStatus.done; // 发送完成; 校验失败会被 file_result 改判
-      _send({
+      _resetRetry(tid);
+      final doneMsg = {
         'type': 'file_done',
         'to': t.peerId,
         'transferId': tid,
         'sha256': hash.hex,
         'size': t.bytesDone,
-      });
+      };
+      // file_done 必须与分块同路: 中继传的就强制走中继,
+      // 否则它经直连插队到达时, 中继管道里还有分块没送完, 接收端误判失败
+      if (link != null) {
+        _send(doneMsg);
+      } else {
+        _ch?.sink.add(jsonEncode(doneMsg));
+      }
       Log.i('transfer', 'send done ${t.fileName} (${t.bytesDone}B)');
       // 等待接收端校验结果的窗口期: 期间对端掉线要改判失败 (防小文件误判完成)
       _unverified.add(tid);
@@ -1960,6 +2948,12 @@ class RelayClient extends ChangeNotifier {
         _cleanupTemp(t);
       } else {
         Log.e('transfer', 'send failed ${t.fileName}', e);
+        // 通道还在就通知对端取消, 防接收端永远卡在「传输中」;
+        // 通道已断则靠接收端自己的停滞看门狗兜底
+        if (_transportUp(t.peerId)) {
+          _send({'type': 'file_cancel', 'to': t.peerId, 'transferId': tid});
+        }
+        _autoRetry(t);
       }
     } finally {
       await raf?.close();
@@ -2006,10 +3000,28 @@ class RelayClient extends ChangeNotifier {
 
   /// 接受文件; 若已有 .part 临时文件则从其长度偏移处续传
   Future<void> acceptFile(FileTransfer t) async {
+    // 防重入: 失败重试的 acceptFile 还在 await 大 .part 哈希, 对方重发的
+    // file_offer 把状态重置为 waiting 又触发一次接受, 两个 append IOSink
+    // 并存写同一 .part (前者永不关闭, Windows 上还会锁文件)
+    if (!_accepting.add(t.transferId)) {
+      Log.w('transfer', 'acceptFile re-entry ignored ${t.transferId}');
+      return;
+    }
+    try {
+      await _acceptFile(t);
+    } finally {
+      _accepting.remove(t.transferId);
+    }
+  }
+
+  Future<void> _acceptFile(FileTransfer t) async {
     var save = t.savePath;
     if (save == null) {
-      // 预览临时传输存缓存目录 (重启清空), 普通接收存下载目录
-      final dir = t.ephemeral
+      // 剪贴板同步存「下载目录/cloudSend/clipboard」; 预览临时传输存
+      // 缓存目录 (重启清空); 普通接收存下载目录
+      final dir = t.clipboard
+          ? await clipboardDir()
+          : t.ephemeral
           ? (await _previewDir()).path
           : await downloadDir();
       var candidate = '$dir${Platform.pathSeparator}${t.fileName}';
@@ -2047,6 +3059,9 @@ class RelayClient extends ChangeNotifier {
     _canceled.remove(t.transferId);
     _recvHash[t.transferId] = hash;
     _recvAcked[t.transferId] = offset;
+    // 接受时也记时间戳: 发送端若在 accept 后、首分块前死掉,
+    // 0 字节挂起的盲区靠看门狗按"对端离线+超时"兜底
+    _recvLastTs[t.transferId] = DateTime.now().millisecondsSinceEpoch;
     _incoming[t.transferId] = part.openWrite(mode: FileMode.append);
     t.bytesDone = offset;
     _lastNotifyBytes = offset;
@@ -2058,6 +3073,7 @@ class RelayClient extends ChangeNotifier {
       'transferId': t.transferId,
       'offset': offset,
     });
+    maybeP2p(t.peerId); // 传输将走中继时尝试升级为 P2P 直连
     notifyListeners();
   }
 
@@ -2119,6 +3135,7 @@ class RelayClient extends ChangeNotifier {
     if (w != null && !w.isCompleted) w.complete();
     _closeIncoming(t.transferId, deletePart: true);
     t.status = TransferStatus.canceled;
+    _resetRetry(t.transferId);
     ChatDb.upsertTransfer(t);
     _cleanupTemp(t);
     notifyListeners();
@@ -2142,6 +3159,9 @@ class RelayClient extends ChangeNotifier {
       'transferId': t.transferId,
       'name': t.fileName,
       'size': t.fileSize,
+      // 剪贴板同步的重发也要带标志: 对端重启后临时记录已丢,
+      // 否则会落成普通弹窗传输而不是进剪贴板目录
+      if (t.clipboard) 'clip': true,
     });
     notifyListeners();
     Timer(const Duration(seconds: 60), () {
@@ -2173,6 +3193,7 @@ class RelayClient extends ChangeNotifier {
     }
     _recvHash.remove(tid);
     _recvAcked.remove(tid);
+    _recvLastTs.remove(tid);
     if (deletePart) {
       final t = _find(tid);
       if (t?.savePath != null) {
@@ -2236,27 +3257,82 @@ class RelayClient extends ChangeNotifier {
     t.status = ok ? TransferStatus.done : TransferStatus.failed;
     if (ok) {
       Log.i('transfer', 'recv done ${t.fileName} (${t.bytesDone}B)');
+      _resetRetry(tid);
+      // 剪贴板同步文件收妥: 写入剪贴板记录 (列表页展示/点击打开)
+      if (t.clipboard && t.savePath != null) {
+        await ChatDb.insertClip(
+          ClipItem(
+            kind: 'file',
+            content: t.savePath!,
+            ts: DateTime.now().millisecondsSinceEpoch,
+            fromMe: false,
+            peerId: t.peerId,
+          ),
+        );
+        _clipChanged();
+      }
     }
     ChatDb.upsertTransfer(t);
     _send({'type': 'file_result', 'to': t.peerId, 'transferId': tid, 'ok': ok});
     notifyListeners();
   }
 
-  String peerName(String id) => peers
-      .firstWhere(
-        (p) => p.id == id,
-        orElse: () => Peer(id: id, name: id.substring(0, 8)),
-      )
-      .name;
+  String peerName(String id) {
+    for (final p in peers) {
+      if (p.id == id) return p.name;
+    }
+    // 离线设备回退到历史记录里的名字
+    final k = knownPeers[id];
+    final kn = k?['name'] as String?;
+    if (kn != null && kn.isNotEmpty) return kn;
+    return id.substring(0, 8);
+  }
 
   bool isOnline(String id) => peers.any((p) => p.id == id);
+
+  /// 历史设备中当前不在线的, 按最后在线时间倒序 (设备页「未在线」分组)
+  List<Peer> get offlinePeers {
+    final online = {for (final p in peers) p.id};
+    final entries =
+        knownPeers.entries.where((e) => !online.contains(e.key)).toList()
+          ..sort(
+            (a, b) => (b.value['lastSeen'] as int? ?? 0).compareTo(
+              a.value['lastSeen'] as int? ?? 0,
+            ),
+          );
+    return [
+      for (final e in entries)
+        Peer(
+          id: e.key,
+          name: e.value['name'] as String? ?? e.key.substring(0, 8),
+          avatar: e.value['avatar'] as String?,
+          platform: e.value['platform'] as String?,
+        ),
+    ];
+  }
+
+  /// 删除历史设备记录 (连同其信任/拉黑标记; 聊天记录保留)
+  Future<void> removeKnownPeer(String peerId) async {
+    knownPeers.remove(peerId);
+    trustedPeers.remove(peerId);
+    blockedPeers.remove(peerId);
+    blockedPeerNames.remove(peerId);
+    _avatarBytesCache.remove(peerId);
+    final sp = await SharedPreferences.getInstance();
+    sp.setString('knownPeers', jsonEncode(knownPeers));
+    sp.setStringList('trustedPeers', trustedPeers.toList());
+    sp.setStringList('blockedPeers', blockedPeers.toList());
+    sp.setString('blockedPeerNames', jsonEncode(blockedPeerNames));
+    Log.i('app', 'removed known peer $peerId');
+    notifyListeners();
+  }
 
   /// 对端头像 (base64 PNG), 无则 null
   String? peerAvatar(String id) {
     for (final p in peers) {
       if (p.id == id) return p.avatar;
     }
-    return null;
+    return knownPeers[id]?['avatar'] as String?;
   }
 
   /// 解码后的对端头像字节(缓存, 避免每次 build 重新解码导致闪烁)
@@ -2297,6 +3373,20 @@ class RelayClient extends ChangeNotifier {
     }
     return null;
   }
+}
+
+/// 一次 P2P 打洞会话: 发起方生成 sid+token, 双方凭 token 验证打进来的连接
+class _PunchSession {
+  final String sid;
+  final String peerId;
+  final String token;
+  final bool initiator;
+  String? peerIp; // 服务器注入的对端公网 IP (fromIp)
+  int? peerPort; // 对端 TCP 监听端口 (NAT 端口保持时可直连)
+  bool done = false; // 已成功 (出站被收养或入站验证通过)
+  bool failed = false;
+
+  _PunchSession(this.sid, this.peerId, this.token, {required this.initiator});
 }
 
 /// 流式 SHA-256: 边传边算, 结束后取 hex

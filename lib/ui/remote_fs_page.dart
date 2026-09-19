@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
@@ -11,9 +12,9 @@ import 'app_toast.dart';
 import 'file_preview_page.dart';
 
 /// 远程文件浏览页: 像文件管理器一样浏览对端设备的存储,
-/// 点目录进入; 点文件 = 预览 (可预览类型且 ≤20MB: 走临时传输,
+/// 点目录进入; 点文件 = 预览 (仅图片/视频/压缩包且 ≤设置的上限: 走临时传输,
 /// 存缓存目录、不入库、不进聊天/传输记录, 完成自动打开预览, 重启即清);
-/// 点行尾下载按钮 = 真正下载 (普通接收确认流程, 落盘到下载目录)。
+/// 预览页里的「下载」按钮才把文件复制到下载目录真正落盘。
 /// Android 从共享存储根起步; Windows 先列磁盘分区 (C:\ D:\ ...)
 class RemoteFsPage extends StatefulWidget {
   const RemoteFsPage({super.key});
@@ -32,40 +33,56 @@ class _RemoteFsPageState extends State<RemoteFsPage> {
   // 防止快速点目录时旧应答覆盖新目录
   int _seq = 0;
 
-  /// 直接预览的大小上限: 超过走普通下载流程 (弹接收确认框)
-  static const int _previewMax = 20 * 1024 * 1024;
+  /// 直接预览的大小上限 (设置页可改); 超过不支持预览
+  int get _previewMax => context.read<RelayClient>().fsPreviewMax;
 
   /// 正在等待自动预览的文件名 / 拉取发起时间 (毫秒); null = 无待预览
   String? _previewName;
   int _previewSince = 0;
+  Timer? _previewTimer; // offer 超时计时器 (重拉/退出时取消)
+  bool _previewHandled = false; // 防止多帧 build 重复调度 openTransfer/toast
 
-  /// 是否可应用内预览 (与 openTransfer 的类型分派一致)
+  /// 缩略图缓存: 完整路径 -> 拉取 Future (对端生成, base64 回传);
+  /// 缓存 Future 使同一路径的并发/重复 build 只请求一次
+  final Map<String, Future<Uint8List?>> _thumbs = {};
+
+  @override
+  void dispose() {
+    _previewTimer?.cancel();
+    super.dispose();
+  }
+
+  /// 是否可应用内预览: 图片/视频/压缩包/文本/Word/Excel
   static bool _previewable(String name) =>
       isImageFile(name) ||
       isVideoFile(name) ||
       isArchiveFile(name) ||
-      isTextFile(name);
+      isTextFile(name) ||
+      isDocFile(name) ||
+      isExcelFile(name);
 
-  /// 点文件 = 预览: 走临时传输 (存缓存、不入库、不进聊天/传输记录),
-  /// 完成后自动打开预览, 重启即清; 真正下载要点行尾的下载按钮
+  /// 点文件: 图片/视频/压缩包且未超限 → 临时传输直接预览;
+  /// 其他类型/超限 → 微信风格文件页 (大图标, 可下载/分享)
   void _tapFile(RelayClient c, String name, int size) {
-    if (!_previewable(name)) {
-      AppToast.show(context, tr('fs_no_preview'));
-      return;
-    }
-    if (size <= 0 || size > _previewMax) {
-      AppToast.show(context, trf('fs_too_big', {'max': _fmt(_previewMax)}));
+    if (!_previewable(name) || size <= 0 || size > _previewMax) {
+      Navigator.pushNamed(
+        context,
+        '/remote_file',
+        arguments: (peerId!, _child(name), name, size),
+      );
       return;
     }
     if (_previewName != null) return; // 一次只拉一个
     setState(() {
       _previewName = name;
       _previewSince = DateTime.now().millisecondsSinceEpoch;
+      _previewHandled = false;
     });
     c.fsGetFileAuto(peerId!, _child(name), name: name, size: size);
     // 对端迟迟不回 offer (离线/文件被删): 超时退出等待 (登记 30s 过期,
     // 之后到达的同名 offer 会回落成普通接收确认框)
-    Timer(const Duration(seconds: 32), () {
+    _previewTimer?.cancel();
+    _previewTimer = Timer(const Duration(seconds: 32), () {
       if (mounted &&
           _previewName == name &&
           _pendingTransfer(context.read<RelayClient>()) == null) {
@@ -73,12 +90,6 @@ class _RemoteFsPageState extends State<RemoteFsPage> {
         AppToast.show(context, tr('fs_timeout'));
       }
     });
-  }
-
-  /// 行尾下载按钮: 走普通接收流程 (弹确认框, 落盘到下载目录)
-  void _download(RelayClient c, String name) {
-    c.fsGetFile(peerId!, _child(name));
-    AppToast.show(context, trf('fs_get_sent', {'name': name}));
   }
 
   /// 找本次拉取对应的传入传输记录 (发起后新建的最新一条)
@@ -99,18 +110,23 @@ class _RemoteFsPageState extends State<RemoteFsPage> {
   /// 盯传输状态: 完成开预览, 失败提示; build 中调用 (传输变更触发),
   /// 状态清理和跳路由都推到帧后, 避免 build 期 setState
   void _watchPreview(RelayClient c) {
-    if (_previewName == null) return;
+    if (_previewName == null || _previewHandled) return;
     final t = _pendingTransfer(c);
     if (t == null) return;
     if (t.status == TransferStatus.done && t.savePath != null) {
+      _previewHandled = true;
+      _previewTimer?.cancel();
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted) return;
         setState(() => _previewName = null);
-        openTransfer(context, t);
+        // 标记临时预览: 查看页据此显示「下载」按钮
+        openTransfer(context, t, tempPreview: true);
       });
     } else if (t.status == TransferStatus.failed ||
         t.status == TransferStatus.canceled ||
         t.status == TransferStatus.rejected) {
+      _previewHandled = true;
+      _previewTimer?.cancel();
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted) return;
         setState(() => _previewName = null);
@@ -187,6 +203,69 @@ class _RemoteFsPageState extends State<RemoteFsPage> {
       return '${(bytes / 1024 / 1024).toStringAsFixed(1)} MB';
     }
     return '${(bytes / 1024 / 1024 / 1024).toStringAsFixed(2)} GB';
+  }
+
+  /// 行首图标: 图片/视频文件拉对端缩略图预览; 目录/磁盘/其他文件用图标
+  Widget _leading(RelayClient c, bool isDir, String ename) {
+    if (_isWin && _stack.isEmpty) {
+      return const Icon(Icons.storage, size: 22, color: AppTheme.grey);
+    }
+    if (isDir) {
+      return const Icon(
+        Icons.folder_outlined,
+        size: 22,
+        color: Color(0xFFE6A23C),
+      );
+    }
+    final isImg = isImageFile(ename);
+    final isVid = !isImg && isVideoFile(ename);
+    if (!isImg && !isVid) {
+      return const Icon(
+        Icons.insert_drive_file_outlined,
+        size: 22,
+        color: AppTheme.grey,
+      );
+    }
+    // 缩略图占位 (加载中/拉取失败回退)
+    Widget placeholder() => Container(
+      color: AppTheme.grey.withValues(alpha: 0.10),
+      child: Icon(
+        isImg ? Icons.image_outlined : Icons.videocam_outlined,
+        size: 17,
+        color: AppTheme.grey,
+      ),
+    );
+    final path = _child(ename);
+    if (_thumbs.length > 300) _thumbs.clear(); // 兜底上限
+    final fut = _thumbs.putIfAbsent(path, () => c.fsThumb(peerId!, path));
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(6),
+      child: SizedBox(
+        width: 34,
+        height: 34,
+        child: FutureBuilder<Uint8List?>(
+          future: fut,
+          builder: (_, snap) {
+            final b = snap.data;
+            if (b == null) return placeholder();
+            return Stack(
+              fit: StackFit.expand,
+              children: [
+                Image.memory(b, fit: BoxFit.cover),
+                if (isVid)
+                  const Center(
+                    child: Icon(
+                      Icons.play_circle_fill,
+                      size: 15,
+                      color: Colors.white70,
+                    ),
+                  ),
+              ],
+            );
+          },
+        ),
+      ),
+    );
   }
 
   @override
@@ -292,18 +371,7 @@ class _RemoteFsPageState extends State<RemoteFsPage> {
                             color: AppTheme.cardOf(context),
                             child: ListTile(
                               dense: true,
-                              leading: Icon(
-                                _isWin && _stack.isEmpty
-                                    ? Icons
-                                          .storage // 磁盘分区
-                                    : isDir
-                                    ? Icons.folder_outlined
-                                    : Icons.insert_drive_file_outlined,
-                                size: 22,
-                                color: isDir
-                                    ? const Color(0xFFE6A23C)
-                                    : AppTheme.grey,
-                              ),
+                              leading: _leading(c, isDir, ename),
                               title: Text(
                                 ename,
                                 style: TextStyle(
@@ -338,17 +406,7 @@ class _RemoteFsPageState extends State<RemoteFsPage> {
                                       size: 18,
                                       color: AppTheme.grey,
                                     )
-                                  : IconButton(
-                                      // 显式下载: 走普通接收确认流程落盘
-                                      tooltip: tr('download'),
-                                      visualDensity: VisualDensity.compact,
-                                      icon: const Icon(
-                                        Icons.download,
-                                        size: 18,
-                                        color: AppTheme.grey,
-                                      ),
-                                      onPressed: () => _download(c, ename),
-                                    ),
+                                  : null,
                               onTap: () {
                                 if (isDir) {
                                   _enter(ename);

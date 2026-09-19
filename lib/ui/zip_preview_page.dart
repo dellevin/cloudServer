@@ -13,6 +13,7 @@ import '../client.dart';
 import '../l10n.dart';
 import '../main.dart';
 import 'app_toast.dart';
+import 'file_preview_page.dart';
 
 /// zip 文件名乱码修复: archive 包按 UTF-8 解码条目名, 失败时回退成
 /// 「每字节→一字符」的伪 latin1 字符串 (国产 Windows 压缩包多为 GBK 且
@@ -53,19 +54,30 @@ class _ZipPreviewPageState extends State<ZipPreviewPage> {
     _load();
   }
 
-  String get _path => ModalRoute.of(context)!.settings.arguments as String;
+  String get _path =>
+      parseViewerArgs(ModalRoute.of(context)!.settings.arguments).$1;
+
+  /// 是否远程浏览的临时预览 (是则 AppBar 显「下载」按钮)
+  bool get _tempPreview =>
+      parseViewerArgs(ModalRoute.of(context)!.settings.arguments).$2;
 
   Future<void> _load() async {
+    InputFileStream? input;
     try {
-      final input = InputFileStream(_path);
+      input = InputFileStream(_path);
       final archive = ZipDecoder().decodeStream(input);
       for (final f in archive.files) {
         f.name = fixZipEntryName(f.name);
       }
       final files = archive.files.where((f) => f.isFile).toList();
       await input.close();
+      input = null;
       if (mounted) setState(() => _files = files);
     } catch (_) {
+      // 损坏/非 zip: 句柄必须关掉, 否则每次打开泄漏一个
+      try {
+        await input?.close();
+      } catch (_) {}
       if (mounted) setState(() => _error = tr('zip_read_fail'));
     }
   }
@@ -103,6 +115,7 @@ class _ZipPreviewPageState extends State<ZipPreviewPage> {
       final dest = await _dedupe(dir, name.isEmpty ? 'unnamed' : name);
       final input = InputFileStream(_path);
       OutputFileStream? out;
+      var found = false;
       try {
         final archive = ZipDecoder().decodeStream(input);
         for (final file in archive.files) {
@@ -110,12 +123,21 @@ class _ZipPreviewPageState extends State<ZipPreviewPage> {
           if (fixZipEntryName(file.name) == f.name && file.isFile) {
             out = OutputFileStream(dest);
             file.writeContent(out);
+            found = true;
             break;
           }
         }
       } finally {
         await out?.close();
         await input.close();
+      }
+      if (!found) {
+        // 条目没找到: 别误报成功, 也别留空文件
+        try {
+          await File(dest).delete();
+        } catch (_) {}
+        if (mounted) AppToast.show(context, tr('extract_fail'));
+        return;
       }
       if (mounted) {
         AppToast.show(
@@ -192,6 +214,15 @@ class _ZipPreviewPageState extends State<ZipPreviewPage> {
       backgroundColor: AppTheme.softOf(context),
       appBar: AppBar(
         title: Text(name, style: const TextStyle(fontSize: 15)),
+        actions: [
+          // 远程浏览的临时预览: 「下载」复制压缩包本体到下载目录
+          if (_tempPreview)
+            IconButton(
+              tooltip: tr('download'),
+              icon: const Icon(Icons.save_alt, size: 20),
+              onPressed: () => downloadTempPreview(context, _path),
+            ),
+        ],
         bottom: const PreferredSize(
           preferredSize: Size.fromHeight(1),
           child: Divider(height: 1),

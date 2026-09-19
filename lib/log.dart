@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
@@ -6,7 +7,7 @@ import 'package:path_provider/path_provider.dart';
 
 import 'l10n.dart';
 
-/// 轻量文件日志: 单文件滚动 (超过 1MB 时截断保留尾部 512KB)。
+/// 轻量文件日志: 单文件滚动 (超过 5MB 时截断保留尾部 512KB)。
 /// 关键路径 (连接/传输/协议异常) 都写一份, 设置页可查看/导出/清空。
 class Log {
   static File? _file;
@@ -14,7 +15,7 @@ class Log {
   static int _sinceFlush = 0;
   static Timer? _flushTimer;
 
-  static const _maxBytes = 1024 * 1024;
+  static const _maxBytes = 5 * 1024 * 1024;
   static const _keepBytes = 512 * 1024;
 
   static Future<void> init() async {
@@ -25,19 +26,52 @@ class Log {
       await logDir.create(recursive: true);
       _file = File('${logDir.path}${Platform.pathSeparator}cloudsend.log');
       if (await _file!.exists() && await _file!.length() > _maxBytes) {
-        // 只保留尾部, 防止长期运行越攒越大
-        final raf = await _file!.open();
-        final len = await raf.length();
-        await raf.setPosition(len - _keepBytes);
-        final tail = await raf.read(_keepBytes);
-        await raf.close();
-        await _file!.writeAsBytes(tail, flush: true);
+        await _truncate();
       }
       _sink = _file!.openWrite(mode: FileMode.append);
       // 定期落盘 (IOSink 有缓冲, 崩溃时少丢日志)
       _flushTimer = Timer.periodic(const Duration(seconds: 3), (_) => flush());
       i('log', '--- app start (pid $pid) ---');
     } catch (_) {}
+  }
+
+  /// 截断日志: 只保留尾部, 防止越攒越大 (启动时与运行中超限都调用)
+  static Future<void> _truncate() async {
+    RandomAccessFile? raf;
+    try {
+      raf = await _file!.open();
+      final len = await raf.length();
+      await raf.setPosition(len - _keepBytes);
+      final tail = await raf.read(_keepBytes);
+      await raf.close();
+      raf = null;
+      await _file!.writeAsBytes(tail, flush: true);
+    } finally {
+      // 读/seek 抛异常时句柄也得关, 否则泄漏
+      try {
+        await raf?.close();
+      } catch (_) {}
+    }
+  }
+
+  /// 运行中截断检查: 每 200 行估一次文件大小, 超 1MB 重建 sink 并截断
+  static int _sinceTrimCheck = 0;
+
+  static Future<void> _trimIfNeeded() async {
+    final f = _file;
+    if (f == null || _sink == null) return;
+    try {
+      if (await f.length() <= _maxBytes) return;
+      await _sink!.flush();
+      await _sink!.close();
+      _sink = null;
+      await _truncate();
+      _sink = f.openWrite(mode: FileMode.append);
+      i('log', 'log trimmed to $_keepBytes bytes');
+    } catch (_) {
+      // 截断中途失败也必须重建 sink, 否则之后文件日志全丢
+      _sink ??= f.openWrite(mode: FileMode.append);
+    }
   }
 
   static String get _ts {
@@ -60,6 +94,10 @@ class Log {
       _sink?.writeln(line);
       // 错误立即落盘; 普通日志攒 20 行刷一次 (另有 3s 定时兜底)
       if (level == 'E' || ++_sinceFlush >= 20) flush();
+      if (++_sinceTrimCheck >= 200) {
+        _sinceTrimCheck = 0;
+        unawaited(_trimIfNeeded());
+      }
     } catch (_) {}
   }
 
@@ -80,11 +118,22 @@ class Log {
     if (f == null || !await f.exists()) return tr('no_log_yet');
     try {
       final len = await f.length();
-      final raf = await f.open();
-      if (len > maxBytes) await raf.setPosition(len - maxBytes);
-      final bytes = await raf.read(len > maxBytes ? maxBytes : len);
-      await raf.close();
-      var text = String.fromCharCodes(bytes);
+      RandomAccessFile? raf;
+      Uint8List bytes;
+      try {
+        raf = await f.open();
+        if (len > maxBytes) await raf.setPosition(len - maxBytes);
+        bytes = await raf.read(len > maxBytes ? maxBytes : len);
+        await raf.close();
+        raf = null;
+      } finally {
+        try {
+          await raf?.close();
+        } catch (_) {}
+      }
+      // 日志是 UTF-8 写入的, 必须按 UTF-8 解码;
+      // fromCharCodes 会把多字节序列逐字节摊开成乱码 (中文文件名全花)
+      var text = utf8.decode(bytes, allowMalformed: true);
       if (len > maxBytes) {
         final nl = text.indexOf('\n');
         if (nl >= 0) text = text.substring(nl + 1);
