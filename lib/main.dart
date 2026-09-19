@@ -26,6 +26,7 @@ import 'ui/qr_pair_page.dart';
 import 'ui/remote_file_page.dart';
 import 'ui/remote_fs_page.dart';
 import 'ui/about_page.dart';
+import 'ui/sponsor_page.dart';
 import 'ui/app_dialog.dart';
 import 'ui/settings_page.dart';
 import 'ui/transfers_page.dart';
@@ -615,6 +616,7 @@ class _CloudSendAppState extends State<CloudSendApp> {
           '/settings_general': (_) => const GeneralSettingsPage(),
           '/settings_clip': (_) => const ClipSettingsPage(),
           '/about': (_) => const AboutPage(),
+          '/sponsor': (_) => const SponsorPage(),
         },
       ),
     );

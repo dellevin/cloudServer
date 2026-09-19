@@ -32,14 +32,20 @@ class SettingsPage extends StatelessWidget {
         _Group(
           children: [
             _Tile(
+              icon: Icons.link_rounded,
+              iconColor: const Color(0xFF10AEFF),
               title: tr('settings_conn'),
               onTap: () => Navigator.pushNamed(context, '/settings_conn'),
             ),
             _Tile(
+              icon: Icons.tune_rounded,
+              iconColor: const Color(0xFF576B95),
               title: tr('settings_general'),
               onTap: () => Navigator.pushNamed(context, '/settings_general'),
             ),
             _Tile(
+              icon: Icons.content_paste_rounded,
+              iconColor: const Color(0xFFFA9D3B),
               title: tr('clip_sync'),
               onTap: () => Navigator.pushNamed(context, '/settings_clip'),
             ),
@@ -51,10 +57,14 @@ class SettingsPage extends StatelessWidget {
         _Group(
           children: [
             _Tile(
+              icon: Icons.qr_code_scanner_rounded,
+              iconColor: const Color(0xFF1485EE),
               title: tr('qr_pairing'),
               onTap: () => Navigator.pushNamed(context, '/qr_pair'),
             ),
             _Tile(
+              icon: Icons.dark_mode_outlined,
+              iconColor: const Color(0xFF6467F0),
               title: tr('dark_mode'),
               trailing: Switch(
                 value: c.darkMode,
@@ -63,6 +73,8 @@ class SettingsPage extends StatelessWidget {
               onTap: () => c.setDarkMode(!c.darkMode),
             ),
             _Tile(
+              icon: Icons.translate_rounded,
+              iconColor: AppTheme.green,
               title: tr('language'),
               value: l10n.isEn ? 'English' : '中文',
               onTap: () => _pickLanguage(context),
@@ -75,6 +87,8 @@ class SettingsPage extends StatelessWidget {
         _Group(
           children: [
             _Tile(
+              icon: Icons.article_outlined,
+              iconColor: const Color(0xFF8A8A8A),
               title: tr('run_log'),
               onTap: () => Navigator.pushNamed(context, '/log'),
             ),
@@ -86,6 +100,14 @@ class SettingsPage extends StatelessWidget {
         _Group(
           children: [
             _Tile(
+              icon: Icons.favorite_rounded,
+              iconColor: AppTheme.red,
+              title: tr('sponsor'),
+              onTap: () => Navigator.pushNamed(context, '/sponsor'),
+            ),
+            _Tile(
+              icon: Icons.info_outline_rounded,
+              iconColor: const Color(0xFF576B95),
               title: '${tr('about')} cloudSend',
               value: 'v$kAppVersion',
               onTap: () => Navigator.pushNamed(context, '/about'),
@@ -218,7 +240,15 @@ class _Group extends StatelessWidget {
         children: [
           for (var i = 0; i < children.length; i++) ...[
             children[i],
-            if (i < children.length - 1) const Divider(height: 1, indent: 16),
+            // 带图标的条目, 分隔线缩进对齐标题左缘 (16 + 30 + 12)
+            if (i < children.length - 1)
+              Divider(
+                height: 1,
+                indent: children[i] is _Tile &&
+                        (children[i] as _Tile).icon != null
+                    ? 58
+                    : 16,
+              ),
           ],
         ],
       ),
@@ -226,14 +256,23 @@ class _Group extends StatelessWidget {
   }
 }
 
-/// 标准设置条目: 标题, 右灰色 value + 箭头
+/// 标准设置条目: 可选彩色图标块 + 标题, 右灰色 value + 箭头
 class _Tile extends StatelessWidget {
+  final IconData? icon;
+  final Color? iconColor;
   final String title;
   final String? value;
   final Widget? trailing;
   final VoidCallback? onTap;
 
-  const _Tile({required this.title, this.value, this.trailing, this.onTap});
+  const _Tile({
+    this.icon,
+    this.iconColor,
+    required this.title,
+    this.value,
+    this.trailing,
+    this.onTap,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -245,6 +284,23 @@ class _Tile extends StatelessWidget {
           padding: const EdgeInsets.symmetric(horizontal: 16),
           child: Row(
             children: [
+              if (icon != null) ...[
+                // 图标彩色, 底色与卡片同色 (#FFFFFF / 深色 #1E1E1E)
+                Container(
+                  width: 30,
+                  height: 30,
+                  decoration: BoxDecoration(
+                    color: AppTheme.cardOf(context),
+                    borderRadius: BorderRadius.circular(7),
+                  ),
+                  child: Icon(
+                    icon,
+                    size: 17,
+                    color: iconColor ?? AppTheme.grey,
+                  ),
+                ),
+                const SizedBox(width: 12),
+              ],
               Text(
                 title,
                 style: TextStyle(fontSize: 16, color: AppTheme.inkOf(context)),

@@ -102,6 +102,8 @@ flutter:
   assets:
     - assets/icon.png
     - assets/icon.ico
+    - assets/wx.jpg
+    - assets/zfb.jpg
 
   # To add assets to your application, add an assets section, like this:
   # assets:

@@ -27,8 +27,15 @@ class DevicesPage extends StatefulWidget {
 }
 
 class _DevicesPageState extends State<DevicesPage> {
+  final _searchCtrl = TextEditingController();
   String _query = '';
   String _filter = 'all'; // all / online / trusted / blocked
+
+  @override
+  void dispose() {
+    _searchCtrl.dispose();
+    super.dispose();
+  }
 
   Future<void> _pickFilter() async {
     final v = await AppDialog.actions<String>(
@@ -123,7 +130,7 @@ class _DevicesPageState extends State<DevicesPage> {
                             if (i > 0)
                               Divider(
                                 height: 1,
-                                indent: 66,
+                                indent: 68,
                                 color: AppTheme.lineOf(context),
                               ),
                             _PeerCard(
@@ -132,6 +139,20 @@ class _DevicesPageState extends State<DevicesPage> {
                             ),
                           ],
                         ],
+                      ),
+                    ),
+                  if (items.isNotEmpty)
+                    // 微信通讯录同款底部总数
+                    Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 16),
+                      child: Center(
+                        child: Text(
+                          trf('device_count', {'n': items.length}),
+                          style: const TextStyle(
+                            fontSize: 12,
+                            color: AppTheme.grey,
+                          ),
+                        ),
                       ),
                     ),
                   const SizedBox(height: 12),
@@ -144,53 +165,82 @@ class _DevicesPageState extends State<DevicesPage> {
     );
   }
 
-  /// 顶部搜索栏 + 筛选按钮 (有激活筛选时按钮变绿)
+  /// 顶部搜索栏 + 筛选块 (与聊天搜索页同款: 白圆角盒内裸 TextField,
+  /// 桌面端必须显式清掉 enabled/focused border 和填充, 否则会浮一层白边)
   Widget _searchRow(BuildContext context) {
+    final active = _filter != 'all';
     return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 10, 4, 2),
+      padding: const EdgeInsets.fromLTRB(12, 10, 12, 0),
       child: Row(
         children: [
           Expanded(
             child: Container(
               height: 36,
-              alignment: Alignment.center,
+              padding: const EdgeInsets.symmetric(horizontal: 10),
               decoration: BoxDecoration(
                 color: AppTheme.cardOf(context),
-                borderRadius: BorderRadius.circular(8),
+                borderRadius: BorderRadius.circular(6),
               ),
-              child: TextField(
-                onChanged: (v) => setState(() => _query = v),
-                style: TextStyle(fontSize: 14, color: AppTheme.inkOf(context)),
-                decoration: InputDecoration(
-                  hintText: tr('device_search_hint'),
-                  hintStyle: const TextStyle(
-                    fontSize: 13,
-                    color: AppTheme.grey,
+              child: Row(
+                children: [
+                  const Icon(Icons.search, size: 18, color: AppTheme.grey),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: TextField(
+                      controller: _searchCtrl,
+                      style: TextStyle(
+                        fontSize: 14,
+                        color: AppTheme.inkOf(context),
+                      ),
+                      decoration: InputDecoration(
+                        hintText: tr('device_search_hint'),
+                        hintStyle: const TextStyle(
+                          fontSize: 14,
+                          color: AppTheme.grey,
+                        ),
+                        filled: false,
+                        isCollapsed: true,
+                        border: InputBorder.none,
+                        enabledBorder: InputBorder.none,
+                        focusedBorder: InputBorder.none,
+                        contentPadding: EdgeInsets.zero,
+                      ),
+                      onChanged: (v) => setState(() => _query = v),
+                    ),
                   ),
-                  prefixIcon: const Icon(
-                    Icons.search,
-                    size: 18,
-                    color: AppTheme.grey,
-                  ),
-                  prefixIconConstraints: const BoxConstraints(minWidth: 38),
-                  border: InputBorder.none,
-                  isDense: true,
-                  contentPadding: const EdgeInsets.symmetric(vertical: 8),
-                ),
+                  if (_query.isNotEmpty)
+                    GestureDetector(
+                      onTap: () {
+                        _searchCtrl.clear();
+                        setState(() => _query = '');
+                      },
+                      child: const Padding(
+                        padding: EdgeInsets.only(left: 6),
+                        child: Icon(
+                          Icons.cancel,
+                          size: 16,
+                          color: AppTheme.grey,
+                        ),
+                      ),
+                    ),
+                ],
               ),
             ),
           ),
           const SizedBox(width: 8),
-          // 筛选按钮: 显示当前选中项, 点按弹窗切换
+          // 筛选块: 显示当前选中项 (激活时绿字), 点按弹窗切换
           InkWell(
-            borderRadius: BorderRadius.circular(8),
+            borderRadius: BorderRadius.circular(6),
             onTap: _pickFilter,
             child: Container(
               height: 36,
               padding: const EdgeInsets.symmetric(horizontal: 10),
               decoration: BoxDecoration(
                 color: AppTheme.cardOf(context),
-                borderRadius: BorderRadius.circular(8),
+                borderRadius: BorderRadius.circular(6),
+                border: active
+                    ? Border.all(color: AppTheme.green.withValues(alpha: 0.5))
+                    : null,
               ),
               child: Row(
                 mainAxisSize: MainAxisSize.min,
@@ -204,21 +254,18 @@ class _DevicesPageState extends State<DevicesPage> {
                     },
                     style: TextStyle(
                       fontSize: 13,
-                      color: _filter == 'all'
-                          ? AppTheme.grey
-                          : AppTheme.green,
+                      color: active ? AppTheme.green : AppTheme.inkOf(context),
                     ),
                   ),
                   Icon(
                     Icons.arrow_drop_down,
                     size: 18,
-                    color: _filter == 'all' ? AppTheme.grey : AppTheme.green,
+                    color: active ? AppTheme.green : AppTheme.grey,
                   ),
                 ],
               ),
             ),
           ),
-          const SizedBox(width: 8),
         ],
       ),
     );
@@ -285,7 +332,7 @@ class _PeerCard extends StatelessWidget {
       onTap: () => Navigator.pushNamed(context, '/chat', arguments: peerId),
       onLongPress: () => _showPeerOptions(context, c, peer, deletable: offline),
       child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
         child: Row(
           children: [
             Builder(
@@ -293,14 +340,14 @@ class _PeerCard extends StatelessWidget {
                 final bytes = c.peerAvatarBytes(peerId);
                 final p = bytes != null ? MemoryImage(bytes) : null;
                 final avatar = Container(
-                  width: 40,
-                  height: 40,
+                  width: 42,
+                  height: 42,
                   alignment: Alignment.center,
                   decoration: BoxDecoration(
                     color: offline
                         ? AppTheme.grey
                         : const Color(0xFF576B95),
-                    borderRadius: BorderRadius.circular(4),
+                    borderRadius: BorderRadius.circular(5),
                     image: p != null
                         ? DecorationImage(image: p, fit: BoxFit.cover)
                         : null,
@@ -333,7 +380,7 @@ class _PeerCard extends StatelessWidget {
                           name,
                           style: TextStyle(
                             fontWeight: FontWeight.w500,
-                            fontSize: 15.5,
+                            fontSize: 16,
                             color: AppTheme.inkOf(context),
                           ),
                           overflow: TextOverflow.ellipsis,
@@ -376,11 +423,11 @@ class _PeerCard extends StatelessWidget {
                       ],
                     ],
                   ),
-                  const SizedBox(height: 2),
+                  const SizedBox(height: 3),
                   Text(
                     peerId,
                     style: const TextStyle(
-                      fontSize: 10,
+                      fontSize: 10.5,
                       color: AppTheme.grey,
                       fontFamily: 'monospace',
                     ),
@@ -389,7 +436,6 @@ class _PeerCard extends StatelessWidget {
                 ],
               ),
             ),
-            const Icon(Icons.chevron_right, size: 18, color: AppTheme.grey),
           ],
         ),
       ),
