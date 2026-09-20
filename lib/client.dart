@@ -2010,11 +2010,13 @@ class RelayClient extends ChangeNotifier {
           unawaited(_pumpStream(s));
           return; // 高频控制消息, 不触发 UI 重建
         case 'fs_stream_skip':
-          // 播放端 seek: 丢弃完全早于 before 的排队请求 (省带宽)
+          // 播放端 seek: 丢弃当前队列里完全早于 before 的请求 (省带宽)。
+          // 注意只能一次性清队列, 不能记永久抛弃线: 回拖 (向后 seek) 的
+          // 新请求也早于 before, 记线会把真实需求当过期请求静默丢掉,
+          // 播放端等不到数据超时断流, 播放器按流结束处理 (卡死后直接结束)
           final s = _streamSend[m['transferId']];
           final before = m['before'] as int?;
           if (s != null && s.peerId == m['from'] && before != null) {
-            if (before > s.skipBefore) s.skipBefore = before;
             s.queue.removeWhere((e) => e.$1 + e.$2 <= before);
           }
           return;
@@ -3343,7 +3345,6 @@ class RelayClient extends ChangeNotifier {
     try {
       while (_streamSend[s.tid] == s && s.queue.isNotEmpty) {
         var (off, len) = s.queue.removeAt(0);
-        if (off + len <= s.skipBefore) continue; // 已被 seek 抛弃的区间
         s.raf ??= await File(s.path).open();
         while (len > 0) {
           if (_streamSend[s.tid] != s) return;
@@ -4787,7 +4788,6 @@ class _StreamSendSession {
   final String path;
   final int size;
   final List<(int, int)> queue = []; // (offset, length) 待发送区间
-  int skipBefore = 0; // seek 抛弃线: 完全早于此的排队请求直接丢
   bool pumping = false;
   RandomAccessFile? raf;
 

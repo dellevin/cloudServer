@@ -61,11 +61,11 @@ class _RemoteFsPageState extends State<RemoteFsPage> {
       isDocFile(name) ||
       isExcelFile(name);
 
-  /// 点文件: 图片/视频/压缩包且未超限 → 临时传输直接预览;
-  /// 视频超限时若对端支持 v5 → 流式预览 (边下边播, 任意拖动);
+  /// 点文件: 视频且对端支持 v5 → 流式预览 (边下边播, 任意拖动, 无需等整文件下完);
+  /// 图片/压缩包/文本等且未超限 → 临时传输直接预览;
   /// 其他类型/超限 → 微信风格文件页 (大图标, 可下载/分享)
   void _tapFile(RelayClient c, String name, int size) {
-    if (isVideoFile(name) && size > _previewMax && c.peerVer(peerId!) >= 5) {
+    if (isVideoFile(name) && size > 0 && c.peerVer(peerId!) >= 5) {
       unawaited(_tapStream(c, name, size));
       return;
     }
