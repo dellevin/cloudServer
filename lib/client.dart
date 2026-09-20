@@ -187,6 +187,11 @@ class RelayClient extends ChangeNotifier {
       StreamController<FileTransfer>.broadcast();
   Stream<FileTransfer> get fileOffers => _fileOfferCtrl.stream;
 
+  /// 自动重试 3 次仍失败的事件流 (UI 弹窗询问用户是否继续)
+  final StreamController<FileTransfer> _retryAskCtrl =
+      StreamController<FileTransfer>.broadcast();
+  Stream<FileTransfer> get retryAsks => _retryAskCtrl.stream;
+
   /// 应用是否在前台 (后台时即使开着聊天页也要计未读+弹通知)
   bool _appForeground = true;
 
@@ -197,9 +202,10 @@ class RelayClient extends ChangeNotifier {
   }
 
   final Map<String, IOSink> _incoming = {};
-  final Map<String, _HashState> _recvHash = {}; // 接收侧累积哈希
   final Set<String> _accepting = {}; // acceptFile 防重入 (见下方注释)
   final Map<String, int> _recvAcked = {}; // 接收侧上次回执的字节数
+  // 接收侧写盘串行链: add/flush/回执全部排队执行 (见分块处理器处注释)
+  final Map<String, Future<void>> _recvChain = {};
   final Map<String, int> _recvLastTs = {}; // 接收侧最后收到分块的毫秒时间戳
   final Map<String, int> _sendAcked = {}; // 发送侧: 对方已确认收到的字节数
   final Map<String, Completer<void>> _sendWaiters = {}; // 背压等待
@@ -220,7 +226,15 @@ class RelayClient extends ChangeNotifier {
   /// (空转最多 6 次, 防对端长期离线时无限挂定时器)
   void _autoRetry(FileTransfer t) {
     if (t.status != TransferStatus.failed) return;
-    if ((_retryAttempts[t.transferId] ?? 0) >= _maxAutoRetries) return;
+    if ((_retryAttempts[t.transferId] ?? 0) >= _maxAutoRetries) {
+      // 3 次自动重试都失败: 不再闷头循环, 交给用户决定要不要继续
+      // (剪贴板/预览等静默传输不打扰; 用户拒绝后保持失败, 仍可手动续传)
+      if (transfers.contains(t) && !t.ephemeral) {
+        Log.w('transfer', 'auto-retry exhausted ${t.fileName}, ask user');
+        _retryAskCtrl.add(t);
+      }
+      return;
+    }
     final sched = (_retrySchedules[t.transferId] ?? 0) + 1;
     if (sched > _maxRetrySchedules) return;
     _retrySchedules[t.transferId] = sched;
@@ -249,6 +263,15 @@ class RelayClient extends ChangeNotifier {
     _retryAttempts.remove(tid);
     _retrySchedules.remove(tid);
     _retryTimers.remove(tid)?.cancel();
+  }
+
+  /// 用户在「重试耗尽」弹窗里选了继续: 账本清零重新走自动重试流程,
+  /// 再失败 3 次会再次询问 (对端不在线则排期等待, 不消耗次数)
+  void retryAgain(FileTransfer t) {
+    if (t.status != TransferStatus.failed) return;
+    Log.i('transfer', 'user chose retry again ${t.fileName}');
+    _resetRetry(t.transferId);
+    _autoRetry(t);
   }
 
   /// 传输进度轻量通知: 进度 tick 走它, 不触发整页重建;
@@ -1055,6 +1078,10 @@ class RelayClient extends ChangeNotifier {
     if (!E2ee.enabled) return false;
     final t = msg['type'] as String?;
     if (t == null || t == 'enc' || t.startsWith('p2p_')) return false;
+    // file_accept 必须明文: 中继靠它建立二进制转发路由 (取 transferId)。
+    // 一旦加密, 服务器只看到 enc 信封, 路由不建, 后续文件块全部被静默丢弃,
+    // 传输卡死在 0 字节直到超时。内容仅 transferId+offset, 不含敏感信息
+    if (t == 'file_accept') return false;
     for (final p in peers) {
       if (p.id == to) return p.ver >= 3;
     }
@@ -1859,8 +1886,19 @@ class RelayClient extends ChangeNotifier {
       if (t == null || sink == null) return;
       // 拉黑后在途的分块直接丢弃 (setBlocked 已取消传输并清理现场)
       if (blockedPeers.contains(t.peerId)) return;
-      sink.add(chunk);
-      _recvHash[tid]?.input.add(chunk);
+      // 文件写入必须排进串行链: dart:io IOSink 在 flush() 进行中再 add()
+      // 会抛 "StreamSink is bound to a stream" (上一版回执前 flush 的修复
+      // 正是这样把分块丢出洞 -> 哈希校验必挂)。add 与 flush 同链串行,
+      // 两者永不重叠; 链内吞异常 (sink 已关的迟到块) 防止链断。
+      final wchain = _recvChain[tid] ?? Future<void>.value();
+      _recvChain[tid] = wchain.then((_) {
+        try {
+          sink.add(chunk);
+        } catch (_) {}
+      });
+      // 不在此逐块算 SHA-256: crypto 是纯 Dart 实现, 大文件高速接收时
+      // 会把 UI isolate 跑满 (Android 整机卡死/ANR 的根因), 改为收完后
+      // 在后台 isolate 对整个 .part 一次性校验 (见 _finishIncoming)
       t.bytesDone += chunk.length;
       if (t.bytesDone > t.fileSize) {
         // 对端发超了声明大小: 异常/恶意, 掐断防止被写满磁盘
@@ -1876,12 +1914,24 @@ class RelayClient extends ChangeNotifier {
       }
       // 流控回执: 每收 2MB 汇报一次, 发送端据此控制发送窗口
       if (t.bytesDone - (_recvAcked[tid] ?? 0) >= 2 * 1024 * 1024) {
-        _recvAcked[tid] = t.bytesDone;
-        _send({
-          'type': 'file_progress',
-          'to': t.peerId,
-          'transferId': tid,
-          'bytes': t.bytesDone,
+        final acked = t.bytesDone;
+        _recvAcked[tid] = acked;
+        // 回执排在这 2MB 的写入 + flush 之后发出: 落盘多少才确认多少,
+        // 发送端窗口耗尽即停, 接收端内存被窗口大小封顶 (大文件 OOM 的修复)。
+        // flush 与上面的 add 同一条链, 时序天然有序
+        final prev = _recvChain[tid] ?? Future<void>.value();
+        _recvChain[tid] = prev.then((_) async {
+          try {
+            await sink.flush();
+            _send({
+              'type': 'file_progress',
+              'to': t.peerId,
+              'transferId': tid,
+              'bytes': acked,
+            });
+          } catch (_) {
+            // 落盘失败/sink 已关: 不回执, 发送端窗口耗尽自会停下 (可断点续传)
+          }
         });
       }
       if (t.bytesDone - _lastNotifyBytes >= 256 * 1024 &&
@@ -2826,9 +2876,11 @@ class RelayClient extends ChangeNotifier {
         : null;
     final viaLan = link != null;
     // 通道参数: 局域网直连块大窗口大, 中继保守 (服务器按帧转发有开销)
+    // 窗口即内存上限: 发送端原生 socket 缓冲 + 接收端落盘前的在途数据都被它封顶,
+    // 128MB 的 LAN 上限在 Android 上足以撑爆内存, 统一压到 32MB
     final chunkSize = viaLan ? 256 * 1024 : 64 * 1024;
     var window = viaLan ? 16 * 1024 * 1024 : 8 * 1024 * 1024;
-    final windowCap = viaLan ? 128 * 1024 * 1024 : 32 * 1024 * 1024;
+    final windowCap = 32 * 1024 * 1024;
     var waitMs = 0; // 累计被窗口卡住的时间
     var evalAt = DateTime.now().millisecondsSinceEpoch + 2000; // 下次评估窗口的时间点
     Log.i(
@@ -3049,15 +3101,9 @@ class RelayClient extends ChangeNotifier {
         offset = 0;
       }
     }
-    final hash = _HashState();
-    if (offset > 0) {
-      // 续传: 已收部分也要计入哈希, 才能和发送端整文件哈希对齐
-      await for (final chunk in part.openRead()) {
-        hash.input.add(chunk);
-      }
-    }
+    // 续传不再重哈希已收部分 (纯 Dart SHA-256 扫几 GB 会卡死 UI isolate);
+    // 完整性由收完后的后台 isolate 整文件校验兜底 (_finishIncoming)
     _canceled.remove(t.transferId);
-    _recvHash[t.transferId] = hash;
     _recvAcked[t.transferId] = offset;
     // 接受时也记时间戳: 发送端若在 accept 后、首分块前死掉,
     // 0 字节挂起的盲区靠看门狗按"对端离线+超时"兜底
@@ -3185,13 +3231,20 @@ class RelayClient extends ChangeNotifier {
 
   /// 关闭接收侧状态; deletePart=false 时保留 .part 供断点续传
   Future<void> _closeIncoming(String tid, {required bool deletePart}) async {
+    // 先排空写盘串行链再关 sink: 否则尾部排队中的分块还没落盘,
+    // 校验改名可能拿到缺尾巴的文件 (链内异常已各自吞掉, 这里只为等待)
+    final chain = _recvChain.remove(tid);
+    if (chain != null) {
+      try {
+        await chain;
+      } catch (_) {}
+    }
     final sink = _incoming.remove(tid);
     if (sink != null) {
       try {
         await sink.close();
       } catch (_) {}
     }
-    _recvHash.remove(tid);
     _recvAcked.remove(tid);
     _recvLastTs.remove(tid);
     if (deletePart) {
@@ -3208,12 +3261,16 @@ class RelayClient extends ChangeNotifier {
   /// 收到 file_done: 校验字节数和 SHA-256, 通过则 .part 改名为正式文件
   Future<void> _finishIncoming(FileTransfer t, {String? sha256}) async {
     final tid = t.transferId;
-    final hash = _recvHash[tid];
-    hash?.input.close();
     await _closeIncoming(tid, deletePart: false);
     var ok = t.bytesDone == t.fileSize;
-    if (ok && sha256 != null && sha256.isNotEmpty) {
-      ok = hash?.hex == sha256;
+    if (ok && sha256 != null && sha256.isNotEmpty && t.savePath != null) {
+      // 后台 isolate 流式哈希整个 .part: 几 GB 的文件在主 isolate 上跑
+      // 纯 Dart SHA-256 会把整机拖死; compute 另起 isolate, UI 保持流畅
+      String? hex;
+      try {
+        hex = await compute(sha256HexOfFile, '${t.savePath}.part');
+      } catch (_) {}
+      ok = hex != null && hex == sha256;
     }
     if (ok && t.savePath != null) {
       try {
@@ -3243,8 +3300,7 @@ class RelayClient extends ChangeNotifier {
       // 数据不可信: 删掉 .part, 重试时从头再来
       Log.e(
         'transfer',
-        'recv verify failed ${t.fileName} '
-            '(${t.bytesDone}/${t.fileSize}B, sha match: ${sha256 == null ? "n/a" : (hash?.hex == sha256)})',
+        'recv verify failed ${t.fileName} (${t.bytesDone}/${t.fileSize}B)',
       );
       t.bytesDone = 0;
       if (t.savePath != null) {
@@ -3397,6 +3453,19 @@ class _HashState {
   );
 
   String? get hex => _digest?.toString();
+}
+
+/// 后台 isolate 用: 流式计算整个文件的 SHA-256 hex。
+/// 必须是顶层函数 (compute 的入口要求); 大文件放后台跑,
+/// 避免纯 Dart 哈希拖满 UI isolate (Android 大文件接收卡死的修复)
+Future<String> sha256HexOfFile(String path) async {
+  Digest? digest;
+  final sink = sha256.startChunkedConversion(_DigestSink((d) => digest = d));
+  await for (final chunk in File(path).openRead()) {
+    sink.add(chunk);
+  }
+  sink.close();
+  return digest.toString();
 }
 
 class _DigestSink implements Sink<Digest> {

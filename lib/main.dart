@@ -485,8 +485,11 @@ class CloudSendApp extends StatefulWidget {
 class _CloudSendAppState extends State<CloudSendApp> {
   final _navigatorKey = GlobalKey<NavigatorState>();
   StreamSubscription<FileTransfer>? _offerSub;
+  StreamSubscription<FileTransfer>? _retrySub;
   final List<FileTransfer> _offerQueue = []; // 多个请求排队弹窗
+  final List<FileTransfer> _retryQueue = []; // 重试询问同样排队
   bool _offerShowing = false;
+  bool _retryShowing = false;
 
   @override
   void initState() {
@@ -495,6 +498,10 @@ class _CloudSendAppState extends State<CloudSendApp> {
     _offerSub = c.fileOffers.listen((t) {
       _offerQueue.add(t);
       _pumpOfferDialog();
+    });
+    _retrySub = c.retryAsks.listen((t) {
+      _retryQueue.add(t);
+      _pumpRetryDialog();
     });
     // 点击系统通知 (Android): 跳转到对应会话
     c.onNotificationOpenChat = (peerId) {
@@ -505,7 +512,30 @@ class _CloudSendAppState extends State<CloudSendApp> {
   @override
   void dispose() {
     _offerSub?.cancel();
+    _retrySub?.cancel();
     super.dispose();
+  }
+
+  /// 自动重试 3 次仍失败: 逐个弹窗询问用户是否继续尝试
+  Future<void> _pumpRetryDialog() async {
+    if (_retryShowing) return;
+    _retryShowing = true;
+    final c = context.read<RelayClient>();
+    while (_retryQueue.isNotEmpty) {
+      final t = _retryQueue.removeAt(0);
+      final ctx = _navigatorKey.currentContext;
+      // 弹窗排队期间可能已被手动重发/删除, 只问仍然是失败状态的
+      if (ctx == null || t.status != TransferStatus.failed) continue;
+      final again = await AppDialog.confirm(
+        ctx,
+        title: tr('retry_ask_title'),
+        message: trf('retry_ask_msg', {'name': t.fileName}),
+        okLabel: tr('retry_keep'),
+        cancelLabel: tr('retry_stop'),
+      );
+      if (again == true) c.retryAgain(t);
+    }
+    _retryShowing = false;
   }
 
   /// 逐个弹出文件接收确认框
@@ -879,7 +909,7 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage> {
-  int _tab = 1; // 0=设备 1=聊天 2=剪贴板 3=设置 (默认打开聊天)
+  int _tab = 0; // 0=设备 1=聊天 2=剪贴板 3=设置 (默认打开设备)
   int _chatSub = 0; // 聊天 tab 内: 0=消息 1=传输记录
   final _clipKey = GlobalKey<ClipboardPageState>(); // AppBar 搜索/刷新调它
 
