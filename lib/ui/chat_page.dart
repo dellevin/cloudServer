@@ -478,6 +478,44 @@ class _ChatPageState extends State<ChatPage> {
     return ts;
   }
 
+  bool _badgePending = false; // 本帧已安排角标结算 (同帧多次 build 只结算一次)
+
+  /// build 中不改状态: 列表项数记录与「回到底部」角标的累计推迟到帧后
+  /// 执行; 数据在回调内重新读取, _atBottom 也按回调时刻判断 (更准确)
+  void _scheduleBadgeUpdate(int itemCount) {
+    if (_badgePending) return;
+    _badgePending = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _badgePending = false;
+      if (!mounted) return;
+      final c = _client;
+      if (c == null || peerId == null) return;
+      _lastItemCount = itemCount;
+      final newestTs = _newestTsOf(c);
+      if (newestTs <= _prevNewestTs) return;
+      var changed = false;
+      if (_prevNewestTs != 0 && !_atBottom) {
+        final msgs = c.chats[peerId] ?? <ChatMessage>[];
+        final n =
+            msgs.where((m) => m.ts > _prevNewestTs).length +
+            c.transfers
+                .where(
+                  (t) =>
+                      !t.ephemeral &&
+                      t.peerId == peerId &&
+                      t.ts > _prevNewestTs,
+                )
+                .length;
+        if (n > 0) {
+          _newBelowCount += n;
+          changed = true;
+        }
+      }
+      _prevNewestTs = newestTs;
+      if (changed) setState(() {}); // 角标数字变化, 补一次重绘
+    });
+  }
+
   /// 当前应显示的文件传输记录。
   /// 文字消息还有更早的页没翻到时, 早于当前页边界的文件先不显示:
   /// 这样翻页拼接的新内容永远只出现在列表最前面, 已有内容索引不变,
@@ -672,17 +710,8 @@ class _ChatPageState extends State<ChatPage> {
     String name,
   ) {
     // 有更早历史时, 顶部多一行加载指示 (reverse 列表的最后一个 index)
-    _lastItemCount = items.length + (c.hasMoreHistory[peerId] == true ? 1 : 0);
-    // 不在底部时来了新消息: 累计到「回到底部」按钮角标
-    final newestTs = _newestTsOf(c);
-    if (newestTs > _prevNewestTs) {
-      if (_prevNewestTs != 0 && !_atBottom) {
-        _newBelowCount +=
-            msgs.where((m) => m.ts > _prevNewestTs).length +
-            transfers.where((t) => t.ts > _prevNewestTs).length;
-      }
-      _prevNewestTs = newestTs;
-    }
+    final itemCount = items.length + (c.hasMoreHistory[peerId] == true ? 1 : 0);
+    _scheduleBadgeUpdate(itemCount);
     return Container(
       color: AppTheme.chatBgOf(context),
       child: Column(
@@ -728,7 +757,7 @@ class _ChatPageState extends State<ChatPage> {
                               vertical: 10,
                             ),
                             // 有更早历史时, 顶部多一行加载指示 (reverse 列表的最后一个 index)
-                            itemCount: _lastItemCount,
+                            itemCount: itemCount,
                             itemBuilder: (_, i) {
                               // 顶部加载行 (仅 hasMore 时存在, 为最后一个 index)
                               if (i >= items.length) {
@@ -1782,7 +1811,7 @@ class _FileBubble extends StatelessWidget {
 }
 
 /// 微信风格文字气泡
-class _Bubble extends StatelessWidget {
+class _Bubble extends StatefulWidget {
   final ChatMessage message;
   final ValueChanged<Rect> onLongPress; // 参数为气泡的全局矩形 (用于菜单定位)
   final bool highlight;
@@ -1792,12 +1821,31 @@ class _Bubble extends StatelessWidget {
     this.highlight = false,
   });
 
+  @override
+  State<_Bubble> createState() => _BubbleState();
+}
+
+class _BubbleState extends State<_Bubble> {
   static const green = Color(0xFF95EC69);
   static final _urlRe = RegExp(r'(https?://[^\s]+)');
 
+  // 每个 URL 一个手势识别器, 必须随 widget 生命周期 dispose;
+  // TextSpan 按文本缓存, 重建时不变就不重新分配 (也不重建识别器)
+  final List<TapGestureRecognizer> _recognizers = [];
+  TextSpan? _span;
+  String? _spanText;
+
+  @override
+  void dispose() {
+    for (final r in _recognizers) {
+      r.dispose();
+    }
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) {
-    final m = message;
+    final m = widget.message;
     final c = context.read<RelayClient>();
     // 已撤回: 居中灰色占位条 (微信风格), 不显示气泡
     if (m.recalled) {
@@ -1813,7 +1861,7 @@ class _Bubble extends StatelessWidget {
     }
     final bubbleColor = m.fromMe ? green : AppTheme.bubbleOf(context);
     return Container(
-      color: highlight ? const Color(0x3307C160) : null,
+      color: widget.highlight ? const Color(0x3307C160) : null,
       padding: const EdgeInsets.symmetric(vertical: 5),
       child: Row(
         mainAxisAlignment: m.fromMe
@@ -1860,7 +1908,7 @@ class _Bubble extends StatelessWidget {
           Flexible(
             child: Builder(
               builder: (bubbleCtx) => GestureDetector(
-                onLongPress: () => onLongPress(_rectOf(bubbleCtx)),
+                onLongPress: () => widget.onLongPress(_rectOf(bubbleCtx)),
                 child: Container(
                   padding: const EdgeInsets.symmetric(
                     horizontal: 12,
@@ -1898,12 +1946,21 @@ class _Bubble extends StatelessWidget {
   }
 
   TextSpan _linkify(String text) {
+    if (_span != null && _spanText == text) return _span!;
+    for (final r in _recognizers) {
+      r.dispose();
+    }
+    _recognizers.clear();
     final spans = <TextSpan>[];
     var pos = 0;
     for (final match in _urlRe.allMatches(text)) {
       if (match.start > pos)
         spans.add(TextSpan(text: text.substring(pos, match.start)));
       final url = match.group(0)!;
+      final rec = TapGestureRecognizer()
+        ..onTap = () =>
+            launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
+      _recognizers.add(rec);
       spans.add(
         TextSpan(
           text: url,
@@ -1911,15 +1968,14 @@ class _Bubble extends StatelessWidget {
             color: Color(0xFF576B95),
             decoration: TextDecoration.underline,
           ),
-          recognizer: TapGestureRecognizer()
-            ..onTap = () =>
-                launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication),
+          recognizer: rec,
         ),
       );
       pos = match.end;
     }
     if (pos < text.length) spans.add(TextSpan(text: text.substring(pos)));
-    return TextSpan(children: spans);
+    _spanText = text;
+    return _span = TextSpan(children: spans);
   }
 }
 

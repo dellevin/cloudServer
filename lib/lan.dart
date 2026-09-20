@@ -55,10 +55,15 @@ class LanLink {
   void Function(dynamic frame)? onFrame; // String (JSON) 或 Uint8List (二进制)
   void Function()? onClosed;
 
-  Uint8List _pending = Uint8List(0);
+  // 收包分块缓冲: TCP 段直接入队不拷贝, 帧落在单块内时零拷贝派发
+  // (视图共享块缓冲, 消费方异步写盘期间块由视图保活), 跨块才一次拼装
+  final List<Uint8List> _rxChunks = [];
+  int _rxHead = 0; // 首块下标 (之前的块已消费, 定期压缩)
+  int _rxOff = 0; // 首块内已消费偏移
+  int _rxLen = 0; // 缓冲总字节数
 
   // 单帧长度上限: 文件块 256KB + 36B 头, JSON 含 base64 头像/目录列表,
-  // 16MB 留足余量; 超限即视为恶意/故障对端, 直接断连防 _pending 无限累积 OOM
+  // 16MB 留足余量; 超限即视为恶意/故障对端, 直接断连防缓冲无限累积 OOM
   static const int maxFrameLen = 16 * 1024 * 1024;
 
   LanLink(this._socket, {required this.inbound, this.peerId}) {
@@ -72,18 +77,76 @@ class LanLink {
 
   InternetAddress get remoteAddr => _socket.remoteAddress;
 
+  int _peekByte(int i) {
+    var idx = _rxHead;
+    var off = _rxOff + i;
+    while (true) {
+      final c = _rxChunks[idx];
+      if (off < c.length) return c[off];
+      off -= c.length;
+      idx++;
+    }
+  }
+
+  void _consume(int n) {
+    _rxLen -= n;
+    var rem = n;
+    while (rem > 0) {
+      final c = _rxChunks[_rxHead];
+      final avail = c.length - _rxOff;
+      if (avail > rem) {
+        _rxOff += rem;
+        return;
+      }
+      rem -= avail;
+      _rxHead++;
+      _rxOff = 0;
+    }
+  }
+
+  Uint8List _take(int n) {
+    final first = _rxChunks[_rxHead];
+    if (first.length - _rxOff >= n) {
+      final v = Uint8List.sublistView(first, _rxOff, _rxOff + n);
+      _consume(n);
+      return v;
+    }
+    final out = Uint8List(n);
+    var pos = 0;
+    while (pos < n) {
+      final c = _rxChunks[_rxHead];
+      final avail = c.length - _rxOff;
+      final k = avail < n - pos ? avail : n - pos;
+      out.setRange(pos, pos + k, c, _rxOff);
+      pos += k;
+      _rxOff += k;
+      if (_rxOff == c.length) {
+        _rxHead++;
+        _rxOff = 0;
+      }
+    }
+    _rxLen -= n;
+    return out;
+  }
+
   void _onData(Uint8List data) {
-    _pending = Uint8List.fromList([..._pending, ...data]);
-    while (_pending.length >= 5) {
-      final kind = _pending[0];
-      final len = ByteData.sublistView(_pending, 1, 5).getUint32(0);
+    if (closed) return;
+    _rxChunks.add(data);
+    _rxLen += data.length;
+    while (_rxLen >= 5) {
+      final kind = _peekByte(0);
+      final len =
+          (_peekByte(1) << 24) |
+          (_peekByte(2) << 16) |
+          (_peekByte(3) << 8) |
+          _peekByte(4);
       if (len > maxFrameLen) {
         close();
         return;
       }
-      if (_pending.length < 5 + len) break;
-      final payload = Uint8List.sublistView(_pending, 5, 5 + len);
-      _pending = Uint8List.sublistView(_pending, 5 + len);
+      if (_rxLen < 5 + len) break;
+      _consume(5);
+      final payload = _take(len);
       if (closed) return;
       // 畸形帧 (非 UTF-8 文本/处理异常) 不应抛进 zone 使宿主崩溃:
       // 关闭这条不可信的连接, 发送方自然回退到中继通道
@@ -93,6 +156,11 @@ class LanLink {
         close();
         return;
       }
+    }
+    // 压缩已消费的前缀块 (全部消费完时即清空)
+    if (_rxHead > 0 && (_rxHead == _rxChunks.length || _rxHead > 64)) {
+      _rxChunks.removeRange(0, _rxHead);
+      _rxHead = 0;
     }
   }
 
@@ -119,6 +187,10 @@ class LanLink {
   void close() {
     if (closed) return;
     closed = true;
+    _rxChunks.clear();
+    _rxHead = 0;
+    _rxOff = 0;
+    _rxLen = 0;
     try {
       _socket.destroy();
     } catch (_) {}

@@ -101,9 +101,16 @@ class ClipItem {
 
 class ChatDb {
   static Database? _db;
+  // 缓存打开中的 Future: 并发调用方共享同一次 openDatabase,
+  // 避免竞态打开两个句柄 (前一个泄漏且后续写分裂到两个连接)
+  static Future<Database>? _opening;
 
-  static Future<Database> get db async {
-    if (_db != null) return _db!;
+  static Future<Database> get db {
+    if (_db != null) return Future.value(_db!);
+    return _opening ??= _open();
+  }
+
+  static Future<Database> _open() async {
     if (!kIsWeb && (Platform.isWindows || Platform.isLinux)) {
       sqfliteFfiInit();
       databaseFactory = databaseFactoryFfi;
@@ -111,10 +118,15 @@ class ChatDb {
     final base = await getDatabasesPath();
     _db = await openDatabase(
       p.join(base, 'cloudsend_chat.db'),
-      version: 6,
+      version: 7,
       onCreate: (d, v) async {
         await d.execute(
           'CREATE TABLE messages(id INTEGER PRIMARY KEY AUTOINCREMENT, peerId TEXT NOT NULL, fromMe INTEGER NOT NULL, text TEXT NOT NULL, ts INTEGER NOT NULL, delivered INTEGER NOT NULL DEFAULT 1, rejected INTEGER NOT NULL DEFAULT 0, recalled INTEGER NOT NULL DEFAULT 0, readFlag INTEGER NOT NULL DEFAULT 0)',
+        );
+        // 历史分页 (peerId = ? AND ts < ? ORDER BY ts DESC) 与
+        // 送达/已读回执定位 (peerId = ? AND ts = ?) 的高频查询索引
+        await d.execute(
+          'CREATE INDEX idx_messages_peer_ts ON messages(peerId, ts)',
         );
         await d.execute(
           'CREATE TABLE transfers(transferId TEXT PRIMARY KEY, peerId TEXT NOT NULL, fileName TEXT NOT NULL, fileSize INTEGER NOT NULL, outgoing INTEGER NOT NULL, status TEXT NOT NULL, savePath TEXT, ts INTEGER NOT NULL)',
@@ -150,6 +162,11 @@ class ChatDb {
         if (oldV < 6) {
           await d.execute(
             'CREATE TABLE clip_items(id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, content TEXT NOT NULL, ts INTEGER NOT NULL, fromMe INTEGER NOT NULL, peerId TEXT NOT NULL)',
+          );
+        }
+        if (oldV < 7) {
+          await d.execute(
+            'CREATE INDEX idx_messages_peer_ts ON messages(peerId, ts)',
           );
         }
       },

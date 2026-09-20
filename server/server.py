@@ -731,6 +731,9 @@ FORWARD_TYPES = (
     "clip_text",
     "file_offer", "file_reject",
     "file_done", "file_progress", "file_result", "file_cancel",
+    # 并行车道控制消息 (正常只在 LAN 直连用, 兜底走中继时也得能转发)
+    "file_parallel", "file_seg_hash", "file_seg_reset",
+    "file_accept_pending", "file_instant", "file_instant_nack",
     "fs_list", "fs_list_result", "fs_get",
     "fs_thumb", "fs_thumb_result",
     "enc",
@@ -816,12 +819,13 @@ async def handle(ws):
                             print(f"[x] register {my_id} from {ip} refused ({r})")
                             await kick(ws, r)
                             return
-                        # 同 id 已有旧连接: 踢掉旧的, 新连接接管身份 (防并行劫持)
+                        # 同 id 已有旧连接: 先原子占位再踢旧连接 (防并行劫持)。
+                        # 顺序不能反: kick 是 await, 两个并发注册会都在 kick 处
+                        # 让出再先后覆盖 clients[id], 先到位的连接成为从未被踢的
+                        # 幽灵 (二进制帧只校验 my_id, 可向在任者的传输注入伪造块)。
+                        # 先占位后每个注册者恰好踢掉自己的前任, 只有最后写者存活
                         old = clients.get(my_id)
-                        if old is not None and old["ws"] is not ws:
-                            print(f"[~] {my_id} re-registered, kicking old connection")
-                            await kick(old["ws"], "replaced")
-                        is_new = my_id not in clients
+                        is_new = old is None
                         clients[my_id] = {
                             "name": m.get("name", "Unknown"),
                             "ws": ws,
@@ -830,6 +834,9 @@ async def handle(ws):
                             "ip": ip,
                             "ver": m.get("ver") if isinstance(m.get("ver"), int) else 0,
                         }
+                        if old is not None and old["ws"] is not ws:
+                            print(f"[~] {my_id} re-registered, kicking old connection")
+                            await kick(old["ws"], "replaced")
                         print(f"[+] {m.get('name')} ({my_id}) v{m.get('ver', 0)} joined from {ip}, total={len(clients)}")
                         await broadcast_peers()
                         if is_new:
@@ -841,12 +848,25 @@ async def handle(ws):
                         if my_id is None or not isinstance(tid, str) or not tid \
                                 or not isinstance(to, str) or not to:
                             continue
+                        # 发送方必须在线: 否则路由+带宽桶空转到 TTL 才被清扫
+                        if to not in clients:
+                            continue
+                        r = routes.get(tid)
+                        if r is not None and r["to"] != my_id:
+                            # 路由已属于其他接收方: 拒绝覆盖。任意设备凭 transferId
+                            # 发 file_accept 即可把发送方的文件流重定向给自己的漏洞
+                            print(f"[!] {my_id} route hijack refused (tid owned by {r['to']})")
+                            continue
                         m["from"] = my_id
-                        # 数据块流向: 文件发送方(m["to"]) -> 文件接收方(my_id)
-                        routes[tid] = {"from": to, "to": my_id, "ts": time.time()}
-                        # 单传输带宽桶随路由创建 (file_done/cancel/路由清理时释放)
-                        transfer_buckets[tid] = Bucket(acl.get_limits()["transfer_bps"])
-                        stats.add("transfers")
+                        if r is None:
+                            # 数据块流向: 文件发送方(m["to"]) -> 文件接收方(my_id)
+                            routes[tid] = {"from": to, "to": my_id, "ts": time.time()}
+                            # 单传输带宽桶随路由创建 (file_done/cancel/路由清理时释放)
+                            transfer_buckets[tid] = Bucket(acl.get_limits()["transfer_bps"])
+                            stats.add("transfers")
+                        else:
+                            # 同一接收方重复接受 (断点续传): 刷新路由, 不重建桶
+                            r["ts"] = time.time()
                         stats.add("text_bytes", len(data))
                         stats.add("messages")
                         await forward(to, json.dumps(m))
@@ -875,6 +895,9 @@ async def handle(ws):
                         r = routes.get(tid)
                         # 只转发路由登记的发送方发来的数据块, 防止伪造注入
                         if r and r["from"] == my_id:
+                            # 数据在流即活跃: 刷新路由时间戳, 防超过 TTL 的
+                            # 大文件/慢速传输中途被清扫, 后续帧全丢传输挂死
+                            r["ts"] = time.time()
                             stats.add("bin_bytes", len(data))
                             stats.add("bin_frames")
                             stats.add_device_bytes(my_id, len(data))

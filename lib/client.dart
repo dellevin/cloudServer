@@ -120,8 +120,42 @@ class RelayClient extends ChangeNotifier {
   Set<String> _relayIds = {};
   List<String> manualLanTargets = []; // 手动添加的局域网设备 "ip:port"
   final List<FileTransfer> transfers = [];
+  // transferId 索引: 每个文件块 (64~256KB) 都查一次 _find, 线性扫描在
+  // 高速传输 + 历史记录多时是纯 CPU 浪费; 增删 transfers 必须同步维护
+  final Map<String, FileTransfer> _transferIdx = {};
   final Map<String, List<ChatMessage>> chats = {};
   final Map<String, int> unread = {};
+
+  /// 登记一条传输 (维护 tid 索引; 顺手修剪终结的 ephemeral 记录防列表膨胀)
+  void _addTransfer(FileTransfer t) {
+    transfers.add(t);
+    _transferIdx[t.transferId] = t;
+    if (t.ephemeral) _pruneEphemeral();
+  }
+
+  /// ephemeral (预览/剪贴板) 临时传输不入库, 重启即弃; 但会话期内完成后
+  /// 也一直留在 transfers 里, 长期运行越攒越多拖慢每次全表遍历。
+  /// 终结超 5 分钟的清掉 (预览页完成即取走文件, 不会再查旧记录)
+  void _pruneEphemeral() {
+    final cutoff = DateTime.now().millisecondsSinceEpoch - 5 * 60 * 1000;
+    for (var i = transfers.length - 1; i >= 0; i--) {
+      final x = transfers[i];
+      if (!x.ephemeral || x.ts > cutoff) continue;
+      if (x.status == TransferStatus.done ||
+          x.status == TransferStatus.failed ||
+          x.status == TransferStatus.canceled ||
+          x.status == TransferStatus.rejected) {
+        _transferIdx.remove(x.transferId);
+        transfers.removeAt(i);
+      }
+    }
+  }
+
+  /// 移除一条传输 (维护 tid 索引)
+  void _removeTransfer(FileTransfer t) {
+    _transferIdx.remove(t.transferId);
+    transfers.remove(t);
+  }
 
   /// 要在 UI 展示的传输记录 (预览拉取的 ephemeral 临时传输不入库不上列表)
   List<FileTransfer> get visibleTransfers =>
@@ -131,6 +165,9 @@ class RelayClient extends ChangeNotifier {
 
   WebSocketChannel? _ch;
   Timer? _reconnectTimer;
+  // 连接代次: 每次 connect/disconnect 自增, 使等待握手期间的旧连接失效
+  // (两次 connect 交错时先到位的 channel 不会被后者覆盖成无人持有的泄漏连接)
+  int _connectSeq = 0;
   bool _manualClose = false;
   int _retryCount = 0; // 重连次数 (指数退避用, 连上后归零)
   bool _svcSyncPending = false;
@@ -240,8 +277,20 @@ class RelayClient extends ChangeNotifier {
   final Map<String, bool> _acceptPar = {}; // 发送侧: file_accept 声明可并行
   final Set<String> _parMode = {}; // 接收侧: 该传输走 40 字节头 (36 tid + 4 片号)
   final Map<String, Map<int, IOSink>> _parSinks = {}; // 并行接收: 片号 -> sink
+  // 并行接收: 片号 -> 已收字节数 (车道断线重发时回退 bytesDone 用)
+  final Map<String, Map<int, int>> _parRecvBytes = {};
+  // 并行发送: 车道断线交回的半片, 重派时需先发 file_seg_reset 让接收端清空该片
+  // (已送入死车道的字节是否到达不可知, 从中间偏移续发必造成空洞/重复)
+  final Set<String> _parSegReset = {}; // '$tid:$seg'
   final Map<String, Map<int, String>> _segHashes = {}; // 分片 SHA-256 (.seghash 边车)
   final Map<String, String> _instantPending = {}; // 秒传等待中: tid -> 候选文件路径
+  final Map<String, Timer> _instantTimers = {}; // 秒传兜底计时 (终结时取消, 不白活 600s)
+
+  /// 清理秒传等待状态 (pending + 兜底计时器)
+  void _clearInstant(String tid) {
+    _instantPending.remove(tid);
+    _instantTimers.remove(tid)?.cancel();
+  }
   final Map<String, Timer> _offerTimers = {}; // 外发 offer 的等待超时 (可续期)
   int _lastNotifyBytes = 0;
   int _lastNotifyTs = 0; // 上次进度通知时间 (高速传输时按 200ms 节流)
@@ -566,6 +615,9 @@ class RelayClient extends ChangeNotifier {
         hasMoreHistory[pid] = h.length >= historyPageSize;
       }
       transfers.addAll(await ChatDb.loadTransfers());
+      for (final t in transfers) {
+        _transferIdx[t.transferId] = t;
+      }
       // 恢复失败接收传输的已收字节: .part/分片还在就可以断点续传
       for (final t in transfers) {
         if (!t.outgoing &&
@@ -678,22 +730,12 @@ class RelayClient extends ChangeNotifier {
 
   String? _avatarB64;
 
-  /// 压缩头像为 96x96 PNG base64 (用于中继广播)
+  /// 压缩头像为 96x96 JPEG base64 (用于中继广播/局域网宣告)
   Future<String?> _avatarBase64() async {
     if (avatarPath.isEmpty) return null;
     if (_avatarB64 != null) return _avatarB64;
-    try {
-      final bytes = await File(avatarPath).readAsBytes();
-      final decoded = img.decodeImage(bytes);
-      if (decoded == null) return null;
-      final resized = img.copyResizeCropSquare(decoded, size: 96);
-      // 用 JPEG 不用 PNG: 照片内容 PNG 有 20KB+ (base64 超局域网宣告的
-      // 16KB 上限直接被丢弃, 对端永远看不到头像), JPEG 只有 ~4KB
-      _avatarB64 = base64Encode(img.encodeJpg(resized, quality: 85));
-      return _avatarB64;
-    } catch (_) {
-      return null;
-    }
+    _avatarB64 = await compute(_avatarJob, avatarPath);
+    return _avatarB64;
   }
 
   Future<void> setDeviceName(String name) async {
@@ -934,12 +976,14 @@ class RelayClient extends ChangeNotifier {
     (await SharedPreferences.getInstance()).setString('serverAddr', serverAddr);
     disconnect();
     _manualClose = false;
+    final seq = ++_connectSeq;
     final uri = serverAddr.startsWith('ws') ? serverAddr : 'ws://$serverAddr';
     try {
       final ch = WebSocketChannel.connect(Uri.parse(uri));
       await ch.ready; // 等握手完成, 失败抛异常走退避重连
-      if (_manualClose) {
-        // 等待握手期间用户点了断开
+      if (_manualClose || seq != _connectSeq || _ch != null) {
+        // 等待握手期间用户点了断开, 或并发的后一次 connect 已接管:
+        // 本连接必须关闭, 否则旧 channel 无人持有, 服务器侧残留幽灵注册
         ch.sink.close();
         return;
       }
@@ -972,6 +1016,7 @@ class RelayClient extends ChangeNotifier {
 
   void disconnect() {
     _manualClose = true;
+    _connectSeq++; // 使等待握手中的 connect 失效
     _reconnectTimer?.cancel();
     _ch?.sink.close();
     _ch = null;
@@ -1139,6 +1184,9 @@ class RelayClient extends ChangeNotifier {
     // 一旦加密, 服务器只看到 enc 信封, 路由不建, 后续文件块全部被静默丢弃,
     // 传输卡死在 0 字节直到超时。内容仅 transferId+offset, 不含敏感信息
     if (t == 'file_accept') return false;
+    // file_seg_reset 必须明文: 加密是异步的, 会插到重发数据帧之后到达,
+    // 接收端先写后删必坏片; 内容仅 transferId+片号, 不含敏感信息
+    if (t == 'file_seg_reset') return false;
     for (final p in peers) {
       if (p.id == to) return p.ver >= 3;
     }
@@ -1788,7 +1836,7 @@ class RelayClient extends ChangeNotifier {
           if (m['clip'] == true && clipSyncEnabled && isTrusted(t.peerId)) {
             t.ephemeral = true;
             t.clipboard = true;
-            transfers.add(t);
+            _addTransfer(t);
             ChatDb.upsertTransfer(t);
             Log.i(
               'clip',
@@ -1801,7 +1849,7 @@ class RelayClient extends ChangeNotifier {
           // 自动接收, 页面等它完成直接预览, 不弹确认框也不发通知
           final pulled = _consumeFsPull(t.peerId, t.fileName, t.fileSize);
           t.ephemeral = pulled;
-          transfers.add(t);
+          _addTransfer(t);
           ChatDb.upsertTransfer(t);
           if (pulled) {
             Log.i('fs', 'auto-accept pulled ${t.fileName} from ${t.peerId}');
@@ -1971,7 +2019,8 @@ class RelayClient extends ChangeNotifier {
           final t = _find(m['transferId']);
           if (t != null &&
               !t.outgoing &&
-              _instantPending.remove(t.transferId) != null) {
+              _instantPending.containsKey(t.transferId)) {
+            _clearInstant(t.transferId);
             Log.i('transfer', 'instant nack ${t.fileName}, fallback to recv');
             unawaited(acceptFile(t));
           }
@@ -1980,6 +2029,32 @@ class RelayClient extends ChangeNotifier {
           // 发送端确认本传输走并行车道: 主链路分块切换为 40 字节头
           final tid = m['transferId'] as String?;
           if (tid != null) _parMode.add(tid);
+          return; // 不触发 UI 重建
+        case 'file_seg_reset':
+          // 并行车道断线: 发送端将从 0 重发该片。回退该片已收计数
+          // (防重发字节触发 overflow 误判), 并排进写盘串行链删掉半片:
+          // 链上已排队的旧写盘先执行后删除, 之后到达的重发帧重新 append
+          final tid = m['transferId'] as String?;
+          final seg = m['seg'] as int?;
+          final t = tid != null ? _find(tid) : null;
+          if (tid != null && seg != null && t != null && !t.outgoing) {
+            final got = _parRecvBytes[tid]?[seg] ?? 0;
+            if (got > 0) {
+              t.bytesDone -= got;
+              _parRecvBytes[tid]?[seg] = 0;
+            }
+            final chain = _recvChain[tid] ?? Future<void>.value();
+            _recvChain[tid] = chain.then((_) async {
+              try {
+                await _parSinks[tid]?.remove(seg)?.close();
+                final p = t.savePath;
+                if (p != null) {
+                  final f = File('$p.seg$seg');
+                  if (await f.exists()) await f.delete();
+                }
+              } catch (_) {}
+            });
+          }
           return; // 不触发 UI 重建
         case 'file_seg_hash':
           // 发送端报某一片的 SHA-256: 存内存 + 追加 .seghash 边车 (续传校验用)
@@ -2007,8 +2082,11 @@ class RelayClient extends ChangeNotifier {
           if (t != null && !t.outgoing) {
             if (m['instant'] == true) {
               // 秒传确认: 本地候选文件哈希与发送端一致, 直接落成
-              final p = _instantPending.remove(t.transferId);
-              if (p != null) _finishInstant(t, p);
+              final p = _instantPending[t.transferId];
+              if (p != null) {
+                _clearInstant(t.transferId);
+                _finishInstant(t, p);
+              }
             } else {
               _finishIncoming(t, sha256: m['sha256'] as String?);
             }
@@ -2052,6 +2130,9 @@ class RelayClient extends ChangeNotifier {
         final seg = parSeg;
         final piece = chunk;
         pos += piece.length;
+        // 每片已收字节记账: file_seg_reset 时据此回退 bytesDone
+        final rb = _parRecvBytes[tid] ??= {};
+        rb[seg] = (rb[seg] ?? 0) + piece.length;
         final wchain = _recvChain[tid] ?? Future<void>.value();
         _recvChain[tid] = wchain.then((_) async {
           try {
@@ -2153,12 +2234,7 @@ class RelayClient extends ChangeNotifier {
     }
   }
 
-  FileTransfer? _find(String tid) {
-    for (final t in transfers) {
-      if (t.transferId == tid) return t;
-    }
-    return null;
-  }
+  FileTransfer? _find(String tid) => _transferIdx[tid];
 
   /// 清洗对端发来的文件名: 只保留最后一段并去掉盘符/前导点,
   /// 防止恶意文件名 (../../ 或 ..\\..\\) 把文件写出下载目录
@@ -2434,10 +2510,10 @@ class RelayClient extends ChangeNotifier {
     }
     _segHashes.remove(t.transferId);
     _offerV2.remove(t.transferId);
-    _instantPending.remove(t.transferId);
+    _clearInstant(t.transferId);
     _offerTimers.remove(t.transferId)?.cancel();
     _cleanupTemp(t);
-    transfers.remove(t);
+    _removeTransfer(t);
     notifyListeners();
   }
 
@@ -2570,7 +2646,7 @@ class RelayClient extends ChangeNotifier {
     await cache.create(recursive: true);
     final ts = DateTime.now().millisecondsSinceEpoch;
     final zipPath = '${cache.path}${Platform.pathSeparator}${name}_$ts.zip';
-    await ZipFileEncoder().zipDirectory(Directory(dirPath), filename: zipPath);
+    await compute(_zipFolderJob, [dirPath, zipPath]);
     return zipPath;
   }
 
@@ -2637,7 +2713,7 @@ class RelayClient extends ChangeNotifier {
     t.ephemeral = preview || clip;
     t.clipboard = clip;
     if (isTemp) _tempSendPaths.add(path);
-    transfers.add(t);
+    _addTransfer(t);
     ChatDb.upsertTransfer(t);
     if (!preview && !clip) {
       // 保证会话出现在消息列表 (纯文件会话没有文字消息)
@@ -2778,7 +2854,7 @@ class RelayClient extends ChangeNotifier {
       // 2) 图片 (截图/相册复制; pasteboard 统一给 PNG 字节)
       final bytes = await Pasteboard.image;
       if (bytes != null && bytes.isNotEmpty) {
-        final key = sha256.convert(bytes).toString();
+        final key = await compute(sha256HexOfBytes, bytes);
         if (_consumeClipSuppress(key)) {
           _lastClipImageKey = key;
           return;
@@ -2998,7 +3074,10 @@ class RelayClient extends ChangeNotifier {
     required int size,
   }) {
     if (!isOnline(peerId)) return;
-    _fsPulls['$peerId|$name|$size'] = DateTime.now().millisecondsSinceEpoch;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    // 顺手清扫过期登记: 否则只在匹配成功时才删, 长期累积
+    _fsPulls.removeWhere((_, ts) => now - ts >= 30000);
+    _fsPulls['$peerId|$name|$size'] = now;
     _send({'type': 'fs_get', 'to': peerId, 'path': path, 'preview': true});
   }
 
@@ -3093,6 +3172,9 @@ class RelayClient extends ChangeNotifier {
     final tid = t.transferId;
     _canceled.remove(tid);
     _aborted.remove(tid);
+    // retry 复用同 transferId: 清掉上一轮残留的片重置标记,
+    // 否则误发 file_seg_reset 把接收端已续传的好片删掉
+    _parSegReset.removeWhere((k) => k.startsWith('$tid:'));
     t.status = TransferStatus.transferring;
     t.bytesDone = offset;
     _sendAcked[tid] = offset;
@@ -3453,6 +3535,16 @@ class RelayClient extends ChangeNotifier {
         if (myLink.closed) return; // 车道已断: 剩余片让另一条领
         final i = takeSeg();
         if (i < 0) return;
+        if (_parSegReset.remove('$tid:$i')) {
+          // 该片是死车道交回的半片: 通知接收端清空再重发。
+          // 控制消息与重发数据同走幸存主链路 (TCP 保序), 接收端先删后写
+          _send({
+            'type': 'file_seg_reset',
+            'to': t.peerId,
+            'transferId': tid,
+            'seg': i,
+          });
+        }
         final segStart = i * _segSize;
         final segLen = (t.fileSize - segStart).clamp(0, _segSize);
         RandomAccessFile? raf;
@@ -3518,7 +3610,16 @@ class RelayClient extends ChangeNotifier {
           await raf?.close();
         }
         if (!completed) {
-          pendingSeg = i; // 半片交回重派 (车道断线)
+          // 半片交回重派 (车道断线): 已送入死车道socket缓冲的字节是否
+          // 到达对端不可知, 幸存 worker 若从 segProgress 偏移续发, 接收端
+          // 纯 append 必产生空洞/重复 (校验失败后整轮白传)。
+          // 回退该片进度从 0 重发, 并标记重派时先让接收端清空该片
+          if (segProgress[i] > 0) {
+            t.bytesDone -= segProgress[i];
+            segProgress[i] = 0;
+            _parSegReset.add('$tid:$i');
+          }
+          pendingSeg = i;
           return;
         }
       }
@@ -3606,9 +3707,25 @@ class RelayClient extends ChangeNotifier {
           : await downloadDir();
       var candidate = '$dir${Platform.pathSeparator}${t.fileName}';
       var i = 1;
+      // 磁盘占用之外还要排除其他进行中传输已选定但未落盘的路径:
+      // sink 懒开 (见分块处理器), 两个同名 offer 并发接受时只看磁盘会
+      // 拿到同一路径, 两个 append sink 交错写同一 .part 必坏。
+      // takenByOther 必须放 || 链最后同步求值: 它与循环退出后的
+      // t.savePath 赋值之间无 await, 单 isolate 下与另一协程不会交错
+      bool takenByOther(String p) => transfers.any(
+        (x) =>
+            !x.outgoing &&
+            x.transferId != t.transferId &&
+            x.savePath == p &&
+            (x.status == TransferStatus.waiting ||
+                x.status == TransferStatus.accepted ||
+                x.status == TransferStatus.transferring ||
+                x.status == TransferStatus.verifying),
+      );
       while (await File(candidate).exists() ||
           await File('$candidate.part').exists() ||
-          await File('$candidate.seg0').exists()) {
+          await File('$candidate.seg0').exists() ||
+          takenByOther(candidate)) {
         final dot = t.fileName.lastIndexOf('.');
         candidate = dot > 0
             ? '$dir${Platform.pathSeparator}${t.fileName.substring(0, dot)}($i)${t.fileName.substring(dot)}'
@@ -3769,7 +3886,9 @@ class RelayClient extends ChangeNotifier {
     Log.i('transfer', 'instant probe ${t.fileName} -> ${t.peerId}');
     notifyListeners();
     // 对端哈希兜底: 超时无回应回退正常接收
-    Timer(const Duration(seconds: 600), () {
+    _instantTimers[t.transferId]?.cancel();
+    _instantTimers[t.transferId] = Timer(const Duration(seconds: 600), () {
+      _instantTimers.remove(t.transferId);
       if (_instantPending.remove(t.transferId) != null &&
           t.status == TransferStatus.accepted &&
           t.bytesDone == 0 &&
@@ -3883,7 +4002,7 @@ class RelayClient extends ChangeNotifier {
       return;
     }
     _canceled.add(t.transferId);
-    _instantPending.remove(t.transferId); // 秒传等待一并终止
+    _clearInstant(t.transferId); // 秒传等待一并终止
     final ws = _sendWaiters.remove(t.transferId);
     if (ws != null) {
       for (final w in ws) {
@@ -3912,7 +4031,7 @@ class RelayClient extends ChangeNotifier {
       return;
     }
     _canceled.add(t.transferId);
-    _instantPending.remove(t.transferId);
+    _clearInstant(t.transferId);
     final ws = _sendWaiters.remove(t.transferId);
     if (ws != null) {
       for (final w in ws) {
@@ -3990,6 +4109,8 @@ class RelayClient extends ChangeNotifier {
       }
     }
     _parMode.remove(tid);
+    _parRecvBytes.remove(tid);
+    _parSegReset.removeWhere((k) => k.startsWith('$tid:'));
     _recvAcked.remove(tid);
     _recvLastTs.remove(tid);
     _recvSeg.remove(tid);
@@ -4086,6 +4207,15 @@ class RelayClient extends ChangeNotifier {
           }
         } catch (_) {}
         ok = hex != null && hex == sha256;
+      } else if (segmented) {
+        // 分片模式但片哈希不全, file_done 也没带总哈希: 无法校验,
+        // 且 .segN 未合并成文件 — 若判完成用户会看到"完成"却没有文件。
+        // 判失败保留好片, 重试续收缺失片即可
+        Log.e(
+          'transfer',
+          'seg hashes missing (${segHashes?.length ?? 0}/$nseg) ${t.fileName}, fail',
+        );
+        ok = false;
       }
     }
     if (ok && t.savePath != null) {
@@ -4275,13 +4405,14 @@ class _PunchSession {
 /// 只是 native memcpy, 比哈希本身便宜一个量级)。
 /// 带背压: 未消化数据超 32MB 时 add 方 await credit() 暂停喂入
 class _HashWorker {
-  _HashWorker._(this._isolate, this._send, this._hex);
+  _HashWorker._(this._isolate, this._send, this._hex, this._port);
 
   static const _creditLimit = 32 * 1024 * 1024;
 
   final Isolate _isolate;
   final SendPort _send;
   final Future<String> _hex;
+  final ReceivePort _port;
   int _fed = 0; // 已喂入字节
   int _hashed = 0; // worker 已消化字节
   Completer<void>? _credit;
@@ -4291,11 +4422,11 @@ class _HashWorker {
     final isolate = await Isolate.spawn(_hashWorkerMain, fromWorker.sendPort);
     final events = fromWorker.asBroadcastStream();
     final send = await events.first as SendPort;
-    final w = _HashWorker._(
-      isolate,
-      send,
-      events.firstWhere((e) => e is String).then((e) => e as String),
-    );
+    final hex = events.firstWhere((e) => e is String).then((e) => e as String);
+    // dispose 时 port 关闭, 若 hex 还没出来 (中止路径) firstWhere 会以
+    // StateError 收尾; 挂个错误处理防无人 await 时抛 unhandled async error
+    unawaited(hex.catchError((_) => ''));
+    final w = _HashWorker._(isolate, send, hex, fromWorker);
     unawaited(
       events.where((e) => e is int).forEach((e) {
         w._hashed = e as int;
@@ -4324,7 +4455,8 @@ class _HashWorker {
     await c.future;
   }
 
-  /// 结束喂入, 等最终 hex; worker 退出后回收 isolate
+  /// 结束喂入, 等最终 hex; worker 退出后回收 isolate 与 ReceivePort
+  /// (原生端口不回收, 并行模式每片泄漏一个)
   Future<String> close() async {
     _send.send('close');
     try {
@@ -4334,7 +4466,10 @@ class _HashWorker {
     }
   }
 
-  void dispose() => _isolate.kill();
+  void dispose() {
+    _port.close();
+    _isolate.kill();
+  }
 }
 
 /// worker isolate 入口 (必须顶层函数): 字节列表喂哈希, 每消化 8MB 上报
@@ -4391,6 +4526,28 @@ Future<Uint8List?> _imageThumbJob(String path) async {
     return null;
   }
 }
+
+/// 后台 isolate 用: 头像读图→解码→裁方 96px→JPEG q85→base64 (compute 入口)
+/// 用 JPEG 不用 PNG: 照片内容 PNG 有 20KB+ (base64 超局域网宣告的
+/// 16KB 上限直接被丢弃, 对端永远看不到头像), JPEG 只有 ~4KB
+Future<String?> _avatarJob(String path) async {
+  try {
+    final decoded = img.decodeImage(await File(path).readAsBytes());
+    if (decoded == null) return null;
+    final resized = img.copyResizeCropSquare(decoded, size: 96);
+    return base64Encode(img.encodeJpg(resized, quality: 85));
+  } catch (_) {
+    return null;
+  }
+}
+
+/// 后台 isolate 用: 流式打包文件夹为 zip (compute 入口; args = [dirPath, zipPath])
+Future<void> _zipFolderJob(List<String> args) =>
+    ZipFileEncoder().zipDirectory(Directory(args[0]), filename: args[1]);
+
+/// 后台 isolate 用: 内存字节 SHA-256 hex (compute 入口;
+/// 剪贴板轮询每 2s 一次, 大截图的纯 Dart 哈希不能占 UI isolate)
+String sha256HexOfBytes(Uint8List bytes) => sha256.convert(bytes).toString();
 
 /// 后台 isolate 用: 把分片按顺序合并成 dest, 边合并边算 SHA-256, 返回 hex。
 /// args[0] = 目标路径, 其余 = 各分片路径 (按序)。
