@@ -17,6 +17,9 @@ class VideoThumbs {
   }
 
   static Future<Uint8List?> _load(String path) async {
+    // 文件已不在 (传输记录里的旧文件被手动清理): 直接回退占位图,
+    // 否则 Android 插件内部抛 FileNotFoundException 刷一屏堆栈日志
+    if (!await File(path).exists()) return null;
     Uint8List? bytes;
     try {
       if (Platform.isAndroid || Platform.isIOS || Platform.isMacOS) {

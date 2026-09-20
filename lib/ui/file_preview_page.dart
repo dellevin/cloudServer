@@ -133,9 +133,14 @@ Future<void> openPath(
   }
 }
 
-/// 解析查看页路由参数: 兼容 String(仅路径) 与 (path, tempPreview)
-(String, bool) parseViewerArgs(Object? args) =>
-    args is (String, bool) ? args : (args as String, false);
+/// 解析查看页路由参数: 兼容 String(仅路径) / (path, tempPreview) /
+/// (path, tempPreview, streamTid)。streamTid 非空 = 远程流式预览,
+/// 查看页退出时要关闭对应的流式会话 (断流删缓存)
+(String, bool, String?) parseViewerArgs(Object? args) => switch (args) {
+  (String p, bool t, String s) => (p, t, s),
+  (String p, bool t) => (p, t, null),
+  _ => (args as String, false, null),
+};
 
 /// 远程浏览预览页的「下载」: 临时预览文件已完整在缓存里,
 /// 复制到下载目录即真正落盘 (重名自动追加 (1)(2)…), 返回保存路径
@@ -310,7 +315,7 @@ class ImageViewPage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final (path, tempPreview) = parseViewerArgs(
+    final (path, tempPreview, _) = parseViewerArgs(
       ModalRoute.of(context)!.settings.arguments,
     );
     final name = path.split(RegExp(r'[\\/]')).last;
@@ -373,7 +378,7 @@ class FilePreviewPage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final (path, tempPreview) = parseViewerArgs(
+    final (path, tempPreview, _) = parseViewerArgs(
       ModalRoute.of(context)!.settings.arguments,
     );
     final name = path.split(RegExp(r'[\\/]')).last;

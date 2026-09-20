@@ -3,7 +3,9 @@
 /// v3: 支持 E2EE 信封消息 (enc; 仅当双方都 v3+ 且设置了接入密码时启用)
 /// v4: 大文件增强 (file_offer/file_accept 带 v2 标志协商): 分片哈希续传
 /// (file_seg_hash)、秒传 (file_instant)、局域网并行车道 (file_parallel)
-const int kProtocolVersion = 4;
+/// v5: 远程视频流式预览 (fs_stream_open/req/skip/close): 播放器按需拉取
+/// 字节区间 (Range), 稀疏缓存 + 本地 HTTP 映射, 任意拖动/moov 后置可播
+const int kProtocolVersion = 5;
 
 class Peer {
   final String id;

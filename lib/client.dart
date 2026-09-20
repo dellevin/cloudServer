@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:isolate';
+import 'dart:math' show min;
 import 'dart:typed_data';
 
 import 'package:app_badge_plus/app_badge_plus.dart';
@@ -25,6 +26,7 @@ import 'l10n.dart';
 import 'lan.dart';
 import 'log.dart';
 import 'models.dart';
+import 'stream_server.dart';
 import 'transfer_service.dart';
 import 'ui/video_thumbs.dart';
 
@@ -936,6 +938,13 @@ class RelayClient extends ChangeNotifier {
         });
         _cleanupTemp(t);
       }
+      // 进行中的流式预览一并断掉: 播放侧报错关缓存, 宿主侧关句柄
+      for (final s in _streamRecv.values.toList()) {
+        if (s.peerId == peerId) _dropStreamRecv(s.tid);
+      }
+      for (final s in _streamSend.values.toList()) {
+        if (s.peerId == peerId) unawaited(_closeStreamSend(s.tid));
+      }
     } else {
       blockedPeers.remove(peerId);
       blockedPeerNames.remove(peerId);
@@ -1830,6 +1839,21 @@ class RelayClient extends ChangeNotifier {
             fileSize: sizeRaw,
             outgoing: false,
           );
+          // 流式预览应答 (fs_stream_open 的回包): 只认登记过的打开请求,
+          // 否则拒绝 — 未登记的 stream offer 是恶意对端诱骗本机开 HTTP 映射
+          if (m['stream'] == true) {
+            final r = _streamOpens.remove('${t.peerId}|${t.fileName}');
+            if (r == null || r.$1.isCompleted) {
+              _send({
+                'type': 'file_reject',
+                'to': m['from'],
+                'transferId': tid,
+              });
+              break;
+            }
+            unawaited(_acceptStream(t, r.$1, r.$2));
+            break;
+          }
           // 剪贴板同步文件: 仅信任设备; 存剪贴板目录、自动接收、
           // 不弹窗不入传输记录 (完成后写 clip_items, 见 _finishIncoming);
           // 非信任设备伪造的 clip 标志直接无视, 回落到普通弹窗流程
@@ -1920,6 +1944,8 @@ class RelayClient extends ChangeNotifier {
           }
           break;
         case 'file_reject':
+          // 流式 offer 被拒 (对端没有对应打开登记): 宿主侧会话清理
+          unawaited(_closeStreamSend(m['transferId'] as String? ?? ''));
           final t = _find(m['transferId']);
           if (t != null) {
             _offerTimers.remove(t.transferId)?.cancel();
@@ -1952,6 +1978,64 @@ class RelayClient extends ChangeNotifier {
             unawaited(sendFile(from, path, preview: m['preview'] == true));
           }
           break;
+        case 'fs_stream_open':
+          // 对端请求流式打开本机文件 (视频边下边播): 仅信任设备可读本机盘
+          final from = m['from'] as String;
+          final path = m['path'];
+          if (!isTrusted(from)) {
+            Log.i('fs', 'fs_stream_open from untrusted $from, rejected');
+            break;
+          }
+          if (path is String && path.isNotEmpty) {
+            Log.i('fs', 'fs_stream_open $path from $from');
+            unawaited(_openStreamSend(from, path));
+          }
+          break;
+        case 'fs_stream_req':
+          // 播放端按需拉取字节区间: 急需 (播放点/seek 目标) 插队首,
+          // 预读排队尾; 同区间去重 (急需可升级已在队列里的预读)
+          final s = _streamSend[m['transferId']];
+          final off = m['offset'] as int?;
+          final len = m['length'] as int?;
+          if (s == null || s.peerId != m['from']) return; // 无会话/冒名
+          if (off == null || len == null || off < 0 || len <= 0) return;
+          if (off >= s.size) return;
+          final entry = (off, min(off + len, s.size) - off);
+          s.queue.removeWhere((e) => e.$1 == entry.$1 && e.$2 == entry.$2);
+          if (m['pri'] == true) {
+            s.queue.insert(0, entry);
+          } else {
+            s.queue.add(entry);
+          }
+          unawaited(_pumpStream(s));
+          return; // 高频控制消息, 不触发 UI 重建
+        case 'fs_stream_skip':
+          // 播放端 seek: 丢弃完全早于 before 的排队请求 (省带宽)
+          final s = _streamSend[m['transferId']];
+          final before = m['before'] as int?;
+          if (s != null && s.peerId == m['from'] && before != null) {
+            if (before > s.skipBefore) s.skipBefore = before;
+            s.queue.removeWhere((e) => e.$1 + e.$2 <= before);
+          }
+          return;
+        case 'fs_stream_close':
+          // 双向: 播放端关闭 -> 宿主侧清理; 宿主侧断流 -> 播放侧报错关缓存
+          final tid = m['transferId'] as String?;
+          if (tid != null && _streamSend.containsKey(tid)) {
+            unawaited(_closeStreamSend(tid));
+            return;
+          }
+          if (tid != null) {
+            _dropStreamRecv(tid);
+            return;
+          }
+          // open 失败的应答 (无 tid): 唤醒等待中的打开登记
+          final name = m['name'] as String?;
+          if (name != null) {
+            final r = _streamOpens.remove('${m['from']}|$name');
+            if (r != null && !r.$1.isCompleted) r.$1.complete(null);
+          }
+          return;
         case 'fs_thumb':
           // 对端请求本机文件缩略图 (远程文件浏览列表的预览图)
           unawaited(_handleFsThumb(m));
@@ -2099,6 +2183,14 @@ class RelayClient extends ChangeNotifier {
       // (每块 64~256KB, 高速传输时 fromList 拷贝是 UI isolate 的纯浪费)
       final bytes = data is Uint8List ? data : Uint8List.fromList(data);
       final tid = utf8.decode(Uint8List.sublistView(bytes, 0, 36));
+      // 流式预览数据帧: 36 tid + 8 大端偏移 + 负载, 帧自带偏移乱序无害
+      final ss = _streamRecv[tid];
+      if (ss != null) {
+        if (bytes.length < 45) return;
+        final off = ByteData.sublistView(bytes, 36, 44).getUint64(0);
+        ss.onFrame(off, Uint8List.sublistView(bytes, 44));
+        return;
+      }
       final t = _find(tid);
       // _recvLastTs 在 accept 时登记: 含 tid 即接收活跃 (sink 懒开, 见下)
       if (t == null || !_recvLastTs.containsKey(tid)) return;
@@ -2291,6 +2383,13 @@ class RelayClient extends ChangeNotifier {
         ChatDb.upsertTransfer(t);
         changed = true;
       }
+    }
+    // 流式预览会话: 对端掉线即断流 (播放侧等待者报错, 宿主侧关句柄)
+    for (final s in _streamRecv.values.toList()) {
+      if (!_transportUp(s.peerId)) _dropStreamRecv(s.tid);
+    }
+    for (final s in _streamSend.values.toList()) {
+      if (!_transportUp(s.peerId)) unawaited(_closeStreamSend(s.tid));
     }
     if (changed) notifyListeners();
   }
@@ -2623,13 +2722,17 @@ class RelayClient extends ChangeNotifier {
     return dir;
   }
 
-  /// 启动时清空上次的预览临时文件 (含没收完的 .part)
+  /// 启动时清空上次的预览临时文件 (含没收完的 .part 与流式稀疏缓存)
   Future<void> _purgePreviewCache() async {
     try {
       final dir = Directory(
         '${(await _cacheDir()).path}${Platform.pathSeparator}preview',
       );
       if (await dir.exists()) await dir.delete(recursive: true);
+      final sdir = Directory(
+        '${(await _cacheDir()).path}${Platform.pathSeparator}streams',
+      );
+      if (await sdir.exists()) await sdir.delete(recursive: true);
     } catch (_) {}
   }
 
@@ -3086,6 +3189,211 @@ class RelayClient extends ChangeNotifier {
     final ts = _fsPulls.remove('$peerId|$name|$size');
     if (ts == null) return false;
     return DateTime.now().millisecondsSinceEpoch - ts < 30000;
+  }
+
+  // ---- 远程视频流式预览 (协议 v5, 见 stream_server.dart) ----
+
+  /// 本地 HTTP 映射服务 (惰性启动, 只绑回环)
+  final StreamHttpServer _streamHttp = StreamHttpServer();
+
+  /// 播放侧会话: tid -> 稀疏缓存+调度
+  final Map<String, StreamSession> _streamRecv = {};
+
+  /// 宿主侧会话: tid -> 读盘发送状态
+  final Map<String, _StreamSendSession> _streamSend = {};
+
+  /// 待应答的流式打开登记: 'peerId|name' -> (等待者, 对端路径) (offer 回包匹配)
+  final Map<String, (Completer<StreamSession?>, String)> _streamOpens = {};
+
+  /// 对端协议版本 (0 = 旧版未上报); 按能力启用新协议特性 (如 v5 流式预览)
+  int peerVer(String id) {
+    for (final p in peers) {
+      if (p.id == id) return p.ver;
+    }
+    return 0;
+  }
+
+  /// 请求对端以流式方式打开远程文件 (仅视频): 对端回 file_offer(stream:true)
+  /// 后会话建立并带播放 URL; 对端不支持/文件已不存在/超时返回 null
+  Future<StreamSession?> fsStreamOpen(String peerId, String path, String name) {
+    if (!isOnline(peerId)) return Future.value(null);
+    final key = '$peerId|$name';
+    final c = Completer<StreamSession?>();
+    // 同名旧登记作废 (浏览页保证一次只开一个, 这里兜底)
+    final old = _streamOpens.remove(key);
+    if (old != null && !old.$1.isCompleted) old.$1.complete(null);
+    _streamOpens[key] = (c, path);
+    _send({'type': 'fs_stream_open', 'to': peerId, 'path': path});
+    Timer(const Duration(seconds: 6), () {
+      if (!c.isCompleted) {
+        _streamOpens.remove(key);
+        c.complete(null);
+      }
+    });
+    return c.future;
+  }
+
+  /// 关闭播放侧会话 (播放器退出时调用): 通知对端停拉, 删除稀疏缓存
+  Future<void> fsStreamClose(String tid) async {
+    final s = _streamRecv.remove(tid);
+    _streamHttp.unmount(tid);
+    if (s == null) return;
+    _send({'type': 'fs_stream_close', 'to': s.peerId, 'transferId': tid});
+    await s.close();
+  }
+
+  /// 播放侧会话查询 (视频播放页「下载」按钮取对端 id/文件名用)
+  StreamSession? streamSession(String tid) => _streamRecv[tid];
+
+  /// 流式预览中点「下载」: 按原路径另起一整文件传输 (免确认拉取存缓存,
+  /// 播放页盯到完成后复制到下载目录)。会话不在/对端离线返回 false
+  bool fsStreamDownload(String tid) {
+    final s = _streamRecv[tid];
+    if (s == null || !isOnline(s.peerId)) return false;
+    fsGetFileAuto(s.peerId, s.path, name: s.name, size: s.size);
+    return true;
+  }
+
+  /// 建立播放侧会话: 稀疏缓存 + 本地 HTTP 映射, 明文 accept 让中继建路由
+  Future<void> _acceptStream(
+    FileTransfer t,
+    Completer<StreamSession?> reg,
+    String path,
+  ) async {
+    try {
+      final dir = Directory(
+        '${(await _cacheDir()).path}${Platform.pathSeparator}streams',
+      );
+      await dir.create(recursive: true);
+      final s = StreamSession(
+        tid: t.transferId,
+        peerId: t.peerId,
+        name: t.fileName,
+        path: path,
+        size: t.fileSize,
+        file: File('${dir.path}${Platform.pathSeparator}${t.transferId}'),
+        token: const Uuid().v4().replaceAll('-', ''),
+        sendReq: (off, len, pri) => _send({
+          'type': 'fs_stream_req',
+          'to': t.peerId,
+          'transferId': t.transferId,
+          'offset': off,
+          'length': len,
+          'pri': pri,
+        }),
+        sendSkip: (before) => _send({
+          'type': 'fs_stream_skip',
+          'to': t.peerId,
+          'transferId': t.transferId,
+          'before': before,
+        }),
+      );
+      _streamRecv[t.transferId] = s;
+      s.url = await _streamHttp.mount(s);
+      // accept 必须明文 (中继靠它建二进制路由, 与文件传输同理);
+      // offset 字段在流式模式无意义, 数据帧自带偏移
+      _sendRaw({
+        'type': 'file_accept',
+        'to': t.peerId,
+        'transferId': t.transferId,
+        'offset': 0,
+        'stream': true,
+      });
+      if (!reg.isCompleted) reg.complete(s);
+    } catch (_) {
+      if (!reg.isCompleted) reg.complete(null);
+    }
+  }
+
+  /// 宿主侧: 应答流式打开 — 文件在则登记会话并发 stream offer,
+  /// 不在则回 close 让对端等待者立刻失败 (不必等 6s 超时)
+  Future<void> _openStreamSend(String peerId, String path) async {
+    final name = path.split(RegExp(r'[\\/]')).where((e) => e.isNotEmpty).last;
+    try {
+      final f = File(path);
+      if (!await f.exists()) throw StateError('gone');
+      final size = await f.length();
+      if (size <= 0) throw StateError('empty');
+      final tid = const Uuid().v4();
+      _streamSend[tid] = _StreamSendSession(tid, peerId, path, size);
+      _send({
+        'type': 'file_offer',
+        'to': peerId,
+        'transferId': tid,
+        'name': name,
+        'size': size,
+        'stream': true,
+      });
+      Log.i('fs', 'stream offer $path ($size B) -> $peerId');
+    } catch (_) {
+      _send({
+        'type': 'fs_stream_close',
+        'to': peerId,
+        'path': path,
+        'name': name,
+      });
+    }
+  }
+
+  /// 宿主侧: 顺序消费某会话的区间请求队列 (一帧一块, 帧自带偏移)
+  Future<void> _pumpStream(_StreamSendSession s) async {
+    if (s.pumping) return;
+    s.pumping = true;
+    final tidBytes = utf8.encode(s.tid);
+    try {
+      while (_streamSend[s.tid] == s && s.queue.isNotEmpty) {
+        var (off, len) = s.queue.removeAt(0);
+        if (off + len <= s.skipBefore) continue; // 已被 seek 抛弃的区间
+        s.raf ??= await File(s.path).open();
+        while (len > 0) {
+          if (_streamSend[s.tid] != s) return;
+          final n = len < kStreamBlock ? len : kStreamBlock;
+          await s.raf!.setPosition(off);
+          final data = await s.raf!.read(n);
+          if (data.isEmpty) throw StateError('eof');
+          final header = ByteData(8)..setUint64(0, off);
+          final b = BytesBuilder(copy: false)
+            ..add(tidBytes)
+            ..add(header.buffer.asUint8List())
+            ..add(data);
+          _sendBinaryTo(s.peerId, b.toBytes());
+          off += data.length;
+          len -= data.length;
+        }
+      }
+    } catch (_) {
+      // 文件被移走/读盘失败: 断流, 播放端等待者报错
+      _send({'type': 'fs_stream_close', 'to': s.peerId, 'transferId': s.tid});
+      unawaited(_closeStreamSend(s.tid));
+    } finally {
+      s.pumping = false;
+    }
+  }
+
+  Future<void> _closeStreamSend(String tid) async {
+    final s = _streamSend.remove(tid);
+    if (s != null) await s.close();
+  }
+
+  /// 发二进制帧到指定对端: 优先局域网直连, 不在则中继
+  /// (流式帧自带偏移, 通道间乱序无害, 无需像文件传输那样锁定通道)
+  void _sendBinaryTo(String peerId, Uint8List frame) {
+    if (_lanActive) {
+      final link = _lan.links[peerId];
+      if (link != null && !link.closed) {
+        link.sendBinary(frame);
+        return;
+      }
+    }
+    _ch?.sink.add(frame);
+  }
+
+  /// 播放侧会话被对端断流 (文件被删/读盘失败): 等待者报错, 关缓存
+  void _dropStreamRecv(String tid, {bool error = true}) {
+    final s = _streamRecv.remove(tid);
+    if (s == null) return;
+    _streamHttp.unmount(tid);
+    unawaited(s.close(error: error));
   }
 
   /// 被浏览方: 列出指定目录 (Android 需「所有文件访问」权限),
@@ -4472,10 +4780,29 @@ class _HashWorker {
   }
 }
 
+/// 宿主侧的流式发送会话: 播放端按需请求的区间排进队列, 顺序读盘发帧
+class _StreamSendSession {
+  final String tid;
+  final String peerId;
+  final String path;
+  final int size;
+  final List<(int, int)> queue = []; // (offset, length) 待发送区间
+  int skipBefore = 0; // seek 抛弃线: 完全早于此的排队请求直接丢
+  bool pumping = false;
+  RandomAccessFile? raf;
+
+  _StreamSendSession(this.tid, this.peerId, this.path, this.size);
+
+  Future<void> close() async {
+    try {
+      await raf?.close();
+    } catch (_) {}
+  }
+}
+
 /// worker isolate 入口 (必须顶层函数): 字节列表喂哈希, 每消化 8MB 上报
 /// 一次进度 (背压用), 收到 'close' 回发最终 hex 后退出
-void _hashWorkerMain(SendPort mainPort) {
-  Digest? digest;
+void _hashWorkerMain(SendPort mainPort) {  Digest? digest;
   final sink = sha256.startChunkedConversion(_DigestSink((d) => digest = d));
   var hashed = 0;
   var reported = 0;

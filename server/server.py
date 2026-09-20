@@ -736,6 +736,8 @@ FORWARD_TYPES = (
     "file_accept_pending", "file_instant", "file_instant_nack",
     "fs_list", "fs_list_result", "fs_get",
     "fs_thumb", "fs_thumb_result",
+    # 流式预览 (v5): 按需拉取字节区间; 数据帧复用 file_accept 建的二进制路由
+    "fs_stream_open", "fs_stream_req", "fs_stream_skip", "fs_stream_close",
     "enc",
 )
 

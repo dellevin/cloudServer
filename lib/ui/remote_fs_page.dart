@@ -62,8 +62,13 @@ class _RemoteFsPageState extends State<RemoteFsPage> {
       isExcelFile(name);
 
   /// 点文件: 图片/视频/压缩包且未超限 → 临时传输直接预览;
+  /// 视频超限时若对端支持 v5 → 流式预览 (边下边播, 任意拖动);
   /// 其他类型/超限 → 微信风格文件页 (大图标, 可下载/分享)
   void _tapFile(RelayClient c, String name, int size) {
+    if (isVideoFile(name) && size > _previewMax && c.peerVer(peerId!) >= 5) {
+      unawaited(_tapStream(c, name, size));
+      return;
+    }
     if (!_previewable(name) || size <= 0 || size > _previewMax) {
       Navigator.pushNamed(
         context,
@@ -90,6 +95,33 @@ class _RemoteFsPageState extends State<RemoteFsPage> {
         AppToast.show(context, tr('fs_timeout'));
       }
     });
+  }
+
+  /// 流式预览 (协议 v5): 对端按需拉取字节区间, 本地 HTTP 映射给播放器,
+  /// 不起整文件传输; 对端不支持/文件已不在则回落到整文件下载页
+  Future<void> _tapStream(RelayClient c, String name, int size) async {
+    if (_previewName != null) return; // 一次只开一个
+    setState(() {
+      _previewName = name;
+      _previewSince = DateTime.now().millisecondsSinceEpoch;
+      _previewHandled = true; // 流式不起整文件传输, 不走 _watchPreview 检测
+    });
+    final sess = await c.fsStreamOpen(peerId!, _child(name), name);
+    if (!mounted) return;
+    setState(() => _previewName = null);
+    if (sess == null) {
+      Navigator.pushNamed(
+        context,
+        '/remote_file',
+        arguments: (peerId!, _child(name), name, size),
+      );
+      return;
+    }
+    Navigator.pushNamed(
+      context,
+      '/video_view',
+      arguments: (sess.url, false, sess.tid),
+    );
   }
 
   /// 找本次拉取对应的传入传输记录 (发起后新建的最新一条)

@@ -47,8 +47,12 @@ class _DocxViewPageState extends State<DocxViewPage> {
     _load();
   }
 
-  (String, bool) get _args =>
-      parseViewerArgs(ModalRoute.of(context)!.settings.arguments);
+  (String, bool) get _args {
+    final (p, t, _) = parseViewerArgs(
+      ModalRoute.of(context)!.settings.arguments,
+    );
+    return (p, t);
+  }
 
   Future<void> _load() async {
     try {
@@ -185,8 +189,12 @@ class _XlsxViewPageState extends State<XlsxViewPage> {
     _load();
   }
 
-  (String, bool) get _args =>
-      parseViewerArgs(ModalRoute.of(context)!.settings.arguments);
+  (String, bool) get _args {
+    final (p, t, _) = parseViewerArgs(
+      ModalRoute.of(context)!.settings.arguments,
+    );
+    return (p, t);
+  }
 
   Future<void> _load() async {
     try {

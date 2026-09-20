@@ -3,8 +3,12 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
+import 'package:provider/provider.dart';
 
+import '../client.dart';
 import '../l10n.dart';
+import '../models.dart';
+import 'app_toast.dart';
 import 'file_preview_page.dart';
 
 /// 视频全屏播放页 (media_kit, 支持 Windows / Android)
@@ -32,6 +36,14 @@ class _VideoPlayerPageState extends State<VideoPlayerPage> {
   Duration? _dragTarget; // 拖动进度条时的目标位置 (松手前不进 player)
   bool _dragging = false;
 
+  String? _streamTid; // 远程流式预览的会话 id (退出时断流删缓存)
+  RelayClient? _client;
+
+  // 流式预览中点「下载」另起的整文件传输状态
+  bool _downloading = false;
+  int _dlSince = 0; // 拉取发起时间 (毫秒), 匹配本次传输用
+  bool _dlHandled = true; // 防多帧 build 重复调度落盘/toast
+
   @override
   void initState() {
     super.initState();
@@ -45,9 +57,11 @@ class _VideoPlayerPageState extends State<VideoPlayerPage> {
     super.didChangeDependencies();
     if (_ready) return;
     _ready = true;
-    final (path, _) = parseViewerArgs(
+    final (path, _, streamTid) = parseViewerArgs(
       ModalRoute.of(context)!.settings.arguments,
     );
+    _streamTid = streamTid;
+    if (streamTid != null) _client = context.read<RelayClient>();
     _player.open(Media(path));
   }
 
@@ -57,6 +71,10 @@ class _VideoPlayerPageState extends State<VideoPlayerPage> {
     // 退出时恢复常速, 防 player 析构时还带着 2x (流回调乱序)
     _player.setRate(1.0);
     _player.dispose();
+    // 流式预览: 先停播放器 (HTTP 读取中断), 再关会话断流删缓存
+    final st = _streamTid;
+    final c = _client;
+    if (st != null && c != null) unawaited(c.fsStreamClose(st));
     super.dispose();
   }
 
@@ -92,12 +110,80 @@ class _VideoPlayerPageState extends State<VideoPlayerPage> {
     return h > 0 ? '$h:$m:$s' : '$m:$s';
   }
 
+  /// 流式预览中的「下载」: 按原路径另起一整文件传输 (免确认拉取存缓存),
+  /// 完成后由 _watchDownload 复制到下载目录真正落盘
+  void _startDownload(RelayClient c) {
+    final st = _streamTid;
+    if (st == null || _downloading) return;
+    if (!c.fsStreamDownload(st)) {
+      AppToast.show(context, tr('fs_offline'));
+      return;
+    }
+    setState(() {
+      _downloading = true;
+      _dlHandled = false;
+      _dlSince = DateTime.now().millisecondsSinceEpoch;
+    });
+  }
+
+  /// 找本次下载对应的传入传输记录 (发起后新建的最新一条)
+  FileTransfer? _dlTransfer(RelayClient c) {
+    final st = _streamTid;
+    if (st == null) return null;
+    final s = c.streamSession(st);
+    if (s == null) return null;
+    for (final t in c.transfers.reversed) {
+      if (!t.outgoing &&
+          t.peerId == s.peerId &&
+          t.fileName == s.name &&
+          t.ts >= _dlSince) {
+        return t;
+      }
+    }
+    return null;
+  }
+
+  /// 盯下载传输状态: 完成落盘, 失败提示; build 中调用 (传输变更触发),
+  /// 状态清理推到帧后, 避免 build 期 setState
+  void _watchDownload(RelayClient c) {
+    if (!_downloading || _dlHandled) return;
+    final t = _dlTransfer(c);
+    if (t == null) return;
+    if (t.status == TransferStatus.done && t.savePath != null) {
+      _dlHandled = true;
+      final src = t.savePath!;
+      WidgetsBinding.instance.addPostFrameCallback((_) async {
+        if (!mounted) return;
+        // 复制到下载目录 = 真正落盘 (自带已保存提示)
+        await downloadTempPreview(context, src);
+        if (!mounted) return;
+        setState(() => _downloading = false);
+      });
+    } else if (t.status == TransferStatus.failed ||
+        t.status == TransferStatus.canceled ||
+        t.status == TransferStatus.rejected) {
+      _dlHandled = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        setState(() => _downloading = false);
+        AppToast.show(context, tr('st_failed'));
+      });
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
-    final (path, tempPreview) = parseViewerArgs(
+    final (path, tempPreview, _) = parseViewerArgs(
       ModalRoute.of(context)!.settings.arguments,
     );
-    final name = path.split(RegExp(r'[\\/]')).last;
+    final c = context.watch<RelayClient>();
+    _watchDownload(c);
+    // 流式 URL 的路径段是 tid/token, 真实文件名放在 query 里
+    var name = path.split(RegExp(r'[\\/]')).last;
+    if (path.startsWith('http')) {
+      final qn = Uri.tryParse(path)?.queryParameters['n'];
+      if (qn != null && qn.isNotEmpty) name = qn;
+    }
     return Scaffold(
       backgroundColor: Colors.black,
       body: GestureDetector(
@@ -209,6 +295,37 @@ class _VideoPlayerPageState extends State<VideoPlayerPage> {
                             onPressed: () =>
                                 downloadTempPreview(context, path),
                           ),
+                        // 流式预览: 「下载」按原路径另起整文件传输, 完成后落盘;
+                        // 传输中图标换成进度环 (订阅轻量 tick, 不整页重建)
+                        if (_streamTid != null)
+                          _downloading
+                              ? Padding(
+                                  padding: const EdgeInsets.all(14),
+                                  child: ValueListenableBuilder<int>(
+                                    valueListenable: c.progressTick,
+                                    builder: (_, _, _) => SizedBox(
+                                      width: 20,
+                                      height: 20,
+                                      child: CircularProgressIndicator(
+                                        value: () {
+                                          final p =
+                                              _dlTransfer(c)?.progress ?? 0.0;
+                                          return p > 0 ? p : null;
+                                        }(),
+                                        strokeWidth: 2,
+                                        color: Colors.white70,
+                                      ),
+                                    ),
+                                  ),
+                                )
+                              : IconButton(
+                                  tooltip: tr('download'),
+                                  icon: const Icon(
+                                    Icons.save_alt,
+                                    color: Colors.white,
+                                  ),
+                                  onPressed: () => _startDownload(c),
+                                ),
                       ],
                     ),
                   ),
