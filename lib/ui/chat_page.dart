@@ -1746,7 +1746,7 @@ class _FileBubble extends StatelessWidget {
       );
     }
 
-    return Container(
+    final bubble = Container(
       color: highlight ? const Color(0x3307C160) : null,
       padding: const EdgeInsets.symmetric(vertical: 5),
       child: Row(
@@ -1786,6 +1786,20 @@ class _FileBubble extends StatelessWidget {
           ],
         ],
       ),
+    );
+    // 被对方拉黑: 气泡下方加一条微信风格系统提示 (居中灰字)
+    if (!fromMe || t.status != TransferStatus.rejected) return bubble;
+    return Column(
+      children: [
+        bubble,
+        Padding(
+          padding: const EdgeInsets.only(top: 2, bottom: 4),
+          child: Text(
+            tr('blocked_notice'),
+            style: const TextStyle(fontSize: 12, color: AppTheme.grey),
+          ),
+        ),
+      ],
     );
   }
 
@@ -1889,7 +1903,7 @@ class _BubbleState extends State<_Bubble> {
       );
     }
     final bubbleColor = m.fromMe ? green : AppTheme.bubbleOf(context);
-    return Container(
+    final bubble = Container(
       color: widget.highlight ? const Color(0x3307C160) : null,
       padding: const EdgeInsets.symmetric(vertical: 5),
       child: Row(
@@ -1971,6 +1985,20 @@ class _BubbleState extends State<_Bubble> {
           ],
         ],
       ),
+    );
+    // 被对方拉黑: 气泡下方加一条微信风格系统提示 (居中灰字)
+    if (!m.fromMe || !m.rejected) return bubble;
+    return Column(
+      children: [
+        bubble,
+        Padding(
+          padding: const EdgeInsets.only(top: 2, bottom: 4),
+          child: Text(
+            tr('blocked_notice'),
+            style: const TextStyle(fontSize: 12, color: AppTheme.grey),
+          ),
+        ),
+      ],
     );
   }
 

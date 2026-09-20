@@ -79,6 +79,7 @@ const Map<String, String> _zh = {
   'msg_unread': '未读',
   'recall_confirm': '撤回这条消息？',
   'recall_too_late': '超过 2 分钟的消息不能撤回',
+  'blocked_notice': '您已被当前用户拉黑，暂时无法发送消息和文件',
   'tray_show': '显示主窗口',
   'tray_quit': '退出',
   'tray_busy': '{n} 个传输进行中',
@@ -475,6 +476,8 @@ const Map<String, String> _en = {
   'msg_unread': 'Unread',
   'recall_confirm': 'Recall this message?',
   'recall_too_late': 'Messages older than 2 minutes cannot be recalled',
+  'blocked_notice':
+      'You have been blocked by this user — messages and files cannot be sent for now',
   'tray_show': 'Show Window',
   'tray_quit': 'Quit',
   'tray_busy': '{n} transfer(s) active',

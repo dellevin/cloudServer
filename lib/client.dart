@@ -1563,13 +1563,11 @@ class RelayClient extends ChangeNotifier {
   }
 
   /// 解密 E2EE 信封并重新走消息分发; 解密失败 (篡改/密钥不一致) 直接丢弃
+  /// 注意: 拉黑设备不能在这里提前丢 — 对方的消息回执 (chat_ack 等) 必须
+  /// 正常处理, 否则我方发出的消息永远停在未送达; 拦截统一在 _handleData
+  /// (chat 回拒收通知, 对方气泡才能显示红色感叹号)
   Future<void> _handleEnc(Map<String, dynamic> m) async {
     final outerFrom = m['from'] as String?;
-    // 外层 from 由中继注入 (诚实中继下可信): 拉黑设备不浪费解密算力
-    if (outerFrom != null && blockedPeers.contains(outerFrom)) {
-      Log.i('app', 'dropped enc from blocked $outerFrom');
-      return;
-    }
     final inner = await E2ee.unwrap(m);
     if (inner == null) {
       Log.w(
