@@ -25,6 +25,7 @@ import 'ui/office_preview_page.dart';
 import 'ui/qr_pair_page.dart';
 import 'ui/remote_file_page.dart';
 import 'ui/remote_fs_page.dart';
+import 'ui/remote_image_page.dart';
 import 'ui/about_page.dart';
 import 'ui/sponsor_page.dart';
 import 'ui/app_dialog.dart';
@@ -643,6 +644,7 @@ class _CloudSendAppState extends State<CloudSendApp> {
           '/xlsx_view': (_) => const XlsxViewPage(),
           '/remote_fs': (_) => const RemoteFsPage(),
           '/remote_file': (_) => const RemoteFilePage(),
+          '/remote_image': (_) => const RemoteImagePage(),
           '/settings_conn': (_) => const ConnSettingsPage(),
           '/settings_general': (_) => const GeneralSettingsPage(),
           '/settings_clip': (_) => const ClipSettingsPage(),

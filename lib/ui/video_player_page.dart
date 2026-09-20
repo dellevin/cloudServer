@@ -11,10 +11,11 @@ import '../models.dart';
 import 'app_toast.dart';
 import 'file_preview_page.dart';
 
-/// 视频全屏播放页 (media_kit, 支持 Windows / Android)
-/// 交互: 单击=显隐控制层 (3s 自动隐藏), 双击=播放/暂停,
-/// 长按=2 倍速 (松手恢复), 拖动进度条实时 seek + 目标时间气泡,
-/// 缓冲中画面中央转圈
+/// 视频全屏播放页 (media_kit, 支持 Windows / Android), Telegram 风格交互:
+/// 单击=显隐控制层 (3s 自动隐藏), 双击左/右 1/3 区=快退/快进 10s
+/// (同向连击秒数累加, 半侧高亮动画), 双击中部=播放/暂停,
+/// 长按=2 倍速 (松手恢复设定倍速), 底栏倍速菜单 (0.5x-2x),
+/// 拖动进度条实时 seek, 缓冲中画面中央转圈
 class VideoPlayerPage extends StatefulWidget {
   const VideoPlayerPage({super.key});
 
@@ -30,8 +31,14 @@ class _VideoPlayerPageState extends State<VideoPlayerPage> {
   bool _controlsVisible = true;
   Timer? _hideTimer;
 
+  double _rate = 1.0; // 设定倍速 (倍速菜单选择; 长按 2x 松手后恢复到这里)
   bool _fastForward = false; // 长按倍速中
   static const _ffRate = 2.0;
+
+  // 双击 ±10s 叠加层: 同向连击累加秒数, 正=快进 (右侧) 负=快退 (左侧)
+  int _seekAcc = 0;
+  bool _seekShow = false;
+  Timer? _seekTimer;
 
   Duration? _dragTarget; // 拖动进度条时的目标位置 (松手前不进 player)
   bool _dragging = false;
@@ -68,7 +75,8 @@ class _VideoPlayerPageState extends State<VideoPlayerPage> {
   @override
   void dispose() {
     _hideTimer?.cancel();
-    // 退出时恢复常速, 防 player 析构时还带着 2x (流回调乱序)
+    _seekTimer?.cancel();
+    // 退出时恢复常速, 防 player 析构时还带着倍速 (流回调乱序)
     _player.setRate(1.0);
     _player.dispose();
     // 流式预览: 先停播放器 (HTTP 读取中断), 再关会话断流删缓存
@@ -100,8 +108,50 @@ class _VideoPlayerPageState extends State<VideoPlayerPage> {
   void _stopFastForward() {
     if (!_fastForward) return;
     setState(() => _fastForward = false);
-    _player.setRate(1.0);
+    _player.setRate(_rate); // 恢复设定倍速 (不一定是 1x)
   }
+
+  /// 双击分区: 左/右 1/3 = 快退/快进 10s, 中部 = 播放/暂停
+  void _onDoubleTap(TapDownDetails d) {
+    final w = context.size?.width ?? 0;
+    if (w <= 0) return;
+    final dx = d.localPosition.dx;
+    if (dx < w * 0.35) {
+      _seekBy(-10);
+    } else if (dx > w * 0.65) {
+      _seekBy(10);
+    } else {
+      _player.playOrPause();
+      _armHideTimer();
+    }
+  }
+
+  /// ±10s seek + Telegram 风格半侧高亮叠加层 (同向连击秒数累加)
+  void _seekBy(int sec) {
+    final dur = _player.state.duration;
+    var t = _player.state.position + Duration(seconds: sec);
+    if (t < Duration.zero) t = Duration.zero;
+    if (dur > Duration.zero && t > dur) t = dur;
+    _player.seek(t);
+    setState(() {
+      if (_seekShow && _seekAcc.sign == sec.sign) {
+        _seekAcc += sec; // 同向连击累加
+      } else {
+        _seekAcc = sec;
+      }
+      _seekShow = true;
+    });
+    _seekTimer?.cancel();
+    _seekTimer = Timer(const Duration(milliseconds: 700), () {
+      if (mounted) setState(() => _seekShow = false);
+    });
+  }
+
+  static const _rates = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
+
+  /// 倍速显示: 整数去小数点 (1x / 1.25x)
+  static String _fmtRate(double r) =>
+      r == r.roundToDouble() ? r.toStringAsFixed(0) : r.toString();
 
   static String _fmtTime(Duration d) {
     final h = d.inHours;
@@ -189,7 +239,7 @@ class _VideoPlayerPageState extends State<VideoPlayerPage> {
       body: GestureDetector(
         behavior: HitTestBehavior.opaque,
         onTap: _toggleControls,
-        onDoubleTap: () => _player.playOrPause(),
+        onDoubleTapDown: _onDoubleTap,
         onLongPressStart: (_) => _startFastForward(),
         onLongPressEnd: (_) => _stopFastForward(),
         onLongPressCancel: _stopFastForward,
@@ -221,6 +271,55 @@ class _VideoPlayerPageState extends State<VideoPlayerPage> {
                       ),
                     )
                   : const SizedBox.shrink(),
+            ),
+            // 双击 ±10s 叠加层 (Telegram 风格: 半侧圆角高亮 + 箭头 + 累计秒数)
+            Positioned(
+              top: 0,
+              bottom: 0,
+              left: _seekAcc < 0 ? 0 : null,
+              right: _seekAcc < 0 ? null : 0,
+              width: MediaQuery.sizeOf(context).width * 0.42,
+              child: IgnorePointer(
+                child: AnimatedOpacity(
+                  opacity: _seekShow ? 1.0 : 0.0,
+                  duration: const Duration(milliseconds: 220),
+                  child: Container(
+                    decoration: BoxDecoration(
+                      color: Colors.white.withValues(alpha: 0.08),
+                      borderRadius: BorderRadius.horizontal(
+                        left: _seekAcc < 0
+                            ? Radius.zero
+                            : const Radius.circular(120),
+                        right: _seekAcc < 0
+                            ? const Radius.circular(120)
+                            : Radius.zero,
+                      ),
+                    ),
+                    alignment: Alignment.center,
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          _seekAcc < 0
+                              ? Icons.fast_rewind_rounded
+                              : Icons.fast_forward_rounded,
+                          color: Colors.white,
+                          size: 38,
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          '${_seekAcc.abs()}s',
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 15,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
             ),
             // 长按倍速提示 (顶部胶囊)
             if (_fastForward)
@@ -426,6 +525,64 @@ class _VideoPlayerPageState extends State<VideoPlayerPage> {
                                             color: Colors.white70,
                                             fontSize: 11.5,
                                             fontFamily: 'monospace',
+                                          ),
+                                        ),
+                                        // 倍速菜单 (Telegram 风格文字按钮)
+                                        const SizedBox(width: 4),
+                                        PopupMenuButton<double>(
+                                          tooltip: tr('playback_speed'),
+                                          color: const Color(0xFF2B2B2B),
+                                          initialValue: _rate,
+                                          onSelected: (v) {
+                                            setState(() => _rate = v);
+                                            _player.setRate(v);
+                                            _armHideTimer();
+                                          },
+                                          itemBuilder: (_) => [
+                                            for (final v in _rates)
+                                              PopupMenuItem<double>(
+                                                value: v,
+                                                height: 36,
+                                                child: Row(
+                                                  children: [
+                                                    SizedBox(
+                                                      width: 16,
+                                                      child: v == _rate
+                                                          ? const Icon(
+                                                              Icons.check,
+                                                              size: 15,
+                                                              color:
+                                                                  Colors.white,
+                                                            )
+                                                          : null,
+                                                    ),
+                                                    const SizedBox(width: 6),
+                                                    Text(
+                                                      '${_fmtRate(v)}x',
+                                                      style: const TextStyle(
+                                                        color: Colors.white,
+                                                        fontSize: 13,
+                                                      ),
+                                                    ),
+                                                  ],
+                                                ),
+                                              ),
+                                          ],
+                                          child: Padding(
+                                            padding: const EdgeInsets.symmetric(
+                                              horizontal: 8,
+                                              vertical: 6,
+                                            ),
+                                            child: Text(
+                                              '${_fmtRate(_rate)}x',
+                                              style: TextStyle(
+                                                color: _rate == 1.0
+                                                    ? Colors.white70
+                                                    : Colors.white,
+                                                fontSize: 13,
+                                                fontWeight: FontWeight.w600,
+                                              ),
+                                            ),
                                           ),
                                         ),
                                       ],

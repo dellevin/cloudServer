@@ -62,11 +62,22 @@ class _RemoteFsPageState extends State<RemoteFsPage> {
       isExcelFile(name);
 
   /// 点文件: 视频且对端支持 v5 → 流式预览 (边下边播, 任意拖动, 无需等整文件下完);
-  /// 图片/压缩包/文本等且未超限 → 临时传输直接预览;
+  /// 图片且对端支持 v5 → Telegram 式预览 (压缩图立即看, 原图页内按需下载);
+  /// 其他可预览类型且未超限 → 临时传输直接预览;
   /// 其他类型/超限 → 微信风格文件页 (大图标, 可下载/分享)
   void _tapFile(RelayClient c, String name, int size) {
     if (isVideoFile(name) && size > 0 && c.peerVer(peerId!) >= 5) {
       unawaited(_tapStream(c, name, size));
+      return;
+    }
+    if (isImageFile(name) && size > 0 && c.peerVer(peerId!) >= 5) {
+      final path = _child(name);
+      // 列表已拉过的 128px 缩略图 Future 一起带去 (模糊打底用, 没有也行)
+      Navigator.pushNamed(
+        context,
+        '/remote_image',
+        arguments: (peerId!, path, name, size, _thumbs[path]),
+      );
       return;
     }
     if (!_previewable(name) || size <= 0 || size > _previewMax) {

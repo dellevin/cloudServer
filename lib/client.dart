@@ -3113,13 +3113,21 @@ class RelayClient extends ChangeNotifier {
   final Map<String, Completer<Uint8List?>> _fsThumbWaiters = {};
 
   /// 请求对端生成文件缩略图 (图片缩到 128px JPEG / 视频抽帧 PNG);
-  /// 对端不在线/超时/失败返回 null (调用方回退占位图标)
-  Future<Uint8List?> fsThumb(String peerId, String path) async {
+  /// maxSide 指定图片最长边 (远程图片预览用, 如 1280 → JPEG q80);
+  /// 对端不在线/超时/失败返回 null (调用方回退占位图标)。
+  /// 旧版对端不认识 max 字段会忽略 → 回 128px 小图 (能看但糊, 优雅降级)
+  Future<Uint8List?> fsThumb(String peerId, String path, {int? maxSide}) async {
     if (!isOnline(peerId)) return null;
     final req = const Uuid().v4();
     final completer = Completer<Uint8List?>();
     _fsThumbWaiters[req] = completer;
-    _send({'type': 'fs_thumb', 'to': peerId, 'req': req, 'path': path});
+    _send({
+      'type': 'fs_thumb',
+      'to': peerId,
+      'req': req,
+      'path': path,
+      'max': ?maxSide,
+    });
     try {
       return await completer.future.timeout(const Duration(seconds: 15));
     } on TimeoutException {
@@ -3140,12 +3148,14 @@ class RelayClient extends ChangeNotifier {
       return;
     }
     Log.i('fs', 'fs_thumb $path from $from');
+    // 预览大图请求: 最长边上限 (clamp 防异常值; 旧版无此字段 → 128)
+    final maxSide = (m['max'] as int?)?.clamp(32, 4096) ?? 128;
     Uint8List? bytes;
     try {
       final dot = path.lastIndexOf('.');
       final ext = dot > 0 ? path.substring(dot + 1).toLowerCase() : '';
       if (_clipImageExts.contains(ext)) {
-        bytes = await _imageThumb(path);
+        bytes = await _imageThumb(path, maxSide);
       } else if (_clipVideoExts.contains(ext)) {
         bytes = await VideoThumbs.get(path);
       }
@@ -3160,10 +3170,11 @@ class RelayClient extends ChangeNotifier {
     });
   }
 
-  /// 图片缩略图: 解码→等比缩到 128px→JPEG q70; 超过 100MB 放弃 (防解码 OOM)。
+  /// 图片缩略图: 解码→等比缩到 maxSide→JPEG; 超过 100MB 放弃 (防解码 OOM)。
   /// 纯 Dart 解码大图要几百毫秒到数秒, 必须放后台 isolate (UI isolate 上
   /// 同步解码是「软件未响应」ANR 的来源之一)
-  Future<Uint8List?> _imageThumb(String path) => compute(_imageThumbJob, path);
+  Future<Uint8List?> _imageThumb(String path, int maxSide) =>
+      compute(_imageThumbJob, (path, maxSide));
 
   /// 我主动从对端拉取并登记自动接收的小文件 (浏览页内直接预览用):
   /// key = 'peerId|name|size', value = 登记毫秒时间戳
@@ -4837,18 +4848,25 @@ Future<String> sha256HexOfFile(String path) async {
   return digest.toString();
 }
 
-/// 后台 isolate 用: 读图→解码→缩到 128px→JPEG q70 (compute 入口, 必须顶层)
-Future<Uint8List?> _imageThumbJob(String path) async {
+/// 后台 isolate 用: 读图→解码→等比缩到最长边 maxSide (已更小则不动)→
+/// JPEG (列表缩略图 q70, 远程图片预览大图 q80) (compute 入口, 必须顶层)
+Future<Uint8List?> _imageThumbJob((String, int) args) async {
+  final (path, maxSide) = args;
   try {
     final f = File(path);
     final len = await f.length();
     if (len <= 0 || len > 100 * 1024 * 1024) return null;
     final im = img.decodeImage(await f.readAsBytes());
     if (im == null) return null;
-    final thumb = im.width >= im.height
-        ? img.copyResize(im, width: 128)
-        : img.copyResize(im, height: 128);
-    return Uint8List.fromList(img.encodeJpg(thumb, quality: 70));
+    var out = im;
+    if (im.width >= im.height && im.width > maxSide) {
+      out = img.copyResize(im, width: maxSide);
+    } else if (im.height > maxSide) {
+      out = img.copyResize(im, height: maxSide);
+    }
+    return Uint8List.fromList(
+      img.encodeJpg(out, quality: maxSide > 256 ? 80 : 70),
+    );
   } catch (_) {
     return null;
   }

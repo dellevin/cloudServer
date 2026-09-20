@@ -363,6 +363,8 @@ const Map<String, String> _zh = {
   'custom': '自定义',
   'fs_preview_limit_hint': '输入上限 (MB)',
   'download': '下载',
+  'playback_speed': '倍速播放',
+  'download_original': '下载原图',
 
   // ---- 压缩包预览页 ----
   'zip_read_fail': '无法读取压缩包 (可能已损坏或不是 zip 格式)',
@@ -762,6 +764,8 @@ const Map<String, String> _en = {
   'custom': 'Custom',
   'fs_preview_limit_hint': 'Enter limit (MB)',
   'download': 'Download',
+  'playback_speed': 'Playback speed',
+  'download_original': 'Download original',
 
   // ---- zip preview page ----
   'zip_read_fail': 'Cannot read the archive',

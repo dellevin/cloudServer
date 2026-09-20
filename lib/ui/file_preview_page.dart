@@ -14,6 +14,7 @@ import '../main.dart';
 import '../models.dart';
 import 'app_dialog.dart';
 import 'app_toast.dart';
+import 'zoomable_image.dart';
 
 /// 文本类扩展名: 应用内预览
 const _textExts = {
@@ -262,9 +263,17 @@ Future<String?> confirmDeleteTransfer(BuildContext context, FileTransfer t) {
   );
 }
 
-/// 图片全屏查看页 (可缩放; 支持保存到相册/另存为与系统分享)
-class ImageViewPage extends StatelessWidget {
+/// 图片全屏查看页 (Telegram 风格: 无 AppBar, 单击显隐顶部控制条,
+/// 双击缩放/双指捏合; 支持保存到相册/另存为与系统分享)
+class ImageViewPage extends StatefulWidget {
   const ImageViewPage({super.key});
+
+  @override
+  State<ImageViewPage> createState() => _ImageViewPageState();
+}
+
+class _ImageViewPageState extends State<ImageViewPage> {
+  bool _bars = true;
 
   /// 保存图片: 移动端写入系统相册, 桌面端弹「另存为」
   static Future<void> _save(BuildContext context, String path) async {
@@ -327,46 +336,91 @@ class ImageViewPage extends StatelessWidget {
             .round();
     return Scaffold(
       backgroundColor: Colors.black,
-      appBar: AppBar(
-        backgroundColor: Colors.black,
-        foregroundColor: Colors.white,
-        title: Text(name, style: const TextStyle(fontSize: 14)),
-        actions: [
-          // 远程浏览的临时预览: 只留「下载」(复制到下载目录) + 分享;
-          // 普通打开: 「保存」(相册/另存为) + 分享
-          if (tempPreview)
-            IconButton(
-              tooltip: tr('download'),
-              icon: const Icon(Icons.save_alt),
-              onPressed: () => downloadTempPreview(context, path),
-            )
-          else
-            IconButton(
-              tooltip: tr('save_image'),
-              icon: const Icon(Icons.download_outlined),
-              onPressed: () => _save(context, path),
+      body: Stack(
+        fit: StackFit.expand,
+        children: [
+          ZoomableImage(
+            onTap: () => setState(() => _bars = !_bars),
+            child: Image.file(
+              File(path),
+              fit: BoxFit.contain,
+              cacheWidth: cacheWidth,
+              errorBuilder: (_, _, _) => const Icon(
+                Icons.broken_image_outlined,
+                color: Colors.white54,
+                size: 48,
+              ),
             ),
-          IconButton(
-            tooltip: tr('share'),
-            icon: const Icon(Icons.share_outlined),
-            onPressed: () => _share(context, path),
           ),
+          // 顶栏: 返回 + 文件名 + 保存/下载 + 分享 (单击画面显隐)
+          if (_bars)
+            Positioned(
+              top: 0,
+              left: 0,
+              right: 0,
+              child: Container(
+                decoration: const BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    colors: [Colors.black87, Colors.transparent],
+                  ),
+                ),
+                child: SafeArea(
+                  bottom: false,
+                  child: Row(
+                    children: [
+                      IconButton(
+                        icon: const Icon(
+                          Icons.arrow_back,
+                          color: Colors.white,
+                        ),
+                        onPressed: () => Navigator.of(context).pop(),
+                      ),
+                      Expanded(
+                        child: Text(
+                          name,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 14,
+                          ),
+                        ),
+                      ),
+                      // 远程浏览的临时预览: 只留「下载」(复制到下载目录) + 分享;
+                      // 普通打开: 「保存」(相册/另存为) + 分享
+                      if (tempPreview)
+                        IconButton(
+                          tooltip: tr('download'),
+                          icon: const Icon(
+                            Icons.save_alt,
+                            color: Colors.white,
+                          ),
+                          onPressed: () => downloadTempPreview(context, path),
+                        )
+                      else
+                        IconButton(
+                          tooltip: tr('save_image'),
+                          icon: const Icon(
+                            Icons.download_outlined,
+                            color: Colors.white,
+                          ),
+                          onPressed: () => _save(context, path),
+                        ),
+                      IconButton(
+                        tooltip: tr('share'),
+                        icon: const Icon(
+                          Icons.share_outlined,
+                          color: Colors.white,
+                        ),
+                        onPressed: () => _share(context, path),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
         ],
-      ),
-      body: Center(
-        child: InteractiveViewer(
-          maxScale: 8,
-          child: Image.file(
-            File(path),
-            fit: BoxFit.contain,
-            cacheWidth: cacheWidth,
-            errorBuilder: (_, _, _) => const Icon(
-              Icons.broken_image_outlined,
-              color: Colors.white54,
-              size: 48,
-            ),
-          ),
-        ),
       ),
     );
   }
