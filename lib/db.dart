@@ -411,7 +411,8 @@ class ChatDb {
     for (final t in list) {
       if (t.status == TransferStatus.waiting ||
           t.status == TransferStatus.accepted ||
-          t.status == TransferStatus.transferring) {
+          t.status == TransferStatus.transferring ||
+          t.status == TransferStatus.verifying) {
         t.status = TransferStatus.failed;
         await d.update(
           'transfers',

@@ -465,8 +465,8 @@ class _ChannelBadge extends StatelessWidget {
   }
 }
 
-/// 长按设备弹出的选项: 信任开关 (信任的设备发来的文件自动接受);
-/// deletable (离线设备) 时带删除入口
+/// 长按设备弹出的选项: 信任/拉黑开关 (圆角灰块行, 与 AppDialog 选项同一风格);
+/// deletable (离线设备) 时底部带浅红删除块
 void _showPeerOptions(
   BuildContext context,
   RelayClient c,
@@ -480,95 +480,142 @@ void _showPeerOptions(
       builder: (ctx, setSheet) {
         final trusted = c.isTrusted(peer.id);
         final blocked = c.isBlocked(peer.id);
-        return Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            SwitchListTile(
-              dense: true,
-              contentPadding: const EdgeInsets.symmetric(horizontal: 16),
-              title: Text(
-                tr('trust_device'),
-                style: const TextStyle(fontSize: 14),
+        return Padding(
+          padding: const EdgeInsets.fromLTRB(16, 0, 16, 14),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _peerOptionBlock(
+                ctx,
+                title: tr('trust_device'),
+                desc: tr('trust_device_desc'),
+                trailing: Switch(
+                  value: trusted,
+                  activeThumbColor: AppTheme.green,
+                  onChanged: (v) {
+                    c.setTrusted(peer.id, v);
+                    setSheet(() {});
+                  },
+                ),
               ),
-              subtitle: Padding(
-                padding: const EdgeInsets.only(top: 2),
-                child: Text(
-                  tr('trust_device_desc'),
-                  style: const TextStyle(
-                    fontSize: 11.5,
-                    color: AppTheme.grey,
-                    height: 1.4,
+              const SizedBox(height: 6),
+              _peerOptionBlock(
+                ctx,
+                title: tr('block_device'),
+                desc: tr('block_device_desc'),
+                trailing: Switch(
+                  value: blocked,
+                  activeThumbColor: AppTheme.red,
+                  onChanged: (v) {
+                    c.setBlocked(peer.id, v);
+                    setSheet(() {});
+                    AppToast.show(
+                      context,
+                      v
+                          ? trf('blocked_toast', {'name': c.peerName(peer.id)})
+                          : tr('unblocked_toast'),
+                    );
+                  },
+                ),
+              ),
+              if (deletable) ...[
+                const SizedBox(height: 6),
+                Material(
+                  color: AppTheme.red.withValues(alpha: 0.08),
+                  borderRadius: BorderRadius.circular(10),
+                  clipBehavior: Clip.antiAlias,
+                  child: InkWell(
+                    onTap: () async {
+                      final ok = await AppDialog.confirm(
+                        ctx,
+                        title: tr('delete_device'),
+                        message: tr('delete_device_confirm'),
+                        danger: true,
+                      );
+                      if (ok && ctx.mounted) {
+                        Navigator.pop(ctx);
+                        await c.removeKnownPeer(peer.id);
+                      }
+                    },
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        vertical: 12,
+                        horizontal: 14,
+                      ),
+                      child: Row(
+                        children: [
+                          Expanded(
+                            child: Text(
+                              tr('delete_device'),
+                              style: const TextStyle(
+                                fontSize: 14.5,
+                                fontWeight: FontWeight.w500,
+                                color: AppTheme.red,
+                              ),
+                            ),
+                          ),
+                          const Icon(
+                            Icons.delete_outline,
+                            size: 18,
+                            color: AppTheme.red,
+                          ),
+                        ],
+                      ),
+                    ),
                   ),
                 ),
-              ),
-              value: trusted,
-              activeThumbColor: AppTheme.green,
-              onChanged: (v) {
-                c.setTrusted(peer.id, v);
-                setSheet(() {});
-              },
-            ),
-            SwitchListTile(
-              dense: true,
-              contentPadding: const EdgeInsets.symmetric(horizontal: 16),
-              title: Text(
-                tr('block_device'),
-                style: const TextStyle(fontSize: 14),
-              ),
-              subtitle: Padding(
-                padding: const EdgeInsets.only(top: 2),
-                child: Text(
-                  tr('block_device_desc'),
-                  style: const TextStyle(
-                    fontSize: 11.5,
-                    color: AppTheme.grey,
-                    height: 1.4,
-                  ),
-                ),
-              ),
-              value: blocked,
-              activeThumbColor: AppTheme.red,
-              onChanged: (v) {
-                c.setBlocked(peer.id, v);
-                setSheet(() {});
-                AppToast.show(
-                  context,
-                  v
-                      ? trf('blocked_toast', {'name': c.peerName(peer.id)})
-                      : tr('unblocked_toast'),
-                );
-              },
-            ),
-            if (deletable)
-              ListTile(
-                dense: true,
-                contentPadding: const EdgeInsets.symmetric(horizontal: 16),
-                leading: const Icon(
-                  Icons.delete_outline,
-                  size: 20,
-                  color: AppTheme.red,
-                ),
-                title: Text(
-                  tr('delete_device'),
-                  style: const TextStyle(fontSize: 14, color: AppTheme.red),
-                ),
-                onTap: () async {
-                  final ok = await AppDialog.confirm(
-                    ctx,
-                    title: tr('delete_device'),
-                    message: tr('delete_device_confirm'),
-                    danger: true,
-                  );
-                  if (ok && ctx.mounted) {
-                    Navigator.pop(ctx);
-                    await c.removeKnownPeer(peer.id);
-                  }
-                },
-              ),
-            const SizedBox(height: 8),
-          ],
+              ],
+            ],
+          ),
         );
       },
+    ),
+  );
+}
+
+/// 设备选项弹窗里的圆角灰块行: 左侧标题+说明, 右侧挂件 (开关)
+Widget _peerOptionBlock(
+  BuildContext ctx, {
+  required String title,
+  required String desc,
+  required Widget trailing,
+}) {
+  return Material(
+    color: AppTheme.softOf(ctx),
+    borderRadius: BorderRadius.circular(10),
+    clipBehavior: Clip.antiAlias,
+    child: Padding(
+      padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 14),
+      child: Row(
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: TextStyle(
+                    fontSize: 14.5,
+                    fontWeight: FontWeight.w500,
+                    color: AppTheme.inkOf(ctx),
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  desc,
+                  style: const TextStyle(
+                    fontSize: 11.5,
+                    color: AppTheme.grey,
+                    height: 1.4,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 10),
+          trailing,
+        ],
+      ),
     ),
   );
 }

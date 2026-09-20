@@ -100,7 +100,8 @@ class _TrayController with WindowListener, TrayListener {
         .where(
           (t) =>
               t.status == TransferStatus.accepted ||
-              t.status == TransferStatus.transferring,
+              t.status == TransferStatus.transferring ||
+              t.status == TransferStatus.verifying,
         )
         .length;
     trayManager.setToolTip(

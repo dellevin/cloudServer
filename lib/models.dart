@@ -1,7 +1,9 @@
 /// 协议版本号: register / 局域网宣告 / hello 均携带, 便于将来协议升级时识别对端
 /// v2: register 支持接入密码 key; 支持 P2P 打洞信令 (p2p_*)
 /// v3: 支持 E2EE 信封消息 (enc; 仅当双方都 v3+ 且设置了接入密码时启用)
-const int kProtocolVersion = 3;
+/// v4: 大文件增强 (file_offer/file_accept 带 v2 标志协商): 分片哈希续传
+/// (file_seg_hash)、秒传 (file_instant)、局域网并行车道 (file_parallel)
+const int kProtocolVersion = 4;
 
 class Peer {
   final String id;
@@ -35,6 +37,10 @@ enum TransferStatus {
   waiting,
   accepted,
   transferring,
+
+  /// 收齐后合并+校验中 (大文件可达数分钟): 无分块到达但绝非停滞,
+  /// 停滞看门狗/断线清理都不得动它 (状态按 name 持久化, 新增安全)
+  verifying,
   done,
   rejected,
   failed,

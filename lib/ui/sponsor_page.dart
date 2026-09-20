@@ -96,13 +96,6 @@ class SponsorPage extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 24),
-          Center(
-            child: Text(
-              tr('sponsor_note'),
-              style: const TextStyle(fontSize: 11.5, color: AppTheme.grey),
-            ),
-          ),
-          const SizedBox(height: 24),
         ],
       ),
     );

@@ -49,6 +49,7 @@ class LanLink {
   bool manual = false; // 由「手动添加」发起
   String? manualTarget;
   bool isP2p = false; // 经中继信令打洞建立的跨网段直连
+  bool isLane = false; // 大文件并行传输的车道连接 (不进 links, 不参与单链接收敛)
   Completer<String>? greeted; // 握手完成时补上 peerId (手动连接流程用)
 
   void Function(dynamic frame)? onFrame; // String (JSON) 或 Uint8List (二进制)
@@ -149,6 +150,12 @@ class LanManager {
 
   /// 某对端的直连断开时回调
   void Function(String peerId)? onLinkClosed;
+
+  /// 车道连接的非 hello 帧回调 (大文件并行传输的数据通道)
+  void Function(LanLink link, dynamic frame)? onLaneFrame;
+
+  /// 车道连接断开时回调
+  void Function(LanLink link)? onLaneClosed;
 
   /// 拉黑拦截 (由 RelayClient 注入): 返回 true 时
   /// 拒绝该 IP 的 TCP 接入与 UDP 宣告
@@ -415,11 +422,20 @@ class LanManager {
         link.close(); // 未握手先说话, 协议违规
         return;
       }
+      // 车道帧原样上交 (控制消息只走主链路, 车道上正常只有二进制块)
+      if (link.isLane) {
+        onLaneFrame?.call(link, jsonEncode(m));
+        return;
+      }
       // 直连没有服务器注入 from, 用连接对端身份补上 (强制覆盖, 防伪造)
       m['from'] = link.peerId;
       onFrame?.call(jsonEncode(m));
     } else {
       if (link.peerId == null) return;
+      if (link.isLane) {
+        onLaneFrame?.call(link, frame);
+        return;
+      }
       onFrame?.call(frame);
     }
   }
@@ -437,6 +453,14 @@ class LanManager {
         link.close();
         return;
       }
+    }
+    // 车道连接: 对方 hello 声明 lane, 或我方 dialLane 拨出时已标记;
+    // 只补 peerId 完成握手, 不更新 peers、不进 links、不参与单链接收敛
+    if (m['lane'] == true) link.isLane = true;
+    if (link.isLane) {
+      link.peerId = id;
+      if (link.greeted?.isCompleted == false) link.greeted!.complete(id);
+      return;
     }
     // 拉黑的设备不断开链路: 其消息在 RelayClient._onData 按类型拦截并回拒收,
     // 链路保留拒收回执 (chat_reject/file_reject) 才能送达对方
@@ -488,6 +512,10 @@ class LanManager {
   }
 
   void _onLinkClosed(LanLink link) {
+    if (link.isLane) {
+      onLaneClosed?.call(link); // 车道不进 links, 单独通知
+      return;
+    }
     final pid = link.peerId;
     if (pid != null && identical(links[pid], link)) {
       links.remove(pid);
@@ -531,6 +559,42 @@ class LanManager {
         return id.isEmpty ? null : id; // 空串 = 被对方/黑名单拒绝
       } on TimeoutException {
         link.close(); // 对方不是 cloudSend
+        return null;
+      }
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// 为并行传输拨一条车道连接: 复用发现的地址直连, hello 带 lane 标记,
+  /// 不进 links 不参与收敛; 对端不是 v2 / 失败返回 null (调用方退化为单链接)
+  Future<LanLink?> dialLane(String peerId) async {
+    final info = peers[peerId];
+    if (info == null || info.tcpPort == 0) return null;
+    if (shouldBlockIp?.call(info.addr.address) == true) return null;
+    try {
+      final socket = await Socket.connect(
+        info.addr,
+        info.tcpPort,
+        timeout: const Duration(seconds: 3),
+      );
+      final link = LanLink(socket, inbound: false)
+        ..isLane = true
+        ..remotePort = info.tcpPort
+        ..greeted = Completer<String>();
+      _wireLink(link);
+      _sendHello(link, extra: {'lane': true});
+      try {
+        final id = await link.greeted!.future.timeout(
+          const Duration(seconds: 4),
+        );
+        if (id != peerId) {
+          link.close(); // 握出的不是目标对端, 不可用于该传输
+          return null;
+        }
+        return link;
+      } on TimeoutException {
+        link.close();
         return null;
       }
     } catch (_) {

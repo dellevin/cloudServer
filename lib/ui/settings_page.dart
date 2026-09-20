@@ -662,7 +662,8 @@ class _ServerStatusTile extends StatelessWidget {
                   hint: tr('server_addr_hint'),
                   initial: c.serverAddr,
                   onSubmit: (v) {
-                    if (v.isNotEmpty) c.connect(v);
+                    // 只保存, 不自动连: 保存后再点一次「连接」
+                    if (v.isNotEmpty) c.setServerAddr(v);
                   },
                 );
               } else {
@@ -913,14 +914,14 @@ class ConnSettingsPage extends StatelessWidget {
                 _Tile(
                   title: tr('server'),
                   value: c.serverAddr.isEmpty ? tr('not_set') : c.serverAddr,
-                  // 连接中也可编辑, 保存后自动断开旧连接并重连新地址
+                  // 只保存地址不自动连接: 还要填密码, 点「连接」按钮才连
                   onTap: () => SettingsPage._editField(
                     context,
                     title: tr('server_addr_title'),
                     hint: tr('server_addr_hint'),
                     initial: c.serverAddr,
                     onSubmit: (v) {
-                      if (v.isNotEmpty) c.connect(v);
+                      if (v.isNotEmpty) c.setServerAddr(v);
                     },
                   ),
                 ),

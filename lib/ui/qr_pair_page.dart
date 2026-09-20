@@ -10,9 +10,10 @@ import '../l10n.dart';
 import '../main.dart';
 import 'app_toast.dart';
 
-/// 二维码配对: 展示本机二维码 (服务器地址 / 局域网直连), 或扫对方二维码填入。
+/// 二维码配对: 展示本机二维码 (服务器地址 / 局域网直连, 分页切换),
+/// 或扫对方二维码填入。
 /// 载荷格式:
-/// - `cloudsend://server/<addr>`   中继服务器地址 (ws://ip:port 或 ip:port)
+/// - `cloudsend://server/<addr>[?key=<url编码的接入密码>]`   中继服务器
 /// - `cloudsend://lan/<ip:port>`   局域网手动设备
 class QrPairPage extends StatefulWidget {
   const QrPairPage({super.key});
@@ -41,7 +42,15 @@ class QrPairPage extends StatefulWidget {
     final value = rest.substring(slash + 1);
     switch (kind) {
       case 'server':
-        c.connect(value);
+        // 载荷可带接入密码 (?key=): 先存密码再连接, 注册时才会带上
+        var addr = value;
+        final q = value.indexOf('?key=');
+        if (q > 0) {
+          addr = value.substring(0, q);
+          final key = Uri.decodeComponent(value.substring(q + 5));
+          if (key.isNotEmpty) await c.setServerKey(key);
+        }
+        c.connect(addr);
         return true;
       case 'lan':
         return await c.addManualLanPeer(value) != null;
@@ -56,6 +65,7 @@ class QrPairPage extends StatefulWidget {
 
 class _QrPairPageState extends State<QrPairPage> {
   String? _lanIp;
+  int _seg = 0; // 当前展示的二维码页签 (中继 / 局域网分开看)
 
   @override
   void initState() {
@@ -69,12 +79,21 @@ class _QrPairPageState extends State<QrPairPage> {
   Widget build(BuildContext context) {
     final c = context.watch<RelayClient>();
     final isMobile = Platform.isAndroid || Platform.isIOS;
-    final items = <({String title, String payload, String caption})>[];
+    final items =
+        <({String title, String payload, String caption, String? note})>[];
     if (c.connMode != 'lan' && c.serverAddr.isNotEmpty) {
+      // 服务器设了接入密码: 一并编进二维码, 对方扫完即可连, 不用再手输
+      var payload = 'cloudsend://server/${c.serverAddr}';
+      String? note;
+      if (c.serverKey.isNotEmpty) {
+        payload += '?key=${Uri.encodeComponent(c.serverKey)}';
+        note = tr('qr_includes_key');
+      }
       items.add((
         title: tr('qr_server'),
-        payload: 'cloudsend://server/${c.serverAddr}',
+        payload: payload,
         caption: c.serverAddr,
+        note: note,
       ));
     }
     if (c.connMode != 'relay' && _lanIp != null && c.lanTcpPort != 0) {
@@ -83,8 +102,10 @@ class _QrPairPageState extends State<QrPairPage> {
         title: tr('qr_lan'),
         payload: 'cloudsend://lan/$target',
         caption: target,
+        note: null,
       ));
     }
+    if (_seg >= items.length) _seg = 0;
     return Scaffold(
       backgroundColor: AppTheme.softOf(context),
       appBar: AppBar(
@@ -94,67 +115,140 @@ class _QrPairPageState extends State<QrPairPage> {
           child: Divider(height: 1),
         ),
       ),
-      body: ListView(
-        padding: const EdgeInsets.all(16),
-        children: [
-          if (items.isEmpty)
-            Padding(
-              padding: const EdgeInsets.only(top: 60),
-              child: Center(
-                child: Text(
-                  tr('qr_nothing'),
-                  style: const TextStyle(color: AppTheme.grey, fontSize: 13),
-                ),
+      body: items.isEmpty
+          ? Center(
+              child: Text(
+                tr('qr_nothing'),
+                style: const TextStyle(color: AppTheme.grey, fontSize: 13),
               ),
             )
-          else
-            for (final item in items) ...[
-              Container(
-                padding: const EdgeInsets.all(16),
-                decoration: BoxDecoration(
-                  color: AppTheme.cardOf(context),
-                  borderRadius: BorderRadius.circular(12),
+          : Column(
+              children: [
+                // 两个连接方式分页切换, 一次只展示一个二维码
+                if (items.length > 1)
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 14, 16, 0),
+                    child: Row(
+                      children: [
+                        for (var i = 0; i < items.length; i++) ...[
+                          if (i > 0) const SizedBox(width: 8),
+                          Expanded(
+                            child: _segTab(
+                              label: items[i].title,
+                              selected: _seg == i,
+                              onTap: () => setState(() => _seg = i),
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                Expanded(
+                  child: ListView(
+                    padding: const EdgeInsets.all(16),
+                    children: [
+                      _qrCard(context, items[_seg], showTitle: items.length <= 1),
+                      if (isMobile) ...[
+                        const SizedBox(height: 12),
+                        FilledButton.icon(
+                          onPressed: () => QrPairPage.scan(context),
+                          icon: const Icon(Icons.qr_code_scanner, size: 18),
+                          label: Text(tr('qr_scan')),
+                        ),
+                      ],
+                    ],
+                  ),
                 ),
-                child: Column(
-                  children: [
-                    Text(
-                      item.title,
-                      style: TextStyle(
-                        fontSize: 14,
-                        fontWeight: FontWeight.w600,
-                        color: AppTheme.inkOf(context),
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                    Container(
-                      color: Colors.white,
-                      padding: const EdgeInsets.all(10),
-                      child: QrImageView(
-                        data: item.payload,
-                        size: 200,
-                        backgroundColor: Colors.white,
-                      ),
-                    ),
-                    const SizedBox(height: 10),
-                    Text(
-                      item.caption,
-                      style: const TextStyle(
-                        fontSize: 12,
-                        color: AppTheme.grey,
-                        fontFamily: 'monospace',
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 12),
-            ],
-          if (isMobile)
-            FilledButton.icon(
-              onPressed: () => QrPairPage.scan(context),
-              icon: const Icon(Icons.qr_code_scanner, size: 18),
-              label: Text(tr('qr_scan')),
+              ],
             ),
+    );
+  }
+
+  /// 页签胶囊: 选中绿底白字, 未选卡片底色 (与 AppDialog 胶囊按钮同风格)
+  Widget _segTab({
+    required String label,
+    required bool selected,
+    required VoidCallback onTap,
+  }) {
+    return Material(
+      color: selected ? AppTheme.green : AppTheme.cardOf(context),
+      borderRadius: BorderRadius.circular(18),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: onTap,
+        child: Container(
+          height: 36,
+          alignment: Alignment.center,
+          child: Text(
+            label,
+            style: TextStyle(
+              fontSize: 13.5,
+              fontWeight: FontWeight.w600,
+              color: selected ? Colors.white : AppTheme.inkOf(context),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _qrCard(
+    BuildContext context,
+    ({String title, String payload, String caption, String? note}) item, {
+    required bool showTitle,
+  }) {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: AppTheme.cardOf(context),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Column(
+        children: [
+          if (showTitle) ...[
+            // 只有一种连接方式时没有页签, 标题放卡片里
+            Text(
+              item.title,
+              style: TextStyle(
+                fontSize: 14,
+                fontWeight: FontWeight.w600,
+                color: AppTheme.inkOf(context),
+              ),
+            ),
+            const SizedBox(height: 12),
+          ],
+          Container(
+            color: Colors.white,
+            padding: const EdgeInsets.all(10),
+            child: QrImageView(
+              data: item.payload,
+              size: 200,
+              backgroundColor: Colors.white,
+            ),
+          ),
+          const SizedBox(height: 10),
+          Text(
+            item.caption,
+            style: const TextStyle(
+              fontSize: 12,
+              color: AppTheme.grey,
+              fontFamily: 'monospace',
+            ),
+          ),
+          if (item.note != null) ...[
+            const SizedBox(height: 4),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                const Icon(Icons.key, size: 12, color: AppTheme.grey),
+                const SizedBox(width: 3),
+                Text(
+                  item.note!,
+                  style: const TextStyle(fontSize: 11, color: AppTheme.grey),
+                ),
+              ],
+            ),
+          ],
         ],
       ),
     );

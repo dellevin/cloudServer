@@ -1251,13 +1251,17 @@ class _ChatPageState extends State<ChatPage> {
     RelayClient c,
     FileTransfer t,
     Rect anchor,
-  ) {
-    // waiting 状态可取消删除; 只有真正在传输中才禁止
+  ) async {
+    // waiting 状态可取消删除; 传输中/校验中都禁止 (校验时删记录会毁掉合并)
     final busy =
         t.status == TransferStatus.accepted ||
-        t.status == TransferStatus.transferring;
-    // 文件已落到本地 (收到的已完成 / 发出的源文件) 才能打开所在位置
-    final revealable = t.savePath != null && File(t.savePath!).existsSync();
+        t.status == TransferStatus.transferring ||
+        t.status == TransferStatus.verifying;
+    // 文件已落到本地 (收到的已完成 / 发出的源文件) 才能打开所在位置;
+    // 异步 stat: IO 高峰时同步 stat 会卡 UI 线程出 ANR
+    final revealable =
+        t.savePath != null && await File(t.savePath!).exists();
+    if (!context.mounted) return;
     _showBubbleMenu(anchor, [
       if (revealable)
         (
@@ -1513,14 +1517,21 @@ class _FileBubble extends StatelessWidget {
     this.highlight = false,
   });
 
-  /// existsSync 结果缓存: key = path|status, 状态翻转时自动重查,
-  /// 避免每条进度通知都对每个文件气泡同步 stat 磁盘
+  /// exists 结果缓存: key = path|status, 状态翻转时自动重查。
+  /// 不同步 stat (IO 高峰同步 stat 会卡 UI 线程出 ANR); 未命中先按
+  /// false 渲染, 异步查好入缓存, 下一次自然重建 (进度 tick/状态变化) 生效
   static final Map<String, bool> _existsCache = {};
 
   static bool _fileExists(String path, TransferStatus st) {
     if (_existsCache.length > 500) _existsCache.clear(); // 兜底上限 (静态存活期长)
     final key = '$path|${st.name}';
-    return _existsCache.putIfAbsent(key, () => File(path).existsSync());
+    final hit = _existsCache[key];
+    if (hit != null) return hit;
+    _existsCache[key] = false;
+    File(path).exists().then((v) {
+      if (_existsCache[key] == false && v) _existsCache[key] = v;
+    });
+    return false;
   }
 
   @override
@@ -1639,7 +1650,8 @@ class _FileBubble extends StatelessWidget {
               ],
             ),
             if (t.status == TransferStatus.transferring ||
-                t.status == TransferStatus.accepted) ...[
+                t.status == TransferStatus.accepted ||
+                t.status == TransferStatus.verifying) ...[
               const SizedBox(height: 10),
               // 订阅轻量进度 tick: 5Hz 刷新只重建进度条, 不重建整个聊天列表
               ValueListenableBuilder<int>(
@@ -1753,6 +1765,7 @@ class _FileBubble extends StatelessWidget {
     TransferStatus.waiting => tr('st_waiting_confirm'),
     TransferStatus.accepted => tr('st_accepted'),
     TransferStatus.transferring => tr('st_transferring'),
+    TransferStatus.verifying => tr('st_verifying'),
     TransferStatus.done => tr('st_done'),
     TransferStatus.rejected => tr('st_rejected'),
     TransferStatus.failed => tr('st_failed'),

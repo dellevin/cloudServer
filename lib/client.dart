@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:app_badge_plus/app_badge_plus.dart';
@@ -36,10 +37,21 @@ import 'ui/video_thumbs.dart';
 /// 二进制帧: 36字节 transferId(ASCII) + 文件数据块, 服务器按 transferId 路由
 ///
 /// 传输可靠性:
-///  - 接收端写入 `<savePath>.part` 临时文件, 校验通过后改名
+///  - 接收端写入 `<savePath>.part` 临时文件, 校验通过后改名;
+///    超过 500MB 的大文件按 500MB 一片写 `<savePath>.segN`, 收齐后合并校验
 ///  - file_accept 带 offset: 已收字节数, 发送端从该偏移续传
 ///  - file_progress: 接收端每收 2MB 回执一次, 发送端 8MB 窗口背压
 ///  - file_done 带 sha256, 接收端校验后回 file_result {ok}
+///
+/// v2 大文件增强 (file_offer/file_accept 各带 v2 标志双向协商, 旧版忽略):
+///  - 分片哈希: 发送端每发完一片发 file_seg_hash, 接收端记 .seghash 边车;
+///    续传前逐片校验已收片 (坏片及后续删除, 只重收坏的部分),
+///    收完逐片校验 + 纯拷贝合并, 不再重算总哈希 (file_done 不带 sha256)
+///  - 秒传: 接收端发现本地有同名同大小文件 → file_instant 带哈希,
+///    发送端比对一致则 file_done {instant:true} 免传, 否则 file_instant_nack 回退
+///  - 并行车道: LAN 直连 + 全新大文件, 发送端 dialLane 另起一条 TCP 车道,
+///    主链路+车道按片领取并发 (40 字节头: 36 tid + 4 片号);
+///    file_accept_pending 用于上述耗时准备期间给 offer 等待续期
 ///
 /// 局域网直连 (见 lan.dart):
 ///  - UDP 广播自动发现同网段设备, peers 为中继+局域网合并列表
@@ -156,7 +168,9 @@ class RelayClient extends ChangeNotifier {
             .where(
               (t) =>
                   t.status == TransferStatus.accepted ||
-                  t.status == TransferStatus.transferring,
+                  t.status == TransferStatus.transferring ||
+                  // 校验中也保持前台服务: 大文件合并数分钟, 进程被杀则前功尽弃
+                  t.status == TransferStatus.verifying,
             )
             .toList(),
       );
@@ -204,14 +218,31 @@ class RelayClient extends ChangeNotifier {
   final Map<String, IOSink> _incoming = {};
   final Set<String> _accepting = {}; // acceptFile 防重入 (见下方注释)
   final Map<String, int> _recvAcked = {}; // 接收侧上次回执的字节数
+  // 大文件分片接收: 超过 _segThreshold 的文件按 _segSize 一片写 .segN,
+  // 收齐后合并成 .part 再校验改名; 中断只丢当前半片, 完整片可直接续传
+  static const int _segThreshold = 500 * 1024 * 1024;
+  static const int _segSize = 500 * 1024 * 1024;
+  // 秒传: 小于该大小不值得哈希一遍直接传; v2 对端 + 本地有同名同大小文件时启用
+  static const int _instantThreshold = 64 * 1024 * 1024;
+  final Map<String, int> _recvSeg = {}; // 当前片序号 (含 tid 即为分片模式)
+  final Set<String> _finishing = {}; // 合并+校验进行中 (防 file_done 重入)
   // 接收侧写盘串行链: add/flush/回执全部排队执行 (见分块处理器处注释)
   final Map<String, Future<void>> _recvChain = {};
   final Map<String, int> _recvLastTs = {}; // 接收侧最后收到分块的毫秒时间戳
   final Map<String, int> _sendAcked = {}; // 发送侧: 对方已确认收到的字节数
-  final Map<String, Completer<void>> _sendWaiters = {}; // 背压等待
+  // 背压等待 (列表: 并行车道时多个 worker 同时等窗口回执)
+  final Map<String, List<Completer<void>>> _sendWaiters = {};
   final Set<String> _canceled = {}; // 已取消的 transferId (发送循环据此退出)
   final Set<String> _aborted = {}; // 对端掉线中止的 transferId
   final Set<String> _unverified = {}; // 已发完但尚未收到接收端校验结果的 transferId
+  // ---- v2 传输协商 (对端同样支持时启用, 旧版对端自动回落) ----
+  final Set<String> _offerV2 = {}; // 接收侧: 带 v2 标志的 file_offer
+  final Map<String, bool> _acceptPar = {}; // 发送侧: file_accept 声明可并行
+  final Set<String> _parMode = {}; // 接收侧: 该传输走 40 字节头 (36 tid + 4 片号)
+  final Map<String, Map<int, IOSink>> _parSinks = {}; // 并行接收: 片号 -> sink
+  final Map<String, Map<int, String>> _segHashes = {}; // 分片 SHA-256 (.seghash 边车)
+  final Map<String, String> _instantPending = {}; // 秒传等待中: tid -> 候选文件路径
+  final Map<String, Timer> _offerTimers = {}; // 外发 offer 的等待超时 (可续期)
   int _lastNotifyBytes = 0;
   int _lastNotifyTs = 0; // 上次进度通知时间 (高速传输时按 200ms 节流)
 
@@ -436,6 +467,7 @@ class RelayClient extends ChangeNotifier {
       _resendUndelivered();
     };
     _lan.onFrame = _onData; // 直连通道的消息与中继走同一处理
+    _lan.onLaneFrame = _onLaneFrame; // 并行车道: 只有 40 字节头的二进制块
     _lan.onLinkClosed = (_) {
       _abortTransfersWithOfflinePeers();
       // 直连断开时可能有消息写进了死连接, 立即重发未送达消息 (走中继/新直连)
@@ -455,6 +487,7 @@ class RelayClient extends ChangeNotifier {
     final lan = _lan;
     lan.onPeersChanged = null;
     lan.onFrame = null;
+    lan.onLaneFrame = null;
     lan.onLinkClosed = null;
     await lan.dispose();
     lan.peers.clear();
@@ -533,7 +566,7 @@ class RelayClient extends ChangeNotifier {
         hasMoreHistory[pid] = h.length >= historyPageSize;
       }
       transfers.addAll(await ChatDb.loadTransfers());
-      // 恢复失败接收传输的已收字节: .part 文件还在就可以断点续传
+      // 恢复失败接收传输的已收字节: .part/分片还在就可以断点续传
       for (final t in transfers) {
         if (!t.outgoing &&
             t.status == TransferStatus.failed &&
@@ -543,6 +576,15 @@ class RelayClient extends ChangeNotifier {
             if (await part.exists()) {
               final len = await part.length();
               if (len > 0 && len <= t.fileSize) t.bytesDone = len;
+            } else {
+              // 分片模式: 累计各片长度
+              var sum = 0;
+              for (var i = 0; ; i++) {
+                final f = File('${t.savePath}.seg$i');
+                if (!await f.exists()) break;
+                sum += await f.length();
+              }
+              if (sum > 0 && sum <= t.fileSize) t.bytesDone = sum;
             }
           } catch (_) {}
         }
@@ -752,17 +794,30 @@ class RelayClient extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// 设置服务器接入密码 (持久化; 已连接时立即重连生效)
+  /// 保存服务器地址但不连接: 地址和密码要分开填,
+  /// 只有点「连接」按钮才发起连接 (connect 内部也会再存一次, 幂等)
+  Future<void> setServerAddr(String addr) async {
+    final a = addr.trim();
+    if (a == serverAddr) return;
+    serverAddr = a;
+    (await SharedPreferences.getInstance()).setString('serverAddr', serverAddr);
+    Log.i('app', 'serverAddr -> $serverAddr');
+    // 地址变了旧连接已不适用: 断开但不自动连新地址, 等用户点连接
+    if (connected) disconnect();
+    notifyListeners();
+  }
+
+  /// 设置服务器接入密码 (持久化; 不自动重连, 由用户点「连接」生效)
   Future<void> setServerKey(String key) async {
-    serverKey = key.trim();
+    final k = key.trim();
+    if (k == serverKey) return;
+    serverKey = k;
     (await SharedPreferences.getInstance()).setString('serverKey', serverKey);
     unawaited(E2ee.setPassword(serverKey)); // E2EE 密钥随接入密码更新
     Log.i('app', 'serverKey updated (len=${serverKey.length})');
+    // 密码变了旧会话用的是旧密码: 断开但不自动重连, 等用户点连接
+    if (connected) disconnect();
     notifyListeners();
-    if (connected) {
-      disconnect();
-      connect(serverAddr);
-    }
   }
 
   /// 切换 P2P 打洞直连 (持久化)
@@ -970,8 +1025,10 @@ class RelayClient extends ChangeNotifier {
       }
       _closeIncoming(tid, deletePart: false);
     }
-    for (final w in _sendWaiters.values) {
-      if (!w.isCompleted) w.complete();
+    for (final ws in _sendWaiters.values) {
+      for (final w in ws) {
+        if (!w.isCompleted) w.complete();
+      }
     }
     _sendWaiters.clear();
     notifyListeners();
@@ -1433,6 +1490,18 @@ class RelayClient extends ChangeNotifier {
     }
   }
 
+  /// 并行车道来帧: 车道上只有 40 字节头 (36 tid + 4 片号) 的二进制块,
+  /// 标记并行模式后交主通道同一处理 (块落盘/回执/看门狗逻辑一致)
+  void _onLaneFrame(LanLink link, dynamic frame) {
+    if (frame is! Uint8List || frame.length < 41) return;
+    try {
+      _parMode.add(utf8.decode(Uint8List.sublistView(frame, 0, 36)));
+      _handleData(frame);
+    } catch (e) {
+      Log.e('proto', 'lane frame error', e);
+    }
+  }
+
   /// 解密 E2EE 信封并重新走消息分发; 解密失败 (篡改/密钥不一致) 直接丢弃
   Future<void> _handleEnc(Map<String, dynamic> m) async {
     final outerFrom = m['from'] as String?;
@@ -1664,6 +1733,7 @@ class RelayClient extends ChangeNotifier {
           final tidRaw = m['transferId'];
           if (tidRaw is! String || tidRaw.isEmpty) break;
           final tid = tidRaw;
+          if (m['v2'] == true) _offerV2.add(tid);
           final existing = _find(tid);
           if (existing != null) {
             // 同 transferId 重发 (对方点了"重发"): 复用记录以保留 .part 续传进度;
@@ -1777,6 +1847,10 @@ class RelayClient extends ChangeNotifier {
             if (t.status == TransferStatus.waiting ||
                 t.status == TransferStatus.failed ||
                 t.status == TransferStatus.canceled) {
+              _offerTimers.remove(t.transferId)?.cancel();
+              if (m['v2'] == true && m['parallel'] == true) {
+                _acceptPar[t.transferId] = true; // _startSend 读取后移除
+              }
               var offset = m['offset'] as int? ?? 0;
               if (offset < 0 || offset > t.fileSize) offset = 0;
               t.status = TransferStatus.accepted;
@@ -1800,6 +1874,7 @@ class RelayClient extends ChangeNotifier {
         case 'file_reject':
           final t = _find(m['transferId']);
           if (t != null) {
+            _offerTimers.remove(t.transferId)?.cancel();
             t.status = TransferStatus.rejected;
             ChatDb.upsertTransfer(t);
             _cleanupTemp(t);
@@ -1842,12 +1917,16 @@ class RelayClient extends ChangeNotifier {
           }
           return; // 浏览页自己等 future, 不用全局重建
         case 'file_progress':
-          // 接收端回执: 更新已确认字节数, 唤醒背压等待
+          // 接收端回执: 更新已确认字节数, 唤醒背压等待 (并行时多个 worker)
           final tid = m['transferId'] as String;
           final bytes = m['bytes'] as int? ?? 0;
           if (bytes > (_sendAcked[tid] ?? 0)) _sendAcked[tid] = bytes;
-          final w = _sendWaiters.remove(tid);
-          if (w != null && !w.isCompleted) w.complete();
+          final ws = _sendWaiters.remove(tid);
+          if (ws != null) {
+            for (final w in ws) {
+              if (!w.isCompleted) w.complete();
+            }
+          }
           return; // 纯内部账本, 不触发 UI 重建 (每 2MB 一帧, 频率高)
         case 'file_result':
           // 接收端校验结果: 失败则把"发送完成"改判为失败
@@ -1868,34 +1947,156 @@ class RelayClient extends ChangeNotifier {
           final t = _find(m['transferId']);
           if (t != null) _remoteCancel(t);
           break;
+        case 'file_accept_pending':
+          // 接收端在做秒传哈希/分片校验等耗时准备: 续期 offer 等待
+          final tid = m['transferId'] as String?;
+          if (tid != null) _armOfferTimer(tid, 120);
+          return; // 不触发 UI 重建
+        case 'file_instant':
+          // 秒传: 接收端声称已有同名同大小文件; 后台哈希比对后决定免传或回退
+          final t = _find(m['transferId']);
+          final theirHex = m['sha256'] as String?;
+          if (t != null &&
+              t.outgoing &&
+              t.status == TransferStatus.waiting &&
+              t.savePath != null &&
+              theirHex != null &&
+              theirHex.isNotEmpty) {
+            _armOfferTimer(t.transferId, 600); // 本端哈希期间不超时
+            unawaited(_handleInstant(t, theirHex));
+          }
+          break;
+        case 'file_instant_nack':
+          // 秒传哈希不一致: 回退正常接收流程
+          final t = _find(m['transferId']);
+          if (t != null &&
+              !t.outgoing &&
+              _instantPending.remove(t.transferId) != null) {
+            Log.i('transfer', 'instant nack ${t.fileName}, fallback to recv');
+            unawaited(acceptFile(t));
+          }
+          break;
+        case 'file_parallel':
+          // 发送端确认本传输走并行车道: 主链路分块切换为 40 字节头
+          final tid = m['transferId'] as String?;
+          if (tid != null) _parMode.add(tid);
+          return; // 不触发 UI 重建
+        case 'file_seg_hash':
+          // 发送端报某一片的 SHA-256: 存内存 + 追加 .seghash 边车 (续传校验用)
+          final tid = m['transferId'] as String?;
+          final seg = m['seg'] as int?;
+          final hex = m['sha256'] as String?;
+          if (tid != null && seg != null && hex != null && hex.isNotEmpty) {
+            (_segHashes[tid] ??= {})[seg] = hex;
+            final t = _find(tid);
+            if (t?.savePath != null) {
+              unawaited(
+                File('${t!.savePath}.seghash')
+                    .writeAsString(
+                      '$seg $hex\n',
+                      mode: FileMode.append,
+                      flush: true,
+                    )
+                    .catchError((_) => File('')),
+              );
+            }
+          }
+          return; // 不触发 UI 重建
         case 'file_done':
           final t = _find(m['transferId']);
           if (t != null && !t.outgoing) {
-            _finishIncoming(t, sha256: m['sha256'] as String?);
+            if (m['instant'] == true) {
+              // 秒传确认: 本地候选文件哈希与发送端一致, 直接落成
+              final p = _instantPending.remove(t.transferId);
+              if (p != null) _finishInstant(t, p);
+            } else {
+              _finishIncoming(t, sha256: m['sha256'] as String?);
+            }
           }
           break;
       }
       notifyListeners();
     } else if (data is List<int>) {
-      // 二进制文件块
-      final bytes = Uint8List.fromList(data);
-      final tid = utf8.decode(bytes.sublist(0, 36));
-      final chunk = bytes.sublist(36);
+      // 二进制文件块; socket/WebSocket 来的本就是 Uint8List, 用视图零拷贝
+      // (每块 64~256KB, 高速传输时 fromList 拷贝是 UI isolate 的纯浪费)
+      final bytes = data is Uint8List ? data : Uint8List.fromList(data);
+      final tid = utf8.decode(Uint8List.sublistView(bytes, 0, 36));
       final t = _find(tid);
-      final sink = _incoming[tid];
-      if (t == null || sink == null) return;
+      // _recvLastTs 在 accept 时登记: 含 tid 即接收活跃 (sink 懒开, 见下)
+      if (t == null || !_recvLastTs.containsKey(tid)) return;
       // 拉黑后在途的分块直接丢弃 (setBlocked 已取消传输并清理现场)
       if (blockedPeers.contains(t.peerId)) return;
+      // 并行模式 (file_parallel 协商或车道来帧): 40 字节头 = 36 tid + 4 片号
+      // 大端, 按帧自带片号写对应片的独立 sink; 顺序模式为 36 字节头
+      int? parSeg;
+      Uint8List chunk;
+      if (_parMode.contains(tid)) {
+        if (bytes.length < 41) return;
+        parSeg = ByteData.sublistView(bytes, 36, 40).getUint32(0);
+        // 片号越界即异常/恶意对端, 丢弃防写出垃圾 .segN 文件
+        if (parSeg * _segSize >= t.fileSize) return;
+        chunk = Uint8List.sublistView(bytes, 40);
+      } else {
+        chunk = Uint8List.sublistView(bytes, 36);
+      }
       // 文件写入必须排进串行链: dart:io IOSink 在 flush() 进行中再 add()
       // 会抛 "StreamSink is bound to a stream" (上一版回执前 flush 的修复
       // 正是这样把分块丢出洞 -> 哈希校验必挂)。add 与 flush 同链串行,
       // 两者永不重叠; 链内吞异常 (sink 已关的迟到块) 防止链断。
-      final wchain = _recvChain[tid] ?? Future<void>.value();
-      _recvChain[tid] = wchain.then((_) {
-        try {
-          sink.add(chunk);
-        } catch (_) {}
-      });
+      // 分片模式按字节位置切块: 跨片边界时先在链内封存当前片、再开下一片。
+      // 切分只依赖接收位置, 与发送端块对齐无关 (旧版对端同样兼容)
+      var pos = t.bytesDone;
+      final segMode = _recvSeg.containsKey(tid);
+      if (parSeg != null) {
+        // 并行块: 帧自带片号; 每片只由一条车道顺序发送, 按序追加即正确
+        final seg = parSeg;
+        final piece = chunk;
+        pos += piece.length;
+        final wchain = _recvChain[tid] ?? Future<void>.value();
+        _recvChain[tid] = wchain.then((_) async {
+          try {
+            final sinks = _parSinks[tid] ??= {};
+            (sinks[seg] ??= File(
+              '${t.savePath}.seg$seg',
+            ).openWrite(mode: FileMode.append)).add(piece);
+          } catch (_) {}
+        });
+      } else {
+        var rest = chunk;
+        while (rest.isNotEmpty) {
+          var take = rest.length;
+          int? seg;
+          if (segMode) {
+            seg = pos ~/ _segSize;
+            final remain = (seg + 1) * _segSize - pos;
+            if (remain < take) take = remain;
+          }
+          final piece = take == rest.length
+              ? rest
+              : Uint8List.sublistView(rest, 0, take);
+          rest = take == rest.length
+              ? Uint8List(0)
+              : Uint8List.sublistView(rest, take);
+          pos += take;
+          final wchain = _recvChain[tid] ?? Future<void>.value();
+          _recvChain[tid] = wchain.then((_) async {
+            try {
+              if (seg != null && _recvSeg[tid] != seg) {
+                // 片边界: 封存当前片, 记下新片序号 (sink 懒开)
+                await _incoming.remove(tid)?.close();
+                _recvSeg[tid] = seg;
+              }
+              // sink 懒开: accept 时不预开文件 — 并行协商 (file_parallel)
+              // 与车道首帧可能先于任何主链路块到达, 预开的顺序 sink 会与
+              // 并行片 sink 写同一 .seg0 冲突
+              _incoming[tid] ??= File(
+                seg != null ? '${t.savePath}.seg$seg' : '${t.savePath}.part',
+              ).openWrite(mode: FileMode.append);
+              _incoming[tid]?.add(piece);
+            } catch (_) {}
+          });
+        }
+      }
       // 不在此逐块算 SHA-256: crypto 是纯 Dart 实现, 大文件高速接收时
       // 会把 UI isolate 跑满 (Android 整机卡死/ANR 的根因), 改为收完后
       // 在后台 isolate 对整个 .part 一次性校验 (见 _finishIncoming)
@@ -1922,7 +2123,14 @@ class RelayClient extends ChangeNotifier {
         final prev = _recvChain[tid] ?? Future<void>.value();
         _recvChain[tid] = prev.then((_) async {
           try {
-            await sink.flush();
+            // 实时查找: 分片换片后 sink 已替换, 不能用它时的旧引用
+            await _incoming[tid]?.flush();
+            final parSinks = _parSinks[tid];
+            if (parSinks != null) {
+              for (final s in parSinks.values) {
+                await s.flush();
+              }
+            }
             _send({
               'type': 'file_progress',
               'to': t.peerId,
@@ -1977,8 +2185,12 @@ class RelayClient extends ChangeNotifier {
         if (t.outgoing) {
           // 发送循环检测到 _aborted 后自行退出并标记失败
           _aborted.add(t.transferId);
-          final w = _sendWaiters.remove(t.transferId);
-          if (w != null && !w.isCompleted) w.complete();
+          final ws = _sendWaiters.remove(t.transferId);
+          if (ws != null) {
+            for (final w in ws) {
+              if (!w.isCompleted) w.complete();
+            }
+          }
           // 还在队列里未启动的: 发送循环不会跑到, 直接出队标记失败
           if ((_sendQueue[t.peerId] ?? const []).contains(t.transferId)) {
             _sendQueue[t.peerId]!.remove(t.transferId);
@@ -2202,13 +2414,28 @@ class RelayClient extends ChangeNotifier {
         if (await f.exists()) await f.delete();
       } catch (_) {}
     }
-    // 未完成的临时文件始终清掉
+    // 未完成的临时文件始终清掉 (.part 和各分片)
     if (t.savePath != null) {
       try {
         final part = File('${t.savePath}.part');
         if (await part.exists()) await part.delete();
       } catch (_) {}
+      for (var i = 0; ; i++) {
+        try {
+          final f = File('${t.savePath}.seg$i');
+          if (!await f.exists()) break;
+          await f.delete();
+        } catch (_) {}
+      }
+      try {
+        final sh = File('${t.savePath}.seghash');
+        if (await sh.exists()) await sh.delete();
+      } catch (_) {}
     }
+    _segHashes.remove(t.transferId);
+    _offerV2.remove(t.transferId);
+    _instantPending.remove(t.transferId);
+    _offerTimers.remove(t.transferId)?.cancel();
     _cleanupTemp(t);
     transfers.remove(t);
     notifyListeners();
@@ -2422,18 +2649,29 @@ class RelayClient extends ChangeNotifier {
       'transferId': tid,
       'name': t.fileName,
       'size': size,
+      'v2': true, // 支持分片哈希/秒传/并行; 旧版对端忽略该字段
       if (clip) 'clip': true,
     });
     notifyListeners();
-    // waiting 超时: 60 秒无响应标记失败
-    Timer(const Duration(seconds: 60), () {
-      if (t.status == TransferStatus.waiting && transfers.contains(t)) {
+    _armOfferTimer(tid, 60);
+    return true;
+  }
+
+  /// 外发 offer 的 waiting 超时 (可续期): 对端做秒传哈希/分片校验等
+  /// 耗时准备工作时发 file_accept_pending 续期, 避免误判超时
+  void _armOfferTimer(String tid, int secs) {
+    _offerTimers.remove(tid)?.cancel();
+    _offerTimers[tid] = Timer(Duration(seconds: secs), () {
+      _offerTimers.remove(tid);
+      final t = _find(tid);
+      if (t != null &&
+          t.status == TransferStatus.waiting &&
+          transfers.contains(t)) {
         t.status = TransferStatus.failed;
         ChatDb.upsertTransfer(t);
         notifyListeners();
       }
     });
-    return true;
   }
 
   // ---------- 剪贴板同步 (信任设备间) ----------
@@ -2741,18 +2979,10 @@ class RelayClient extends ChangeNotifier {
     });
   }
 
-  /// 图片缩略图: 解码→等比缩到 128px→JPEG q70; 超过 100MB 放弃 (防解码 OOM)
-  Future<Uint8List?> _imageThumb(String path) async {
-    final f = File(path);
-    final len = await f.length();
-    if (len <= 0 || len > 100 * 1024 * 1024) return null;
-    final im = img.decodeImage(await f.readAsBytes());
-    if (im == null) return null;
-    final thumb = im.width >= im.height
-        ? img.copyResize(im, width: 128)
-        : img.copyResize(im, height: 128);
-    return Uint8List.fromList(img.encodeJpg(thumb, quality: 70));
-  }
+  /// 图片缩略图: 解码→等比缩到 128px→JPEG q70; 超过 100MB 放弃 (防解码 OOM)。
+  /// 纯 Dart 解码大图要几百毫秒到数秒, 必须放后台 isolate (UI isolate 上
+  /// 同步解码是「软件未响应」ANR 的来源之一)
+  Future<Uint8List?> _imageThumb(String path) => compute(_imageThumbJob, path);
 
   /// 我主动从对端拉取并登记自动接收的小文件 (浏览页内直接预览用):
   /// key = 'peerId|name|size', value = 登记毫秒时间戳
@@ -2874,109 +3104,42 @@ class RelayClient extends ChangeNotifier {
     final link = _lanActive && _lan.links[t.peerId]?.closed == false
         ? _lan.links[t.peerId]
         : null;
-    final viaLan = link != null;
-    // 通道参数: 局域网直连块大窗口大, 中继保守 (服务器按帧转发有开销)
-    // 窗口即内存上限: 发送端原生 socket 缓冲 + 接收端落盘前的在途数据都被它封顶,
-    // 128MB 的 LAN 上限在 Android 上足以撑爆内存, 统一压到 32MB
-    final chunkSize = viaLan ? 256 * 1024 : 64 * 1024;
-    var window = viaLan ? 16 * 1024 * 1024 : 8 * 1024 * 1024;
-    final windowCap = 32 * 1024 * 1024;
-    var waitMs = 0; // 累计被窗口卡住的时间
-    var evalAt = DateTime.now().millisecondsSinceEpoch + 2000; // 下次评估窗口的时间点
-    Log.i(
-      'transfer',
-      'send start ${t.fileName} -> ${t.peerId} '
-          '(${viaLan ? "lan" : "relay"}, offset=$offset)',
-    );
-    RandomAccessFile? raf;
+    LanLink? lane;
     try {
-      final hash = _HashState();
-      raf = await File(t.savePath!).open();
-      if (offset > 0) {
-        // 哈希需覆盖整个文件: 先把已发送的部分喂进哈希
-        await for (final chunk in File(t.savePath!).openRead(0, offset)) {
-          hash.input.add(chunk);
+      // 并行车道: LAN 直连 + 分片大文件 + 全新发送 + 对端 accept 声明支持;
+      // 车道拨不通自动退化为单链接顺序传输
+      if (link != null &&
+          offset == 0 &&
+          t.fileSize > _segThreshold &&
+          _acceptPar.remove(tid) == true) {
+        lane = await _lan.dialLane(t.peerId);
+        if (lane != null) {
+          _send({
+            'type': 'file_parallel',
+            'to': t.peerId,
+            'transferId': tid,
+            'lanes': 2,
+          });
+          Log.i(
+            'transfer',
+            'parallel send ${t.fileName} -> ${t.peerId} (2 lanes)',
+          );
         }
-        await raf.setPosition(offset);
+      } else {
+        _acceptPar.remove(tid);
       }
-      final tidBytes = ascii.encode(tid);
-      // 锁定通道的可用性: 只认开始时的那条路 (新链路建立不算数)
-      bool pinnedUp() => link != null ? !link.closed : connected;
-      while (true) {
-        while (t.bytesDone - (_sendAcked[tid] ?? 0) >= window) {
-          // 窗口满: 等接收端 file_progress 回执
-          if (_canceled.contains(tid) ||
-              _aborted.contains(tid) ||
-              !pinnedUp()) {
-            throw StateError('aborted');
-          }
-          final before = _sendAcked[tid] ?? 0;
-          final w = Completer<void>();
-          _sendWaiters[tid] = w;
-          final waitStart = DateTime.now().millisecondsSinceEpoch;
-          try {
-            await w.future.timeout(
-              const Duration(seconds: 120),
-              onTimeout: () {
-                if ((_sendAcked[tid] ?? 0) == before) {
-                  throw TimeoutException('file_progress timeout');
-                }
-              },
-            );
-          } finally {
-            _sendWaiters.remove(tid);
-          }
-          waitMs += DateTime.now().millisecondsSinceEpoch - waitStart;
-        }
-        if (_canceled.contains(tid) ||
-            _aborted.contains(tid) ||
-            !pinnedUp()) {
-          throw StateError('aborted');
-        }
-        // 自适应窗口: 若发送端超过 1/3 时间在等回执, 说明窗口是瓶颈, 翻倍扩
-        final nowMs = DateTime.now().millisecondsSinceEpoch;
-        if (nowMs >= evalAt) {
-          if (waitMs * 3 > nowMs - (evalAt - 2000) && window < windowCap) {
-            window = window * 2 > windowCap ? windowCap : window * 2;
-            Log.i(
-              'transfer',
-              'window up -> ${window ~/ (1024 * 1024)}MB ($tid)',
-            );
-          }
-          waitMs = 0;
-          evalAt = nowMs + 2000;
-        }
-        final chunk = await raf.read(chunkSize);
-        if (chunk.isEmpty) break;
-        hash.input.add(chunk);
-        final b = BytesBuilder()
-          ..add(tidBytes)
-          ..add(chunk);
-        // 走锁定的那条通道 (不用 _sendBinary: 它按当前链路状态动态选路)
-        if (link != null) {
-          link.sendBinary(b.toBytes());
-        } else {
-          _ch?.sink.add(b.toBytes());
-        }
-        t.bytesDone += chunk.length;
-        t.sampleSpeed();
-        final notifyNow = DateTime.now().millisecondsSinceEpoch;
-        if (t.bytesDone - _lastNotifyBytes >= 1024 * 1024 &&
-            notifyNow - _lastNotifyTs >= 200) {
-          // 轻量 tick: 只刷新进度条, 不触发整页重建
-          _lastNotifyBytes = t.bytesDone;
-          _lastNotifyTs = notifyNow;
-          _bumpProgress();
-        }
-      }
-      hash.input.close();
+      // 分片/并行模式逐片算哈希 (file_seg_hash), file_done 不带总哈希;
+      // 小文件照旧总算总哈希带上
+      final hex = lane != null
+          ? await _sendLanes(t, link!, lane)
+          : await _sendSequential(t, link, offset);
       t.status = TransferStatus.done; // 发送完成; 校验失败会被 file_result 改判
       _resetRetry(tid);
-      final doneMsg = {
+      final doneMsg = <String, dynamic>{
         'type': 'file_done',
         'to': t.peerId,
         'transferId': tid,
-        'sha256': hash.hex,
+        if (hex != null) 'sha256': hex,
         'size': t.bytesDone,
       };
       // file_done 必须与分块同路: 中继传的就强制走中继,
@@ -3008,16 +3171,368 @@ class RelayClient extends ChangeNotifier {
         _autoRetry(t);
       }
     } finally {
-      await raf?.close();
+      lane?.close(); // 并行车道随传输终结回收
       _aborted.remove(tid);
       _sendAcked.remove(tid);
-      final w = _sendWaiters.remove(tid);
-      if (w != null && !w.isCompleted) w.complete();
+      final ws = _sendWaiters.remove(tid);
+      if (ws != null) {
+        for (final w in ws) {
+          if (!w.isCompleted) w.complete();
+        }
+      }
       _sendingPeers.remove(t.peerId);
       _pumpSendQueue(t.peerId); // 本对端队列里的下一个接着发
     }
     ChatDb.upsertTransfer(t);
     notifyListeners();
+  }
+
+  /// 顺序发送主体: 返回 file_done 要带的总哈希; 分片模式逐片哈希
+  /// (每发完一片发 file_seg_hash), 总哈希被逐片校验取代, 返回 null。
+  /// 哈希在后台 isolate 算: 纯 Dart crypto 在 UI isolate 逐块算是高速
+  /// 发送时界面卡的根因; Uint8List 过 SendPort 只是 native memcpy
+  Future<String?> _sendSequential(
+    FileTransfer t,
+    LanLink? link,
+    int offset,
+  ) async {
+    final tid = t.transferId;
+    final viaLan = link != null;
+    // 通道参数: 局域网直连块大窗口大, 中继保守 (服务器按帧转发有开销)
+    // 窗口即内存上限: 发送端原生 socket 缓冲 + 接收端落盘前的在途数据都被它封顶,
+    // 128MB 的 LAN 上限在 Android 上足以撑爆内存, 统一压到 32MB
+    final chunkSize = viaLan ? 256 * 1024 : 64 * 1024;
+    var window = viaLan ? 16 * 1024 * 1024 : 8 * 1024 * 1024;
+    const windowCap = 32 * 1024 * 1024;
+    final segMode = t.fileSize > _segThreshold;
+    var waitMs = 0; // 累计被窗口卡住的时间
+    var evalAt = DateTime.now().millisecondsSinceEpoch + 2000; // 下次评估窗口的时间点
+    Log.i(
+      'transfer',
+      'send start ${t.fileName} -> ${t.peerId} '
+          '(${viaLan ? "lan" : "relay"}, offset=$offset${segMode ? ", seg" : ""})',
+    );
+    // 控制消息与分块同路 (见 file_done 处注释)
+    void sendCtrl(Map<String, dynamic> msg) {
+      if (link != null) {
+        _send(msg);
+      } else {
+        _ch?.sink.add(jsonEncode(msg));
+      }
+    }
+
+    RandomAccessFile? raf;
+    _HashWorker? hash; // 非分片: 总哈希; 分片: 当前片哈希
+    var pos = offset;
+    var segFed = false; // 当前片 worker 已喂过数据 (空 worker 不发片哈希)
+    try {
+      hash = await _HashWorker.start();
+      raf = await File(t.savePath!).open();
+      if (segMode) {
+        // 分片续传: 只需把当前半片的已发部分补进片哈希; 之前完整片的
+        // 哈希在上个会话已发给对方 (边车仍在), 无需重读重算
+        final segStart = (offset ~/ _segSize) * _segSize;
+        if (offset > segStart) {
+          await for (final chunk in File(
+            t.savePath!,
+          ).openRead(segStart, offset)) {
+            hash.add(chunk);
+            segFed = true;
+            await hash.credit(); // 背压: 未消化数据不超 32MB
+          }
+        }
+        await raf.setPosition(offset);
+      } else if (offset > 0) {
+        // 哈希需覆盖整个文件: 先把已发送的部分喂进哈希
+        await for (final chunk in File(t.savePath!).openRead(0, offset)) {
+          hash.add(chunk);
+          await hash.credit();
+        }
+        await raf.setPosition(offset);
+      }
+      final tidBytes = ascii.encode(tid);
+      // 锁定通道的可用性: 只认开始时的那条路 (新链路建立不算数)
+      bool pinnedUp() => link != null ? !link.closed : connected;
+      while (true) {
+        while (t.bytesDone - (_sendAcked[tid] ?? 0) >= window) {
+          // 窗口满: 等接收端 file_progress 回执
+          if (_canceled.contains(tid) ||
+              _aborted.contains(tid) ||
+              !pinnedUp()) {
+            throw StateError('aborted');
+          }
+          final before = _sendAcked[tid] ?? 0;
+          final w = Completer<void>();
+          (_sendWaiters[tid] ??= []).add(w);
+          final waitStart = DateTime.now().millisecondsSinceEpoch;
+          try {
+            await w.future.timeout(
+              const Duration(seconds: 120),
+              onTimeout: () {
+                if ((_sendAcked[tid] ?? 0) == before) {
+                  throw TimeoutException('file_progress timeout');
+                }
+              },
+            );
+          } finally {
+            final ws = _sendWaiters[tid];
+            if (ws != null) {
+              ws.remove(w);
+              if (ws.isEmpty) _sendWaiters.remove(tid);
+            }
+          }
+          waitMs += DateTime.now().millisecondsSinceEpoch - waitStart;
+        }
+        if (_canceled.contains(tid) ||
+            _aborted.contains(tid) ||
+            !pinnedUp()) {
+          throw StateError('aborted');
+        }
+        // 自适应窗口: 若发送端超过 1/3 时间在等回执, 说明窗口是瓶颈, 翻倍扩
+        final nowMs = DateTime.now().millisecondsSinceEpoch;
+        if (nowMs >= evalAt) {
+          if (waitMs * 3 > nowMs - (evalAt - 2000) && window < windowCap) {
+            window = window * 2 > windowCap ? windowCap : window * 2;
+            Log.i(
+              'transfer',
+              'window up -> ${window ~/ (1024 * 1024)}MB ($tid)',
+            );
+          }
+          waitMs = 0;
+          evalAt = nowMs + 2000;
+        }
+        final chunk = await raf.read(chunkSize);
+        if (chunk.isEmpty) break;
+        if (segMode) {
+          // 按片边界切开喂哈希: 喂满一片即发出其 file_seg_hash 并起新片
+          var rest = chunk;
+          while (rest.isNotEmpty) {
+            final segEnd = (pos ~/ _segSize + 1) * _segSize;
+            var take = rest.length;
+            if (segEnd - pos < take) take = segEnd - pos;
+            final piece = take == rest.length
+                ? rest
+                : Uint8List.sublistView(rest, 0, take);
+            rest = take == rest.length
+                ? Uint8List(0)
+                : Uint8List.sublistView(rest, take);
+            hash!.add(piece);
+            segFed = true;
+            pos += take;
+            if (pos == segEnd) {
+              final segHex = await hash.close();
+              sendCtrl({
+                'type': 'file_seg_hash',
+                'to': t.peerId,
+                'transferId': tid,
+                'seg': segEnd ~/ _segSize - 1,
+                'sha256': segHex,
+              });
+              hash = await _HashWorker.start();
+              segFed = false;
+            }
+          }
+          await hash!.credit();
+        } else {
+          hash!.add(chunk);
+          await hash.credit(); // 哈希消化不过来时暂停, 与网络窗口同理
+        }
+        final b = BytesBuilder()
+          ..add(tidBytes)
+          ..add(chunk);
+        // 走锁定的那条通道 (不用 _sendBinary: 它按当前链路状态动态选路)
+        if (link != null) {
+          link.sendBinary(b.toBytes());
+        } else {
+          _ch?.sink.add(b.toBytes());
+        }
+        t.bytesDone += chunk.length;
+        t.sampleSpeed();
+        final notifyNow = DateTime.now().millisecondsSinceEpoch;
+        if (t.bytesDone - _lastNotifyBytes >= 1024 * 1024 &&
+            notifyNow - _lastNotifyTs >= 200) {
+          // 轻量 tick: 只刷新进度条, 不触发整页重建
+          _lastNotifyBytes = t.bytesDone;
+          _lastNotifyTs = notifyNow;
+          _bumpProgress();
+        }
+      }
+      if (segMode) {
+        // 最后一片 (通常不足 _segSize): 发片哈希; 若恰在片边界收尾,
+        // 当前 worker 未喂过数据 (segFed=false), 该片哈希已发过不再重复
+        if (segFed) {
+          final segHex = await hash!.close();
+          hash = null;
+          sendCtrl({
+            'type': 'file_seg_hash',
+            'to': t.peerId,
+            'transferId': tid,
+            'seg': (pos - 1) ~/ _segSize,
+            'sha256': segHex,
+          });
+        } else {
+          hash?.dispose();
+          hash = null;
+        }
+        return null;
+      }
+      final hex = await hash!.close();
+      hash = null;
+      return hex;
+    } finally {
+      hash?.dispose(); // 中止/失败时回收 worker isolate (close 后重复 kill 无害)
+      await raf?.close();
+    }
+  }
+
+  /// 并行发送主体 (LAN 双车道): 主链路 + 一条车道各跑一个 worker, 按片领取
+  /// 任务; 帧头 40 字节 (36 tid + 4 片号大端), 每片只由一条车道顺序发送,
+  /// 接收端按片号独立 sink 追加即天然有序。车道中断时未发完的半片交回
+  /// (进度记在 segProgress), 由还活着的 worker 续发, 不因此整单失败
+  Future<String?> _sendLanes(
+    FileTransfer t,
+    LanLink mainLink,
+    LanLink lane,
+  ) async {
+    final tid = t.transferId;
+    final nseg = (t.fileSize + _segSize - 1) ~/ _segSize;
+    final segProgress = List<int>.filled(nseg, 0);
+    var nextSeg = 0;
+    var pendingSeg = -1; // 车道断线交回待重派的半片
+    const chunkSize = 256 * 1024;
+    const window = 16 * 1024 * 1024; // 两 worker 共享一个窗口
+    final tidBytes = ascii.encode(tid);
+    var parAborted = false; // 任一 worker 出错: 另一个尽快退出, 不要白发剩余片
+    int takeSeg() {
+      if (pendingSeg >= 0) {
+        final s = pendingSeg;
+        pendingSeg = -1;
+        return s;
+      }
+      return nextSeg < nseg ? nextSeg++ : -1;
+    }
+
+    Future<void> windowWait() async {
+      while (t.bytesDone - (_sendAcked[tid] ?? 0) >= window) {
+        if (parAborted ||
+            _canceled.contains(tid) ||
+            _aborted.contains(tid) ||
+            mainLink.closed) {
+          throw StateError('aborted');
+        }
+        final before = _sendAcked[tid] ?? 0;
+        final w = Completer<void>();
+        (_sendWaiters[tid] ??= []).add(w);
+        try {
+          await w.future.timeout(
+            const Duration(seconds: 120),
+            onTimeout: () {
+              if ((_sendAcked[tid] ?? 0) == before) {
+                throw TimeoutException('file_progress timeout');
+              }
+            },
+          );
+        } finally {
+          final ws = _sendWaiters[tid];
+          if (ws != null) {
+            ws.remove(w);
+            if (ws.isEmpty) _sendWaiters.remove(tid);
+          }
+        }
+      }
+    }
+
+    Future<void> worker(LanLink myLink) async {
+      while (true) {
+        if (parAborted) return; // 搭档已出错, 整体即将判失败
+        if (_canceled.contains(tid) ||
+            _aborted.contains(tid) ||
+            mainLink.closed) {
+          throw StateError('aborted');
+        }
+        if (myLink.closed) return; // 车道已断: 剩余片让另一条领
+        final i = takeSeg();
+        if (i < 0) return;
+        final segStart = i * _segSize;
+        final segLen = (t.fileSize - segStart).clamp(0, _segSize);
+        RandomAccessFile? raf;
+        _HashWorker? segHash;
+        var completed = false;
+        try {
+          raf = await File(t.savePath!).open();
+          await raf.setPosition(segStart + segProgress[i]);
+          segHash = await _HashWorker.start();
+          // 重派的半片: 已发部分补进片哈希 (从片头重读)
+          if (segProgress[i] > 0) {
+            await for (final c in File(
+              t.savePath!,
+            ).openRead(segStart, segStart + segProgress[i])) {
+              segHash.add(c);
+              await segHash.credit();
+            }
+          }
+          while (segProgress[i] < segLen) {
+            await windowWait();
+            if (myLink.closed) break; // 车道中途断: 交回半片
+            final want = segLen - segProgress[i];
+            final chunk = await raf.read(
+              want < chunkSize ? want : chunkSize,
+            );
+            if (chunk.isEmpty) {
+              throw StateError('file shrunk during send');
+            }
+            segHash.add(chunk);
+            await segHash.credit();
+            final frame = BytesBuilder()
+              ..add(tidBytes)
+              ..add((ByteData(4)..setUint32(0, i)).buffer.asUint8List())
+              ..add(chunk);
+            myLink.sendBinary(frame.toBytes());
+            segProgress[i] += chunk.length;
+            t.bytesDone += chunk.length;
+            t.sampleSpeed();
+            final notifyNow = DateTime.now().millisecondsSinceEpoch;
+            if (t.bytesDone - _lastNotifyBytes >= 1024 * 1024 &&
+                notifyNow - _lastNotifyTs >= 200) {
+              _lastNotifyBytes = t.bytesDone;
+              _lastNotifyTs = notifyNow;
+              _bumpProgress();
+            }
+          }
+          completed = segProgress[i] >= segLen;
+          if (completed) {
+            final hex = await segHash.close();
+            segHash = null;
+            if (mainLink.closed) throw StateError('aborted');
+            // 片哈希走主链路控制帧 (接收端记入 .seghash 边车)
+            _send({
+              'type': 'file_seg_hash',
+              'to': t.peerId,
+              'transferId': tid,
+              'seg': i,
+              'sha256': hex,
+            });
+          }
+        } finally {
+          segHash?.dispose();
+          await raf?.close();
+        }
+        if (!completed) {
+          pendingSeg = i; // 半片交回重派 (车道断线)
+          return;
+        }
+      }
+    }
+
+    // 等两个 worker 都退出; 任一出错置 parAborted 让另一个尽快停,
+    // Future.wait 收齐后抛第一个异常
+    Future<void> guarded(LanLink l) => worker(l).catchError((Object e) {
+      parAborted = true;
+      throw e;
+    });
+    await Future.wait([guarded(mainLink), guarded(lane)]);
+    if (t.bytesDone < t.fileSize) throw StateError('incomplete send');
+    return null; // 并行模式无总哈希 (逐片校验)
   }
 
   /// 发送队列泵: 当前发送结束后启动该对端队列里的下一个
@@ -3059,6 +3574,17 @@ class RelayClient extends ChangeNotifier {
       Log.w('transfer', 'acceptFile re-entry ignored ${t.transferId}');
       return;
     }
+    // 校验/合并进行中或已完成: 发送端重发带来的迟到 accept 不得再碰分片
+    // (合并 isolate 正在边写边删 .segN, 再开 sink 必乱)
+    if (t.status == TransferStatus.verifying ||
+        t.status == TransferStatus.done) {
+      _accepting.remove(t.transferId);
+      Log.w(
+        'transfer',
+        'acceptFile during ${t.status.name} ignored ${t.transferId}',
+      );
+      return;
+    }
     try {
       await _acceptFile(t);
     } finally {
@@ -3067,6 +3593,8 @@ class RelayClient extends ChangeNotifier {
   }
 
   Future<void> _acceptFile(FileTransfer t) async {
+    // 秒传: v2 对端 + 本地已有同名同大小文件 → 后台哈希比对, 一致则免传
+    if (t.savePath == null && await _tryInstant(t)) return;
     var save = t.savePath;
     if (save == null) {
       // 剪贴板同步存「下载目录/cloudSend/clipboard」; 预览临时传输存
@@ -3079,7 +3607,8 @@ class RelayClient extends ChangeNotifier {
       var candidate = '$dir${Platform.pathSeparator}${t.fileName}';
       var i = 1;
       while (await File(candidate).exists() ||
-          await File('$candidate.part').exists()) {
+          await File('$candidate.part').exists() ||
+          await File('$candidate.seg0').exists()) {
         final dot = t.fileName.lastIndexOf('.');
         candidate = dot > 0
             ? '$dir${Platform.pathSeparator}${t.fileName.substring(0, dot)}($i)${t.fileName.substring(dot)}'
@@ -3092,6 +3621,7 @@ class RelayClient extends ChangeNotifier {
     final part = File('$save.part');
     var offset = 0;
     if (await part.exists()) {
+      // 旧版单临时文件: 原样续传 (本次仍不分片)
       offset = await part.length();
       if (offset < 0 || offset > t.fileSize) {
         // 临时文件异常, 重头再来
@@ -3100,15 +3630,73 @@ class RelayClient extends ChangeNotifier {
         } catch (_) {}
         offset = 0;
       }
+    } else if (t.fileSize > _segThreshold) {
+      // v2 分片续传: 载入 .seghash 边车, 后台逐片校验已收完整片
+      // (坏片及其后续删除), 只从可信前缀后续传; 校验耗时可达数分钟,
+      // 期间向发送端发 file_accept_pending 保活防 offer 超时
+      final sidecar = await _loadSegHashes(save);
+      if (sidecar.isNotEmpty) {
+        _segHashes[t.transferId] = sidecar;
+        if (_offerV2.contains(t.transferId)) {
+          _send({
+            'type': 'file_accept_pending',
+            'to': t.peerId,
+            'transferId': t.transferId,
+          });
+          final keepAlive = Timer.periodic(const Duration(seconds: 15), (_) {
+            _send({
+              'type': 'file_accept_pending',
+              'to': t.peerId,
+              'transferId': t.transferId,
+            });
+          });
+          try {
+            await compute(verifySegsJob, {
+              'save': save,
+              'size': t.fileSize,
+              'seg': _segSize,
+              'hashes': sidecar,
+            });
+          } catch (_) {}
+          keepAlive.cancel();
+        }
+      }
+      _segHashes.putIfAbsent(t.transferId, () => {});
+      // 大文件分片: 扫描已有片 — 完整片累计, 半片从长度处追加续传
+      var i = 0;
+      while (i * _segSize < t.fileSize) {
+        final f = File('$save.seg$i');
+        if (!await f.exists()) break;
+        final expect = (t.fileSize - i * _segSize).clamp(0, _segSize);
+        final len = await f.length();
+        if (len == expect) {
+          offset += len;
+          i++;
+          continue;
+        }
+        if (len > expect) {
+          // 片比预期还长: 数据不可信, 删掉从这片重收
+          try {
+            await f.delete();
+          } catch (_) {}
+        } else {
+          offset += len; // 半片
+        }
+        break;
+      }
+      if (offset >= t.fileSize) {
+        // 片已收齐 (上次合并失败): 不再开新片, 等 file_done 重新合并
+        i = (t.fileSize + _segSize - 1) ~/ _segSize - 1;
+      }
+      _recvSeg[t.transferId] = i;
     }
-    // 续传不再重哈希已收部分 (纯 Dart SHA-256 扫几 GB 会卡死 UI isolate);
-    // 完整性由收完后的后台 isolate 整文件校验兜底 (_finishIncoming)
+    // 写盘 sink 懒开: 首个分块到达时才打开 (见分块处理器),
+    // 避免与并行车道协商前的预开 sink 冲突
     _canceled.remove(t.transferId);
     _recvAcked[t.transferId] = offset;
     // 接受时也记时间戳: 发送端若在 accept 后、首分块前死掉,
     // 0 字节挂起的盲区靠看门狗按"对端离线+超时"兜底
     _recvLastTs[t.transferId] = DateTime.now().millisecondsSinceEpoch;
-    _incoming[t.transferId] = part.openWrite(mode: FileMode.append);
     t.bytesDone = offset;
     _lastNotifyBytes = offset;
     t.status = TransferStatus.accepted;
@@ -3118,9 +3706,150 @@ class RelayClient extends ChangeNotifier {
       'to': t.peerId,
       'transferId': t.transferId,
       'offset': offset,
+      'v2': true,
+      'parallel': true, // 支持并行车道; 是否启用由发送端决定
     });
     maybeP2p(t.peerId); // 传输将走中继时尝试升级为 P2P 直连
     notifyListeners();
+  }
+
+  /// 秒传尝试: 本地已有同名同大小的完成文件时, 后台算其哈希发给发送端比对,
+  /// 一致则双方免传 (见 file_instant/file_done 处理)。返回 true = 已接管
+  /// (正等待比对结果), false = 无候选, 走正常接收
+  Future<bool> _tryInstant(FileTransfer t) async {
+    if (t.ephemeral || t.clipboard || t.bytesDone != 0) return false;
+    if (t.status != TransferStatus.waiting) return false;
+    if (!_offerV2.contains(t.transferId)) return false; // 旧版发送端不认识 file_instant
+    if (t.fileSize < _instantThreshold) return false;
+    // 候选: 下载目录同名文件 + 已完成接收记录里同名同大小的文件
+    final dir = await downloadDir();
+    final paths = <String>['$dir${Platform.pathSeparator}${t.fileName}'];
+    for (final x in transfers) {
+      if (x.outgoing || x.status != TransferStatus.done || x.savePath == null) {
+        continue;
+      }
+      if (x.fileName == t.fileName &&
+          x.fileSize == t.fileSize &&
+          !paths.contains(x.savePath)) {
+        paths.add(x.savePath!);
+      }
+    }
+    // 哈希大文件可达数分钟: 期间向发送端发 pending 保活, 防 offer 超时
+    _send({
+      'type': 'file_accept_pending',
+      'to': t.peerId,
+      'transferId': t.transferId,
+    });
+    final keepAlive = Timer.periodic(const Duration(seconds: 15), (_) {
+      _send({
+        'type': 'file_accept_pending',
+        'to': t.peerId,
+        'transferId': t.transferId,
+      });
+    });
+    List<dynamic>? res;
+    try {
+      res = await compute(_instantHashJob, [t.fileSize, ...paths]);
+    } catch (_) {}
+    keepAlive.cancel();
+    if (res == null) return false; // 没有大小相符的候选: 正常接收
+    // 哈希期间被取消/删除/状态已变: 静默放弃, 不再走正常接收
+    if (!transfers.contains(t) || t.status != TransferStatus.waiting) {
+      return true;
+    }
+    _instantPending[t.transferId] = res[0] as String;
+    t.status = TransferStatus.accepted; // 等待发送端哈希比对结果
+    ChatDb.upsertTransfer(t);
+    _send({
+      'type': 'file_instant',
+      'to': t.peerId,
+      'transferId': t.transferId,
+      'sha256': res[1],
+    });
+    Log.i('transfer', 'instant probe ${t.fileName} -> ${t.peerId}');
+    notifyListeners();
+    // 对端哈希兜底: 超时无回应回退正常接收
+    Timer(const Duration(seconds: 600), () {
+      if (_instantPending.remove(t.transferId) != null &&
+          t.status == TransferStatus.accepted &&
+          t.bytesDone == 0 &&
+          transfers.contains(t)) {
+        Log.w('transfer', 'instant wait timeout ${t.fileName}, fallback');
+        unawaited(acceptFile(t));
+      }
+    });
+    return true;
+  }
+
+  /// 秒传比对 (发送侧): 后台哈希本端文件, 一致则直接完成并通知对方,
+  /// 不一致回 file_instant_nack 让对方回退正常接收
+  Future<void> _handleInstant(FileTransfer t, String theirHex) async {
+    String? hex;
+    try {
+      hex = await compute(sha256HexOfFile, t.savePath!);
+    } catch (_) {}
+    // 哈希期间可能已被取消或走了正常流程: 结果作废
+    if (t.status != TransferStatus.waiting) return;
+    if (hex != null && hex == theirHex) {
+      _offerTimers.remove(t.transferId)?.cancel();
+      t.bytesDone = t.fileSize;
+      t.status = TransferStatus.done;
+      _resetRetry(t.transferId);
+      ChatDb.upsertTransfer(t);
+      _send({
+        'type': 'file_done',
+        'to': t.peerId,
+        'transferId': t.transferId,
+        'instant': true,
+        'size': t.fileSize,
+      });
+      _cleanupTemp(t);
+      Log.i('transfer', 'instant send ${t.fileName} (${t.fileSize}B)');
+      notifyListeners();
+    } else {
+      _send({
+        'type': 'file_instant_nack',
+        'to': t.peerId,
+        'transferId': t.transferId,
+      });
+      _armOfferTimer(t.transferId, 120); // 等对方回退后重新 accept
+    }
+  }
+
+  /// 秒传落成 (接收侧): 发送端确认本地候选文件与其一致, 直接指向已有文件
+  void _finishInstant(FileTransfer t, String path) {
+    t.savePath = path;
+    t.bytesDone = t.fileSize;
+    t.status = TransferStatus.done;
+    _resetRetry(t.transferId);
+    _offerV2.remove(t.transferId);
+    ChatDb.upsertTransfer(t);
+    _send({
+      'type': 'file_result',
+      'to': t.peerId,
+      'transferId': t.transferId,
+      'ok': true,
+    });
+    Log.i('transfer', 'instant done ${t.fileName} (${t.fileSize}B)');
+    notifyListeners();
+  }
+
+  /// 载入 .seghash 边车 (每行 "片号 hex"): 续传时校验已收分片的可信性
+  Future<Map<int, String>> _loadSegHashes(String save) async {
+    final m = <int, String>{};
+    try {
+      final f = File('$save.seghash');
+      if (await f.exists()) {
+        for (final line in await f.readAsLines()) {
+          final sp = line.trim().split(' ');
+          if (sp.length == 2) {
+            final i = int.tryParse(sp[0]);
+            if (i != null && sp[1].isNotEmpty) m[i] = sp[1];
+          }
+        }
+      }
+    } catch (_) {}
+    return m;
   }
 
   void rejectFile(FileTransfer t) {
@@ -3134,6 +3863,7 @@ class RelayClient extends ChangeNotifier {
   Future<void> cancelTransfer(FileTransfer t) async {
     if (t.status == TransferStatus.waiting) {
       if (t.outgoing) {
+        _offerTimers.remove(t.transferId)?.cancel();
         t.status = TransferStatus.canceled;
         ChatDb.upsertTransfer(t);
         _send({
@@ -3153,8 +3883,13 @@ class RelayClient extends ChangeNotifier {
       return;
     }
     _canceled.add(t.transferId);
-    final w = _sendWaiters.remove(t.transferId);
-    if (w != null && !w.isCompleted) w.complete();
+    _instantPending.remove(t.transferId); // 秒传等待一并终止
+    final ws = _sendWaiters.remove(t.transferId);
+    if (ws != null) {
+      for (final w in ws) {
+        if (!w.isCompleted) w.complete();
+      }
+    }
     // 若还在发送队列里排队: 直接出队 (队列泵会跳过非 accepted 状态, 这里顺手清掉)
     if ((_sendQueue[t.peerId] ?? const []).contains(t.transferId)) {
       _sendQueue[t.peerId]!.remove(t.transferId);
@@ -3177,8 +3912,13 @@ class RelayClient extends ChangeNotifier {
       return;
     }
     _canceled.add(t.transferId);
-    final w = _sendWaiters.remove(t.transferId);
-    if (w != null && !w.isCompleted) w.complete();
+    _instantPending.remove(t.transferId);
+    final ws = _sendWaiters.remove(t.transferId);
+    if (ws != null) {
+      for (final w in ws) {
+        if (!w.isCompleted) w.complete();
+      }
+    }
     _closeIncoming(t.transferId, deletePart: true);
     t.status = TransferStatus.canceled;
     _resetRetry(t.transferId);
@@ -3205,18 +3945,13 @@ class RelayClient extends ChangeNotifier {
       'transferId': t.transferId,
       'name': t.fileName,
       'size': t.fileSize,
+      'v2': true,
       // 剪贴板同步的重发也要带标志: 对端重启后临时记录已丢,
       // 否则会落成普通弹窗传输而不是进剪贴板目录
       if (t.clipboard) 'clip': true,
     });
     notifyListeners();
-    Timer(const Duration(seconds: 60), () {
-      if (t.status == TransferStatus.waiting && transfers.contains(t)) {
-        t.status = TransferStatus.failed;
-        ChatDb.upsertTransfer(t);
-        notifyListeners();
-      }
-    });
+    _armOfferTimer(t.transferId, 60);
     return true;
   }
 
@@ -3245,14 +3980,39 @@ class RelayClient extends ChangeNotifier {
         await sink.close();
       } catch (_) {}
     }
+    // 并行接收的片 sink 一并关闭 (与主链共用上面的串行链, 已无在途写)
+    final parSinks = _parSinks.remove(tid);
+    if (parSinks != null) {
+      for (final s in parSinks.values) {
+        try {
+          await s.close();
+        } catch (_) {}
+      }
+    }
+    _parMode.remove(tid);
     _recvAcked.remove(tid);
     _recvLastTs.remove(tid);
+    _recvSeg.remove(tid);
     if (deletePart) {
+      _segHashes.remove(tid);
+      _offerV2.remove(tid);
       final t = _find(tid);
       if (t?.savePath != null) {
         try {
           final part = File('${t!.savePath}.part');
           if (await part.exists()) await part.delete();
+        } catch (_) {}
+        // 分片与分片哈希边车一并清掉
+        for (var i = 0; ; i++) {
+          try {
+            final f = File('${t!.savePath}.seg$i');
+            if (!await f.exists()) break;
+            await f.delete();
+          } catch (_) {}
+        }
+        try {
+          final sh = File('${t.savePath}.seghash');
+          if (await sh.exists()) await sh.delete();
         } catch (_) {}
       }
     }
@@ -3261,16 +4021,72 @@ class RelayClient extends ChangeNotifier {
   /// 收到 file_done: 校验字节数和 SHA-256, 通过则 .part 改名为正式文件
   Future<void> _finishIncoming(FileTransfer t, {String? sha256}) async {
     final tid = t.transferId;
+    // 防重入: 合并+校验可达数分钟, 期间发送端重发带来的重复 file_done
+    // 必须忽略 — 两个合并任务并发写同一 .part 必坏 (100% 后失败重传
+    // 循环的根因之一); 已完成的同样不再处理
+    if (t.status == TransferStatus.verifying ||
+        t.status == TransferStatus.done ||
+        !_finishing.add(tid)) {
+      return;
+    }
+    // 校验中: 停滞看门狗按「无分块 45s」会误判 (合并期间本就没有分块),
+    // 独立状态让看门狗跳过、UI 显示校验中而不是像卡死
+    t.status = TransferStatus.verifying;
+    ChatDb.upsertTransfer(t);
+    notifyListeners();
+    try {
+      await _finishIncomingInner(t, sha256: sha256);
+    } finally {
+      _finishing.remove(tid);
+    }
+  }
+
+  Future<void> _finishIncomingInner(FileTransfer t, {String? sha256}) async {
+    final tid = t.transferId;
+    final segmented = _recvSeg.containsKey(tid);
+    final segHashes = _segHashes[tid];
+    final origSave = t.savePath; // 合并改名前的路径 (.segN/.seghash 以它命名)
     await _closeIncoming(tid, deletePart: false);
     var ok = t.bytesDone == t.fileSize;
-    if (ok && sha256 != null && sha256.isNotEmpty && t.savePath != null) {
-      // 后台 isolate 流式哈希整个 .part: 几 GB 的文件在主 isolate 上跑
-      // 纯 Dart SHA-256 会把整机拖死; compute 另起 isolate, UI 保持流畅
-      String? hex;
-      try {
-        hex = await compute(sha256HexOfFile, '${t.savePath}.part');
-      } catch (_) {}
-      ok = hex != null && hex == sha256;
+    if (ok && t.savePath != null) {
+      final nseg = (t.fileSize + _segSize - 1) ~/ _segSize;
+      if (segmented && segHashes != null && segHashes.length >= nseg) {
+        // v2 分片校验: 逐片后台哈希比对 (能定位坏片, 失败保留好片供续传),
+        // 全部通过后纯拷贝合并; 不再重算总哈希
+        try {
+          ok = await compute(verifySegsJob, {
+            'save': t.savePath,
+            'size': t.fileSize,
+            'seg': _segSize,
+            'hashes': segHashes,
+          });
+          if (ok) {
+            await compute(copySegsAndDelete, [
+              '${t.savePath}.part',
+              for (var i = 0; i < nseg; i++) '${t.savePath}.seg$i',
+            ]);
+          }
+        } catch (_) {
+          ok = false;
+        }
+      } else if (sha256 != null && sha256.isNotEmpty) {
+        // 后台 isolate 流式哈希: 几 GB 的文件在主 isolate 上跑
+        // 纯 Dart SHA-256 会把整机拖死; compute 另起 isolate, UI 保持流畅。
+        // 分片模式先顺序合并成 .part, 边合并边算哈希, 合完的片即删
+        // (合并中磁盘占用 ≈ 一份文件; 合并失败片还在, 重试可再合并)
+        String? hex;
+        try {
+          if (segmented) {
+            hex = await compute(mergeSegmentsAndHash, [
+              '${t.savePath}.part',
+              for (var i = 0; i < nseg; i++) '${t.savePath}.seg$i',
+            ]);
+          } else {
+            hex = await compute(sha256HexOfFile, '${t.savePath}.part');
+          }
+        } catch (_) {}
+        ok = hex != null && hex == sha256;
+      }
     }
     if (ok && t.savePath != null) {
       try {
@@ -3297,7 +4113,8 @@ class RelayClient extends ChangeNotifier {
       }
     }
     if (!ok) {
-      // 数据不可信: 删掉 .part, 重试时从头再来
+      // 数据不可信: 删掉 .part; 分片模式下校验通过的前缀片保留,
+      // 重试续传只需重收坏片及之后 (见 _acceptFile 的边车校验)
       Log.e(
         'transfer',
         'recv verify failed ${t.fileName} (${t.bytesDone}/${t.fileSize}B)',
@@ -3309,7 +4126,15 @@ class RelayClient extends ChangeNotifier {
           if (await part.exists()) await part.delete();
         } catch (_) {}
       }
+    } else if (origSave != null) {
+      // 成功: 分片已合并删除, 边车一并清掉 (按改名前的原始路径)
+      try {
+        final sh = File('$origSave.seghash');
+        if (await sh.exists()) await sh.delete();
+      } catch (_) {}
     }
+    _segHashes.remove(tid);
+    _offerV2.remove(tid);
     t.status = ok ? TransferStatus.done : TransferStatus.failed;
     if (ok) {
       Log.i('transfer', 'recv done ${t.fileName} (${t.bytesDone}B)');
@@ -3445,14 +4270,96 @@ class _PunchSession {
   _PunchSession(this.sid, this.peerId, this.token, {required this.initiator});
 }
 
-/// 流式 SHA-256: 边传边算, 结束后取 hex
-class _HashState {
-  Digest? _digest;
-  late final ByteConversionSink input = sha256.startChunkedConversion(
-    _DigestSink((d) => _digest = d),
-  );
+/// 后台 SHA-256 worker: 独立 isolate 流式哈希, 发送端喂块不占 UI isolate
+/// (纯 Dart crypto 逐块算是高速发送时界面卡的根因; Uint8List 过 SendPort
+/// 只是 native memcpy, 比哈希本身便宜一个量级)。
+/// 带背压: 未消化数据超 32MB 时 add 方 await credit() 暂停喂入
+class _HashWorker {
+  _HashWorker._(this._isolate, this._send, this._hex);
 
-  String? get hex => _digest?.toString();
+  static const _creditLimit = 32 * 1024 * 1024;
+
+  final Isolate _isolate;
+  final SendPort _send;
+  final Future<String> _hex;
+  int _fed = 0; // 已喂入字节
+  int _hashed = 0; // worker 已消化字节
+  Completer<void>? _credit;
+
+  static Future<_HashWorker> start() async {
+    final fromWorker = ReceivePort();
+    final isolate = await Isolate.spawn(_hashWorkerMain, fromWorker.sendPort);
+    final events = fromWorker.asBroadcastStream();
+    final send = await events.first as SendPort;
+    final w = _HashWorker._(
+      isolate,
+      send,
+      events.firstWhere((e) => e is String).then((e) => e as String),
+    );
+    unawaited(
+      events.where((e) => e is int).forEach((e) {
+        w._hashed = e as int;
+        final c = w._credit;
+        if (c != null &&
+            !c.isCompleted &&
+            w._fed - w._hashed <= _creditLimit) {
+          w._credit = null;
+          c.complete();
+        }
+      }),
+    );
+    return w;
+  }
+
+  /// 喂一块数据 (拷贝发生在 native 层, 远便宜于在 UI isolate 跑哈希)
+  void add(List<int> chunk) {
+    _fed += chunk.length;
+    _send.send(chunk);
+  }
+
+  /// 未消化数据超背压阈值时等 worker 赶上 (与网络发送窗口同理)
+  Future<void> credit() async {
+    if (_fed - _hashed <= _creditLimit) return;
+    final c = _credit ??= Completer<void>();
+    await c.future;
+  }
+
+  /// 结束喂入, 等最终 hex; worker 退出后回收 isolate
+  Future<String> close() async {
+    _send.send('close');
+    try {
+      return await _hex;
+    } finally {
+      dispose();
+    }
+  }
+
+  void dispose() => _isolate.kill();
+}
+
+/// worker isolate 入口 (必须顶层函数): 字节列表喂哈希, 每消化 8MB 上报
+/// 一次进度 (背压用), 收到 'close' 回发最终 hex 后退出
+void _hashWorkerMain(SendPort mainPort) {
+  Digest? digest;
+  final sink = sha256.startChunkedConversion(_DigestSink((d) => digest = d));
+  var hashed = 0;
+  var reported = 0;
+  final inbox = ReceivePort();
+  mainPort.send(inbox.sendPort);
+  inbox.listen((msg) {
+    if (msg is List<int>) {
+      sink.add(msg);
+      hashed += msg.length;
+      if (hashed - reported >= 8 * 1024 * 1024) {
+        reported = hashed;
+        mainPort.send(hashed);
+      }
+    } else {
+      sink.close();
+      mainPort.send(digest.toString());
+      inbox.close();
+    }
+  });
 }
 
 /// 后台 isolate 用: 流式计算整个文件的 SHA-256 hex。
@@ -3466,6 +4373,149 @@ Future<String> sha256HexOfFile(String path) async {
   }
   sink.close();
   return digest.toString();
+}
+
+/// 后台 isolate 用: 读图→解码→缩到 128px→JPEG q70 (compute 入口, 必须顶层)
+Future<Uint8List?> _imageThumbJob(String path) async {
+  try {
+    final f = File(path);
+    final len = await f.length();
+    if (len <= 0 || len > 100 * 1024 * 1024) return null;
+    final im = img.decodeImage(await f.readAsBytes());
+    if (im == null) return null;
+    final thumb = im.width >= im.height
+        ? img.copyResize(im, width: 128)
+        : img.copyResize(im, height: 128);
+    return Uint8List.fromList(img.encodeJpg(thumb, quality: 70));
+  } catch (_) {
+    return null;
+  }
+}
+
+/// 后台 isolate 用: 把分片按顺序合并成 dest, 边合并边算 SHA-256, 返回 hex。
+/// args[0] = 目标路径, 其余 = 各分片路径 (按序)。
+/// 每片完整写入目标后才删源片: 中途失败时剩余片还在, 重试只需再合并;
+/// 合并期间磁盘占用 ≈ 一份文件 + 当前片 (目标随合并增长, 源片随删减小)
+Future<String> mergeSegmentsAndHash(List<String> args) async {
+  final dest = args.first;
+  final segs = args.sublist(1);
+  Digest? digest;
+  final hashSink = sha256.startChunkedConversion(_DigestSink((d) => digest = d));
+  final out = File(dest).openWrite();
+  try {
+    for (final p in segs) {
+      final f = File(p);
+      await for (final chunk in f.openRead()) {
+        hashSink.add(chunk);
+        out.add(chunk);
+      }
+      await out.flush();
+      await f.delete();
+    }
+    hashSink.close();
+    await out.close();
+    return digest.toString();
+  } catch (_) {
+    // 清理半成品 dest, 源片未删的部分保留 (可重试合并)
+    try {
+      await out.close();
+    } catch (_) {}
+    try {
+      await File(dest).delete();
+    } catch (_) {}
+    rethrow;
+  }
+}
+
+/// 后台 isolate 内部共用: 流式算一个文件的 SHA-256 hex
+Future<String> _hashFileHex(File f) async {
+  Digest? digest;
+  final sink = sha256.startChunkedConversion(_DigestSink((d) => digest = d));
+  await for (final chunk in f.openRead()) {
+    sink.add(chunk);
+  }
+  sink.close();
+  return digest.toString();
+}
+
+/// 后台 isolate 用 (秒传): 在候选路径里找第一个大小相符的文件,
+/// 流式算其 SHA-256, 返回 [路径, hex]; 无相符候选返回 null。
+/// args[0] = 期望大小, 其余 = 候选路径 (按优先级)
+Future<List<dynamic>?> _instantHashJob(List<dynamic> args) async {
+  final size = args[0] as int;
+  for (final p in args.sublist(1)) {
+    final f = File(p as String);
+    try {
+      if (!await f.exists() || await f.length() != size) continue;
+      return [p, await _hashFileHex(f)];
+    } catch (_) {}
+  }
+  return null;
+}
+
+/// 后台 isolate 用: 逐片校验 .segN 与给定哈希 (compute 入口)。
+/// args: {save, size, seg, hashes:{片号:hex}}。从 0 起连续检查:
+/// 完整片有哈希则比对, 校验不符/超长即删该片及后续全部并返回 false;
+/// 无哈希的完整片照旧信任; 遇缺失/半片停止 (半片留给追加续传)。
+/// 片数齐全且全部通过返回 true (收完校验); 续传修剪场景只看删除副作用
+Future<bool> verifySegsJob(Map<String, dynamic> args) async {
+  final save = args['save'] as String;
+  final fileSize = args['size'] as int;
+  final segSize = args['seg'] as int;
+  final hashes = (args['hashes'] as Map).map(
+    (k, v) => MapEntry(k is int ? k : int.parse('$k'), '$v'),
+  );
+  var i = 0;
+  while (i * segSize < fileSize) {
+    final f = File('$save.seg$i');
+    if (!await f.exists()) break; // 缺失: 后续还没收/已被修剪, 停
+    final expect = (fileSize - i * segSize).clamp(0, segSize);
+    final len = await f.length();
+    if (len < expect) break; // 半片: 追加续传, 不算坏
+    if (len > expect ||
+        (hashes[i] != null && await _hashFileHex(f) != hashes[i])) {
+      // 超长或校验不符: 该片及之后全部不可信, 删除 (好前缀保留)
+      for (var j = i; ; j++) {
+        try {
+          final g = File('$save.seg$j');
+          if (!await g.exists()) break;
+          await g.delete();
+        } catch (_) {}
+      }
+      return false;
+    }
+    i++;
+  }
+  final nseg = (fileSize + segSize - 1) ~/ segSize;
+  return i >= nseg;
+}
+
+/// 后台 isolate 用: 把已校验通过的分片顺序合并成 dest (纯拷贝, 不算哈希),
+/// 每片完整写入后删源片; 失败清理半成品 dest, 未删的源片保留可重试。
+/// args[0] = 目标路径, 其余 = 各分片路径 (按序)
+Future<void> copySegsAndDelete(List<String> args) async {
+  final dest = args.first;
+  final segs = args.sublist(1);
+  final out = File(dest).openWrite();
+  try {
+    for (final p in segs) {
+      final f = File(p);
+      await for (final chunk in f.openRead()) {
+        out.add(chunk);
+      }
+      await out.flush();
+      await f.delete();
+    }
+    await out.close();
+  } catch (_) {
+    try {
+      await out.close();
+    } catch (_) {}
+    try {
+      await File(dest).delete();
+    } catch (_) {}
+    rethrow;
+  }
 }
 
 class _DigestSink implements Sink<Digest> {

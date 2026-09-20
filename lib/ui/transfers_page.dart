@@ -32,15 +32,22 @@ class _TransfersPageState extends State<TransfersPage> {
   int _shown = _pageSize;
   final ScrollController _ctrl = ScrollController();
 
-  /// existsSync 结果缓存: key = path|status,
-  /// 传输状态变化自动失效重查, 避免进度通知刷屏时反复同步 stat
-  /// (之前 key 还带 bytesDone, 每个进度 tick 新增一条, Map 无界增长)
+  /// exists 结果缓存: key = path|status, 传输状态变化自动失效重查。
+  /// build 里绝不同步 stat: 大文件合并/写盘的 IO 高峰时, 同步 stat 能把
+  /// UI 线程卡出 ANR; 未命中先按 false 渲染, 异步查完再 setState 刷新
   final Map<String, bool> _existsCache = {};
 
   bool _fileExists(String path, TransferStatus st, int bytes) {
     if (_existsCache.length > 500) _existsCache.clear(); // 兜底上限
     final key = '$path|${st.name}';
-    return _existsCache.putIfAbsent(key, () => File(path).existsSync());
+    final hit = _existsCache[key];
+    if (hit != null) return hit;
+    _existsCache[key] = false;
+    File(path).exists().then((v) {
+      if (!mounted || _existsCache[key] == v) return;
+      setState(() => _existsCache[key] = v);
+    });
+    return false;
   }
 
   @override
@@ -194,7 +201,8 @@ class _TransfersPageState extends State<TransfersPage> {
                     final t = item as FileTransfer;
                     final busy =
                         t.status == TransferStatus.accepted ||
-                        t.status == TransferStatus.transferring;
+                        t.status == TransferStatus.transferring ||
+                        t.status == TransferStatus.verifying;
                     final checked = _selected.contains(t.transferId);
                     // 组内行间细分隔线, 组尾/列表尾不画
                     final showDivider =
@@ -611,7 +619,8 @@ class TransferCard extends StatelessWidget {
                     ],
                   ),
                   if (t.status == TransferStatus.transferring ||
-                      t.status == TransferStatus.accepted) ...[
+                      t.status == TransferStatus.accepted ||
+                      t.status == TransferStatus.verifying) ...[
                     const SizedBox(height: 8),
                     Row(
                       children: [
@@ -654,23 +663,26 @@ class TransferCard extends StatelessWidget {
                           ),
                         ),
                         const SizedBox(width: 8),
-                        InkWell(
-                          borderRadius: BorderRadius.circular(4),
-                          onTap: () => c.cancelTransfer(t),
-                          child: Padding(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 8,
-                              vertical: 2,
-                            ),
-                            child: Text(
-                              tr('cancel'),
-                              style: const TextStyle(
-                                fontSize: 12,
-                                color: AppTheme.red,
+                        // 校验中不显示取消: 合并 isolate 不可中断,
+                        // 此时取消只会删掉正在合并的分片
+                        if (t.status != TransferStatus.verifying)
+                          InkWell(
+                            borderRadius: BorderRadius.circular(4),
+                            onTap: () => c.cancelTransfer(t),
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 8,
+                                vertical: 2,
+                              ),
+                              child: Text(
+                                tr('cancel'),
+                                style: const TextStyle(
+                                  fontSize: 12,
+                                  color: AppTheme.red,
+                                ),
                               ),
                             ),
                           ),
-                        ),
                       ],
                     ),
                   ],
@@ -874,6 +886,7 @@ class TransferCard extends StatelessWidget {
     TransferStatus.waiting => tr('st_waiting_confirm'),
     TransferStatus.accepted => tr('st_accepted'),
     TransferStatus.transferring => tr('st_transferring'),
+    TransferStatus.verifying => tr('st_verifying'),
     TransferStatus.done => tr('st_done'),
     TransferStatus.rejected => tr('st_rejected'),
     TransferStatus.failed => tr('st_failed'),
@@ -885,7 +898,8 @@ class TransferCard extends StatelessWidget {
     TransferStatus.failed => AppTheme.red,
     TransferStatus.waiting => const Color(0xFFFF9500),
     TransferStatus.transferring ||
-    TransferStatus.accepted => const Color(0xFF576B95),
+    TransferStatus.accepted ||
+    TransferStatus.verifying => const Color(0xFF576B95),
     _ => AppTheme.grey,
   };
 
