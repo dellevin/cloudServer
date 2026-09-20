@@ -9,6 +9,7 @@ import '../client.dart';
 import '../l10n.dart';
 import '../main.dart';
 import '../models.dart';
+import 'app_dialog.dart';
 import 'app_toast.dart';
 import 'file_preview_page.dart';
 import 'slidable_close.dart';
@@ -75,10 +76,17 @@ class _TransfersPageState extends State<TransfersPage> {
     _selected.clear();
   });
 
+  /// 列表里的「删除」= 仅对列表隐藏 (不动文件, 聊天页文件消息保留),
+  /// 所以只弹简单确认框, 不再有「同时删除文件」选项
   Future<void> _deleteOne(RelayClient c, FileTransfer t) async {
-    final choice = await confirmDeleteTransfer(context, t);
-    if (choice == null) return;
-    await c.deleteTransfer(t, deleteFile: choice == 'both');
+    final ok = await AppDialog.confirm(
+      context,
+      title: tr('del_transfer_title'),
+      message: trf('file_quoted', {'name': t.fileName}),
+      danger: true,
+    );
+    if (!ok || !mounted) return;
+    await c.hideTransfers([t]);
   }
 
   Future<void> _deleteSelected(RelayClient c) async {
@@ -86,14 +94,14 @@ class _TransfersPageState extends State<TransfersPage> {
         .where((t) => _selected.contains(t.transferId))
         .toList();
     if (targets.isEmpty) return;
-    final choice = await confirmDeleteDialog(
+    final ok = await AppDialog.confirm(
       context,
       title: trf('del_transfers_title', {'n': targets.length}),
+      danger: true,
     );
-    if (choice == null) return;
-    await c.deleteTransfers(targets, deleteFile: choice == 'both');
-    // 删文件 IO 期间用户可能已退出页面
-    if (mounted) _exitSelect();
+    if (!ok || !mounted) return;
+    await c.hideTransfers(targets);
+    _exitSelect();
   }
 
   @override
@@ -224,16 +232,14 @@ class _TransfersPageState extends State<TransfersPage> {
                     );
                     if (_selecting || busy) return card;
                     // 左滑露出操作按钮: 打开(收到需已完成, 发出的本地有文件即可)
-                    // 位置(文件在本地) / 删除; 按钮为正方形 (边长≈条目高), 面板宽度按按钮个数换算
+                    // / 删除; 按钮为正方形 (边长≈条目高), 面板宽度按按钮个数换算
                     // existsSync 走缓存 (key 含状态/进度, 完成/续传变化时自动重查),
                     // 否则 5Hz 进度通知下每行每次都同步 stat 磁盘
-                    final revealable =
-                        t.savePath != null &&
-                        _fileExists(t.savePath!, t.status, t.bytesDone);
                     final openable =
-                        revealable &&
+                        t.savePath != null &&
+                        _fileExists(t.savePath!, t.status, t.bytesDone) &&
                         (t.outgoing || t.status == TransferStatus.done);
-                    final n = 1 + (revealable ? 1 : 0) + (openable ? 1 : 0);
+                    final n = 1 + (openable ? 1 : 0);
                     final sw = MediaQuery.of(context).size.width;
                     final ratio = (n * 76.0) / sw;
                     return Slidable(
@@ -251,18 +257,6 @@ class _TransfersPageState extends State<TransfersPage> {
                                 color: const Color(0xFF4C8DFF),
                                 icon: Icons.visibility_outlined,
                                 label: tr('open'),
-                              ),
-                            ),
-                          if (revealable)
-                            CustomSlidableAction(
-                              onPressed: (_) =>
-                                  revealTransferInFolder(context, t),
-                              backgroundColor: Colors.transparent,
-                              padding: EdgeInsets.zero,
-                              child: _SquareAction(
-                                color: AppTheme.green,
-                                icon: Icons.folder_open,
-                                label: tr('locate'),
                               ),
                             ),
                           CustomSlidableAction(

@@ -64,14 +64,15 @@ class QrPairPage extends StatefulWidget {
 }
 
 class _QrPairPageState extends State<QrPairPage> {
-  String? _lanIp;
+  List<(String, String)> _lanAddrs = const []; // (IP, 网卡名)
+  int _lanSel = 0; // 选中的局域网网段下标
   int _seg = 0; // 当前展示的二维码页签 (中继 / 局域网分开看)
 
   @override
   void initState() {
     super.initState();
-    context.read<RelayClient>().firstLanIp().then((ip) {
-      if (mounted) setState(() => _lanIp = ip);
+    context.read<RelayClient>().lanAddrs().then((list) {
+      if (mounted) setState(() => _lanAddrs = list);
     });
   }
 
@@ -80,7 +81,15 @@ class _QrPairPageState extends State<QrPairPage> {
     final c = context.watch<RelayClient>();
     final isMobile = Platform.isAndroid || Platform.isIOS;
     final items =
-        <({String title, String payload, String caption, String? note})>[];
+        <
+          ({
+            String title,
+            String payload,
+            String caption,
+            String? note,
+            bool isLan,
+          })
+        >[];
     if (c.connMode != 'lan' && c.serverAddr.isNotEmpty) {
       // 服务器设了接入密码: 一并编进二维码, 对方扫完即可连, 不用再手输
       var payload = 'cloudsend://server/${c.serverAddr}';
@@ -94,15 +103,18 @@ class _QrPairPageState extends State<QrPairPage> {
         payload: payload,
         caption: c.serverAddr,
         note: note,
+        isLan: false,
       ));
     }
-    if (c.connMode != 'relay' && _lanIp != null && c.lanTcpPort != 0) {
-      final target = '$_lanIp:${c.lanTcpPort}';
+    if (c.connMode != 'relay' && _lanAddrs.isNotEmpty && c.lanTcpPort != 0) {
+      final sel = _lanSel.clamp(0, _lanAddrs.length - 1);
+      final target = '${_lanAddrs[sel].$1}:${c.lanTcpPort}';
       items.add((
         title: tr('qr_lan'),
         payload: 'cloudsend://lan/$target',
         caption: target,
         note: null,
+        isLan: true,
       ));
     }
     if (_seg >= items.length) _seg = 0;
@@ -194,7 +206,14 @@ class _QrPairPageState extends State<QrPairPage> {
 
   Widget _qrCard(
     BuildContext context,
-    ({String title, String payload, String caption, String? note}) item, {
+    ({
+      String title,
+      String payload,
+      String caption,
+      String? note,
+      bool isLan,
+    })
+    item, {
     required bool showTitle,
   }) {
     return Container(
@@ -213,6 +232,48 @@ class _QrPairPageState extends State<QrPairPage> {
                 fontSize: 14,
                 fontWeight: FontWeight.w600,
                 color: AppTheme.inkOf(context),
+              ),
+            ),
+            const SizedBox(height: 12),
+          ],
+          // 多网卡/多网段: 下拉选对方所在网段, 二维码跟随切换
+          if (item.isLan && _lanAddrs.length > 1) ...[
+            Text(
+              tr('qr_pick_lan'),
+              style: const TextStyle(fontSize: 11, color: AppTheme.grey),
+            ),
+            const SizedBox(height: 6),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10),
+              decoration: BoxDecoration(
+                color: AppTheme.softOf(context),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: DropdownButtonHideUnderline(
+                child: DropdownButton<int>(
+                  value: _lanSel.clamp(0, _lanAddrs.length - 1),
+                  isDense: true,
+                  dropdownColor: AppTheme.cardOf(context),
+                  items: [
+                    for (var i = 0; i < _lanAddrs.length; i++)
+                      DropdownMenuItem(
+                        value: i,
+                        child: Text(
+                          _lanAddrs[i].$2.isNotEmpty
+                              ? '${_lanAddrs[i].$1} · ${_lanAddrs[i].$2}'
+                              : _lanAddrs[i].$1,
+                          style: TextStyle(
+                            fontSize: 12.5,
+                            fontFamily: 'monospace',
+                            color: AppTheme.inkOf(context),
+                          ),
+                        ),
+                      ),
+                  ],
+                  onChanged: (v) {
+                    if (v != null) setState(() => _lanSel = v);
+                  },
+                ),
               ),
             ),
             const SizedBox(height: 12),

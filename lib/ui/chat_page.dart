@@ -132,13 +132,28 @@ class ChatsTabPage extends StatelessWidget {
                     final last = _lastPreview(id, msgs, lastFiles[id]);
                     final n = c.unread[id] ?? 0;
                     final name = c.peerName(id);
-                    // 左滑露出通高红色删除按钮, 点击按钮再弹选项
+                    // 左滑露出操作: 有未读时「标记已读」(灰) + 通高红色删除
                     return Slidable(
                       key: Key('conv_$id'),
                       endActionPane: ActionPane(
                         motion: const DrawerMotion(),
-                        extentRatio: 0.22,
+                        extentRatio: n > 0 ? 0.42 : 0.22,
                         children: [
+                          if (n > 0)
+                            CustomSlidableAction(
+                              onPressed: (_) => c.markConversationRead(id),
+                              backgroundColor: AppTheme.grey,
+                              padding: EdgeInsets.zero,
+                              child: Center(
+                                child: Text(
+                                  tr('mark_read'),
+                                  style: const TextStyle(
+                                    fontSize: 14,
+                                    color: Colors.white,
+                                  ),
+                                ),
+                              ),
+                            ),
                           CustomSlidableAction(
                             onPressed: (_) => _confirmDeleteConversation(
                               context,
@@ -249,7 +264,8 @@ class ChatsTabPage extends StatelessWidget {
   }
 }
 
-/// 会话列表头像: 48px 圆角方形, 未读数红色角标在右上角 (微信样式)
+/// 会话列表头像: 48px 圆角方形, 未读数红色角标在右上角 (微信样式);
+/// 对端不在线时灰底 + 灰度滤镜 (与设备页的离线设备同款)
 class _ConversationAvatar extends StatelessWidget {
   final RelayClient client;
   final String peerId;
@@ -262,15 +278,24 @@ class _ConversationAvatar extends StatelessWidget {
     required this.unread,
   });
 
+  // 灰度滤镜: 离线对端的彩色头像去色 (与设备页离线设备一致)
+  static const _greyscale = ColorFilter.matrix([
+    0.2126, 0.7152, 0.0722, 0, 0, //
+    0.2126, 0.7152, 0.0722, 0, 0,
+    0.2126, 0.7152, 0.0722, 0, 0,
+    0, 0, 0, 1, 0,
+  ]);
+
   @override
   Widget build(BuildContext context) {
     final bytes = client.peerAvatarBytes(peerId);
-    final avatar = Container(
+    final online = client.isOnline(peerId);
+    Widget avatar = Container(
       width: 48,
       height: 48,
       alignment: Alignment.center,
       decoration: BoxDecoration(
-        color: const Color(0xFF576B95),
+        color: online ? const Color(0xFF576B95) : AppTheme.grey,
         borderRadius: BorderRadius.circular(4),
         image: bytes != null
             ? DecorationImage(image: MemoryImage(bytes), fit: BoxFit.cover)
@@ -287,6 +312,9 @@ class _ConversationAvatar extends StatelessWidget {
               ),
             ),
     );
+    if (!online) {
+      avatar = ColorFiltered(colorFilter: _greyscale, child: avatar);
+    }
     if (unread <= 0) return avatar;
     return Stack(
       clipBehavior: Clip.none,
@@ -1280,23 +1308,13 @@ class _ChatPageState extends State<ChatPage> {
     RelayClient c,
     FileTransfer t,
     Rect anchor,
-  ) async {
+  ) {
     // waiting 状态可取消删除; 传输中/校验中都禁止 (校验时删记录会毁掉合并)
     final busy =
         t.status == TransferStatus.accepted ||
         t.status == TransferStatus.transferring ||
         t.status == TransferStatus.verifying;
-    // 文件已落到本地 (收到的已完成 / 发出的源文件) 才能打开所在位置;
-    // 异步 stat: IO 高峰时同步 stat 会卡 UI 线程出 ANR
-    final revealable =
-        t.savePath != null && await File(t.savePath!).exists();
-    if (!context.mounted) return;
     _showBubbleMenu(anchor, [
-      if (revealable)
-        (
-          label: tr('open_location'),
-          onTap: () => revealTransferInFolder(context, t),
-        ),
       if (!busy)
         (
           label: t.status == TransferStatus.waiting

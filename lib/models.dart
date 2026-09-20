@@ -68,6 +68,10 @@ class FileTransfer {
   /// 完成后写入 clip_items 记录 (剪贴板页展示, 不进传输记录)
   bool clipboard = false;
 
+  /// 传输记录列表里被「删除」(仅对列表隐藏: 记录和文件都保留,
+  /// 聊天页的文件消息不受影响); 持久化到 DB
+  bool hidden;
+
   FileTransfer({
     required this.transferId,
     required this.peerId,
@@ -78,6 +82,7 @@ class FileTransfer {
     this.status = TransferStatus.waiting,
     this.bytesDone = 0,
     this.savePath,
+    this.hidden = false,
   }) : ts = ts ?? DateTime.now().millisecondsSinceEpoch;
 
   double get progress => fileSize == 0 ? 0 : bytesDone / fileSize;

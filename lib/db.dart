@@ -118,7 +118,7 @@ class ChatDb {
     final base = await getDatabasesPath();
     _db = await openDatabase(
       p.join(base, 'cloudsend_chat.db'),
-      version: 7,
+      version: 8,
       onCreate: (d, v) async {
         await d.execute(
           'CREATE TABLE messages(id INTEGER PRIMARY KEY AUTOINCREMENT, peerId TEXT NOT NULL, fromMe INTEGER NOT NULL, text TEXT NOT NULL, ts INTEGER NOT NULL, delivered INTEGER NOT NULL DEFAULT 1, rejected INTEGER NOT NULL DEFAULT 0, recalled INTEGER NOT NULL DEFAULT 0, readFlag INTEGER NOT NULL DEFAULT 0)',
@@ -129,7 +129,7 @@ class ChatDb {
           'CREATE INDEX idx_messages_peer_ts ON messages(peerId, ts)',
         );
         await d.execute(
-          'CREATE TABLE transfers(transferId TEXT PRIMARY KEY, peerId TEXT NOT NULL, fileName TEXT NOT NULL, fileSize INTEGER NOT NULL, outgoing INTEGER NOT NULL, status TEXT NOT NULL, savePath TEXT, ts INTEGER NOT NULL)',
+          'CREATE TABLE transfers(transferId TEXT PRIMARY KEY, peerId TEXT NOT NULL, fileName TEXT NOT NULL, fileSize INTEGER NOT NULL, outgoing INTEGER NOT NULL, status TEXT NOT NULL, savePath TEXT, ts INTEGER NOT NULL, hidden INTEGER NOT NULL DEFAULT 0)',
         );
         await d.execute(
           'CREATE TABLE clip_items(id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, content TEXT NOT NULL, ts INTEGER NOT NULL, fromMe INTEGER NOT NULL, peerId TEXT NOT NULL)',
@@ -167,6 +167,12 @@ class ChatDb {
         if (oldV < 7) {
           await d.execute(
             'CREATE INDEX idx_messages_peer_ts ON messages(peerId, ts)',
+          );
+        }
+        if (oldV < 8) {
+          // 传输记录「列表删除 = 仅隐藏」(聊天页文件消息保留)
+          await d.execute(
+            'ALTER TABLE transfers ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0',
           );
         }
       },
@@ -398,11 +404,21 @@ class ChatDb {
       'status': t.status.name,
       'savePath': t.savePath,
       'ts': t.ts,
+      'hidden': t.hidden ? 1 : 0,
     }, conflictAlgorithm: ConflictAlgorithm.replace);
   }
 
   static Future<int> deleteTransfer(String transferId) async => (await db)
       .delete('transfers', where: 'transferId = ?', whereArgs: [transferId]);
+
+  /// 仅对传输记录列表隐藏 (记录保留: 聊天页文件消息不受影响)
+  static Future<void> hideTransfer(String transferId) async =>
+      (await db).update(
+        'transfers',
+        {'hidden': 1},
+        where: 'transferId = ?',
+        whereArgs: [transferId],
+      );
 
   static Future<List<FileTransfer>> loadTransfers() async {
     final rows = await (await db).query('transfers', orderBy: 'ts ASC');
@@ -416,6 +432,7 @@ class ChatDb {
             outgoing: (m['outgoing'] as int) == 1,
             ts: m['ts'] as int,
             savePath: m['savePath'] as String?,
+            hidden: (m['hidden'] as int? ?? 0) == 1,
             status:
                 TransferStatus.values.asNameMap()[m['status'] as String] ??
                 TransferStatus.failed,

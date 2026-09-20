@@ -12,7 +12,6 @@ import '../client.dart';
 import '../l10n.dart';
 import '../main.dart';
 import '../models.dart';
-import 'app_dialog.dart';
 import 'app_toast.dart';
 import 'zoomable_image.dart';
 
@@ -191,76 +190,6 @@ Future<void> openTransferWith(BuildContext context, FileTransfer t) async {
   if (r.type != ResultType.done && context.mounted) {
     AppToast.show(context, trf('open_fail', {'msg': r.message}));
   }
-}
-
-/// 打开文件所在位置 (Windows 资源管理器定位并选中; macOS Finder 显示;
-/// Linux/Android 打开所在目录, 失败则提示路径)
-Future<void> revealTransferInFolder(
-  BuildContext context,
-  FileTransfer t,
-) async {
-  final path = t.savePath;
-  if (path == null || !File(path).existsSync()) {
-    AppToast.show(context, tr('file_gone'));
-    return;
-  }
-  try {
-    if (Platform.isWindows) {
-      // explorer 成功也可能返回非零退出码, 不据此举异常
-      await Process.run('explorer.exe', [
-        '/select,${path.replaceAll('/', '\\')}',
-      ]);
-      return;
-    }
-    if (Platform.isMacOS) {
-      await Process.run('open', ['-R', path]);
-      return;
-    }
-    final dir = File(path).parent.path;
-    if (Platform.isAndroid) {
-      // 部分文件管理器能处理目录打开, 不行则落到下面提示路径
-      final r = await OpenFilex.open(dir);
-      if (r.type == ResultType.done) return;
-    } else {
-      await Process.run('xdg-open', [dir]);
-      return;
-    }
-  } catch (_) {}
-  if (context.mounted) {
-    AppToast.show(
-      context,
-      trf('file_located', {'dir': File(path).parent.path}),
-    );
-  }
-}
-
-/// 删除确认对话框 (微信动作面板风格, 与消息列表删除会话弹窗一致)
-/// 返回 'record' / 'both' / null(取消)
-Future<String?> confirmDeleteDialog(
-  BuildContext context, {
-  required String title,
-  String? message,
-}) {
-  return AppDialog.actions<String>(
-    context,
-    title: title,
-    message: message,
-    actions: [
-      AppDialogAction(tr('del_record_only'), 'record'),
-      AppDialogAction(tr('del_record_file'), 'both', danger: true),
-    ],
-  );
-}
-
-/// 传输删除确认对话框: 返回 'record' / 'both' / null(取消)
-Future<String?> confirmDeleteTransfer(BuildContext context, FileTransfer t) {
-  return confirmDeleteDialog(
-    context,
-    title: tr('del_transfer_title'),
-    message: t.status == TransferStatus.waiting
-        ? trf('del_transfer_waiting', {'name': t.fileName})
-        : trf('file_quoted', {'name': t.fileName}),
-  );
 }
 
 /// 图片全屏查看页 (Telegram 风格: 无 AppBar, 单击显隐顶部控制条,

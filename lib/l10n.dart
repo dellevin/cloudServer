@@ -365,6 +365,8 @@ const Map<String, String> _zh = {
   'download': '下载',
   'playback_speed': '倍速播放',
   'download_original': '下载原图',
+  'qr_pick_lan': '有多个局域网网段，选择对方所在的网段',
+  'mark_read': '标记已读',
 
   // ---- 压缩包预览页 ----
   'zip_read_fail': '无法读取压缩包 (可能已损坏或不是 zip 格式)',
@@ -766,6 +768,8 @@ const Map<String, String> _en = {
   'download': 'Download',
   'playback_speed': 'Playback speed',
   'download_original': 'Download original',
+  'qr_pick_lan': 'Multiple LAN subnets — pick the peer\'s network',
+  'mark_read': 'Mark read',
 
   // ---- zip preview page ----
   'zip_read_fail': 'Cannot read the archive',

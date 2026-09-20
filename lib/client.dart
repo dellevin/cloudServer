@@ -159,9 +159,10 @@ class RelayClient extends ChangeNotifier {
     transfers.remove(t);
   }
 
-  /// 要在 UI 展示的传输记录 (预览拉取的 ephemeral 临时传输不入库不上列表)
+  /// 要在 UI 展示的传输记录 (预览拉取的 ephemeral 临时传输不入库不上列表;
+  /// hidden = 用户在列表里「删除」的, 仅对列表隐藏, 聊天页文件消息保留)
   List<FileTransfer> get visibleTransfers =>
-      transfers.where((t) => !t.ephemeral).toList();
+      transfers.where((t) => !t.ephemeral && !t.hidden).toList();
 
   late LanManager _lan; // 仅中继模式下为已 dispose 的空实例 (不启动发现/直连)
 
@@ -1451,14 +1452,15 @@ class RelayClient extends ChangeNotifier {
   /// 局域网 TCP 直连端口 (0 = 未绑定); 二维码配对展示用
   int get lanTcpPort => _lan.boundTcpPort;
 
-  /// 首个非回环 IPv4 地址 (二维码配对展示用); 无则 null
-  Future<String?> firstLanIp() async {
+  /// 本机全部非回环 IPv4 地址 (二维码配对的局域网网段选择用): (地址, 网卡名)
+  Future<List<(String, String)>> lanAddrs() async {
+    final out = <(String, String)>[];
     for (final i in await localInterfaces()) {
       for (final a in i.addresses) {
-        if (!a.isLoopback) return a.address;
+        if (!a.isLoopback) out.add((a.address, i.name));
       }
     }
-    return null;
+    return out;
   }
 
   /// 解析 "ip" 或 "ip:port" (端口缺省 45678); 非法输入返回 null
@@ -2408,12 +2410,17 @@ class RelayClient extends ChangeNotifier {
     final h = await ChatDb.history(peerId, limit: historyPageSize);
     chats[peerId] = h;
     hasMoreHistory[peerId] = h.length >= historyPageSize;
-    if ((unread[peerId] ?? 0) != 0) {
-      unread[peerId] = 0;
-      _unreadChanged();
-    }
+    markConversationRead(peerId);
     notifyListeners();
     return h;
+  }
+
+  /// 会话列表左滑「标记已读」: 只清零未读数 (含角标), 不动消息内容
+  void markConversationRead(String peerId) {
+    if ((unread[peerId] ?? 0) == 0) return;
+    unread[peerId] = 0;
+    _unreadChanged();
+    notifyListeners();
   }
 
   /// 抓取更早的一页历史 (只查库不并入列表; 由聊天页在滚动停止后
@@ -2626,6 +2633,17 @@ class RelayClient extends ChangeNotifier {
     for (final t in List.of(list)) {
       await deleteTransfer(t, deleteFile: deleteFile);
     }
+  }
+
+  /// 传输记录列表的「删除」: 仅对列表隐藏 — 不删本地文件, 不删 DB 记录,
+  /// 聊天页的文件消息不受影响 (聊天页自己的删除仍走 deleteTransfer 全删)
+  Future<void> hideTransfers(List<FileTransfer> list) async {
+    for (final t in list) {
+      if (t.hidden) continue;
+      t.hidden = true;
+      await ChatDb.hideTransfer(t.transferId);
+    }
+    notifyListeners();
   }
 
   /// 外发临时文件 (zip 等) 在传输终结后删除; 失败状态保留以便重试
