@@ -48,6 +48,8 @@ class ClipboardPageState extends State<ClipboardPage> {
   bool _searching = false;
   String _query = '';
   final TextEditingController _searchCtrl = TextEditingController();
+  Timer? _searchDebounce; // 搜索输入防抖, 停止敲字 300ms 后才查库
+  int _reloadSeq = 0; // 重载序号: 防止慢的旧查询覆盖新结果
 
   @override
   void initState() {
@@ -59,6 +61,7 @@ class ClipboardPageState extends State<ClipboardPage> {
   @override
   void dispose() {
     _sub?.cancel();
+    _searchDebounce?.cancel();
     _searchCtrl.dispose();
     super.dispose();
   }
@@ -88,6 +91,7 @@ class ClipboardPageState extends State<ClipboardPage> {
   }
 
   Future<void> _reload() async {
+    final seq = ++_reloadSeq;
     final (dayStart, dayEnd) = _dayRange();
     final q = _query.isEmpty ? null : _query;
     final total = await ChatDb.clipCount(
@@ -95,6 +99,7 @@ class ClipboardPageState extends State<ClipboardPage> {
       dayStart: dayStart,
       dayEnd: dayEnd,
     );
+    if (seq != _reloadSeq) return; // 期间又发起了新查询, 丢弃本次结果
     final pageCount = total == 0 ? 0 : ((total + _pageSize - 1) ~/ _pageSize);
     var page = _page;
     if (page >= pageCount) page = pageCount - 1; // 删除后总页数可能变少
@@ -106,16 +111,25 @@ class ClipboardPageState extends State<ClipboardPage> {
       dayStart: dayStart,
       dayEnd: dayEnd,
     );
+    if (seq != _reloadSeq) return;
+    // 文件存在性/大小检查: 单次 stat 并发做完 (原来 exists+length 串行
+    // 两次往返, 一页 50 条最多 100 次排队 IO, 是日期筛选卡顿的主因)
+    final fileItems = [
+      for (final it in items)
+        if (it.kind == 'file' && it.id != null) it,
+    ];
+    final stats = await Future.wait([
+      for (final it in fileItems) FileStat.stat(it.content),
+    ]);
+    if (seq != _reloadSeq) return;
     final missing = <int>{};
     final sizes = <int, int>{};
-    for (final it in items) {
-      if (it.kind == 'file' && it.id != null) {
-        final f = File(it.content);
-        if (await f.exists()) {
-          sizes[it.id!] = await f.length();
-        } else {
-          missing.add(it.id!);
-        }
+    for (var i = 0; i < fileItems.length; i++) {
+      final st = stats[i];
+      if (st.type == FileSystemEntityType.file) {
+        sizes[fileItems[i].id!] = st.size;
+      } else {
+        missing.add(fileItems[i].id!);
       }
     }
     if (mounted) {
@@ -145,7 +159,9 @@ class ClipboardPageState extends State<ClipboardPage> {
   void _setQuery(String v) {
     _query = v.trim();
     _page = 0;
-    _reload();
+    // 防抖: 每敲一个字都查库会连续触发 IO, 停笔 300ms 后再查
+    _searchDebounce?.cancel();
+    _searchDebounce = Timer(const Duration(milliseconds: 300), _reload);
   }
 
   void _closeSearch() {

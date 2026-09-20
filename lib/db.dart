@@ -167,7 +167,7 @@ class ChatDb {
     final base = await getDatabasesPath();
     _db = await openDatabase(
       p.join(base, 'cloudsend_chat.db'),
-      version: 12,
+      version: 13,
       onCreate: (d, v) async {
         await d.execute(
           'CREATE TABLE messages(id INTEGER PRIMARY KEY AUTOINCREMENT, peerId TEXT NOT NULL, fromMe INTEGER NOT NULL, text TEXT NOT NULL, ts INTEGER NOT NULL, delivered INTEGER NOT NULL DEFAULT 1, rejected INTEGER NOT NULL DEFAULT 0, recalled INTEGER NOT NULL DEFAULT 0, readFlag INTEGER NOT NULL DEFAULT 0)',
@@ -183,6 +183,8 @@ class ChatDb {
         await d.execute(
           'CREATE TABLE clip_items(id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, content TEXT NOT NULL, ts INTEGER NOT NULL, fromMe INTEGER NOT NULL, peerId TEXT NOT NULL)',
         );
+        // 剪贴板日期筛选 (ts >= ? AND ts < ?) 与时间倒序的索引
+        await d.execute('CREATE INDEX idx_clip_ts ON clip_items(ts)');
         await d.execute(
           'CREATE TABLE collection_items(id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, content TEXT NOT NULL, fileName TEXT NOT NULL DEFAULT \'\', fileSize INTEGER NOT NULL DEFAULT 0, fromName TEXT NOT NULL DEFAULT \'\', peerId TEXT NOT NULL DEFAULT \'\', fromMe INTEGER NOT NULL DEFAULT 1, ts INTEGER NOT NULL)',
         );
@@ -261,6 +263,10 @@ class ChatDb {
               'ALTER TABLE collection_items ADD COLUMN peerId TEXT NOT NULL DEFAULT \'\'',
             );
           }
+        }
+        if (oldV < 13) {
+          // 剪贴板按日期筛选/排序走索引 (原来全表扫描+排序)
+          await d.execute('CREATE INDEX idx_clip_ts ON clip_items(ts)');
         }
       },
     );
