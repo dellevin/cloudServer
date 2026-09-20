@@ -382,10 +382,21 @@ class _RemoteFsPageState extends State<RemoteFsPage> {
                               ),
                               subtitle: isDir
                                   ? null
+                                  : pulling
+                                  ? ValueListenableBuilder<int>(
+                                      // 订阅轻量进度 tick: 传输中的进度推进
+                                      // 不走 notifyListeners, 不订阅则百分比冻结
+                                      valueListenable: c.progressTick,
+                                      builder: (context, _, _) => Text(
+                                        '${_fmt(e['size'] as int? ?? 0)} · ${(pending.progress * 100).toStringAsFixed(0)}%',
+                                        style: const TextStyle(
+                                          fontSize: 11,
+                                          color: AppTheme.grey,
+                                        ),
+                                      ),
+                                    )
                                   : Text(
-                                      pulling
-                                          ? '${_fmt(e['size'] as int? ?? 0)} · ${(pending.progress * 100).toStringAsFixed(0)}%'
-                                          : _fmt(e['size'] as int? ?? 0),
+                                      _fmt(e['size'] as int? ?? 0),
                                       style: const TextStyle(
                                         fontSize: 11,
                                         color: AppTheme.grey,

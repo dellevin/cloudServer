@@ -245,26 +245,31 @@ class _RemoteFilePageState extends State<RemoteFilePage> {
                   ],
                 )
               : _pulling
-              ? Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    LinearProgressIndicator(
-                      value: t == null || t.progress <= 0 ? null : t.progress,
-                      color: AppTheme.green,
-                      backgroundColor: AppTheme.green.withValues(alpha: 0.12),
-                      borderRadius: BorderRadius.circular(3),
-                    ),
-                    const SizedBox(height: 8),
-                    Text(
-                      t == null
-                          ? '…'
-                          : '${(t.progress * 100).toStringAsFixed(0)}%',
-                      style: const TextStyle(
-                        fontSize: 12,
-                        color: AppTheme.grey,
+              // 订阅轻量进度 tick: 传输中的进度推进不走 notifyListeners
+              // (节流设计), 不订阅的话进度会一直冻在开始时的 0%
+              ? ValueListenableBuilder<int>(
+                  valueListenable: c.progressTick,
+                  builder: (context, _, _) => Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      LinearProgressIndicator(
+                        value: t == null || t.progress <= 0 ? null : t.progress,
+                        color: AppTheme.green,
+                        backgroundColor: AppTheme.green.withValues(alpha: 0.12),
+                        borderRadius: BorderRadius.circular(3),
                       ),
-                    ),
-                  ],
+                      const SizedBox(height: 8),
+                      Text(
+                        t == null
+                            ? '…'
+                            : '${(t.progress * 100).toStringAsFixed(0)}%',
+                        style: const TextStyle(
+                          fontSize: 12,
+                          color: AppTheme.grey,
+                        ),
+                      ),
+                    ],
+                  ),
                 )
               : FilledButton.icon(
                   onPressed: _startDownload,
