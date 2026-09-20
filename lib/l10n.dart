@@ -141,8 +141,13 @@ const Map<String, String> _zh = {
   'dir_saved_to': '文件保存于: {dir}',
   'open_folder_fail': '无法打开文件夹',
   'clear_cache': '清除缓存',
-  'clear_cache_msg': '将清空临时文件 (含文件选择器复制的文件副本)，不影响已接收保存的文件。',
+  'clear_cache_msg': '将清空 {size} 临时文件，不影响已接收保存的文件和聊天记录。',
   'cache_cleared': '缓存已清除',
+  'cache_partial': '部分文件正在使用中，已跳过',
+  'cache_cat_preview': '预览临时文件',
+  'cache_cat_picker': '发送文件副本',
+  'cache_cat_other': '其他缓存',
+  'cache_sheet_hint': '「发送文件副本」清除后，聊天里对应的已发文件将无法打开；不影响已接收保存的文件。',
   'queue_sends': '多文件排队发送',
   'compress_images': '发送图片前压缩',
   'dark_mode': '深色模式',
@@ -310,8 +315,7 @@ const Map<String, String> _zh = {
   'say_hello': '开始和 {name} 聊天吧',
   'input_hint': '输入消息…',
   'send': '发送',
-  'offline_cant_send': '对方不在线,无法发送消息',
-  'offline_may_fail': '对方当前离线，消息可能无法送达',
+  'offline_may_fail': '对方当前离线，消息将在对方上线后送达',
   'drop_to_send': '松开鼠标发送文件',
   'sent_files': '已发送{n}个文件请求',
   'offline_files': '对方不在线, 无法发送文件',
@@ -367,6 +371,16 @@ const Map<String, String> _zh = {
   'download_original': '下载原图',
   'qr_pick_lan': '有多个局域网网段，选择对方所在的网段',
   'mark_read': '标记已读',
+
+  // ---- 收藏 ----
+  'collection': '收藏',
+  'collect': '收藏',
+  'collected': '已收藏',
+  'collect_fail': '收藏失败，文件已不存在',
+  'uncollect': '取消收藏',
+  'uncollected': '已取消收藏',
+  'collection_empty': '暂无收藏\n长按消息或左滑传输记录即可收藏',
+  'collection_hint': '收藏的消息和文件',
 
   // ---- 压缩包预览页 ----
   'zip_read_fail': '无法读取压缩包 (可能已损坏或不是 zip 格式)',
@@ -526,8 +540,14 @@ const Map<String, String> _en = {
   'open_folder_fail': 'Cannot open folder',
   'clear_cache': 'Clear cache',
   'clear_cache_msg':
-      'Clears temporary files (including copies made by the file picker). Received files are not affected.',
+      'This will clear {size} of temporary files. Received files and chats are not affected.',
   'cache_cleared': 'Cache cleared',
+  'cache_partial': 'Some files are in use and were skipped',
+  'cache_cat_preview': 'Preview temp files',
+  'cache_cat_picker': 'Sent file copies',
+  'cache_cat_other': 'Other cache',
+  'cache_sheet_hint':
+      'Clearing "Sent file copies" means those files can no longer be opened from chat bubbles. Received files are not affected.',
   'queue_sends': 'Queue multiple file sends',
   'compress_images': 'Compress images before sending',
   'dark_mode': 'Dark mode',
@@ -712,8 +732,8 @@ const Map<String, String> _en = {
   'say_hello': 'Start chatting with {name}',
   'input_hint': 'Type a message…',
   'send': 'Send',
-  'offline_cant_send': 'The peer is offline, cannot send messages',
-  'offline_may_fail': 'The peer is offline, messages may not be delivered',
+  'offline_may_fail':
+      'The peer is offline — message will be delivered when they come online',
   'drop_to_send': 'Release to send files',
   'sent_files': 'Sent {n} file requests',
   'offline_files': 'Peer is offline, cannot send files',
@@ -770,6 +790,17 @@ const Map<String, String> _en = {
   'download_original': 'Download original',
   'qr_pick_lan': 'Multiple LAN subnets — pick the peer\'s network',
   'mark_read': 'Mark read',
+
+  // ---- collection ----
+  'collection': 'Favorites',
+  'collect': 'Favorite',
+  'collected': 'Added to favorites',
+  'collect_fail': 'Cannot favorite — file no longer exists',
+  'uncollect': 'Remove',
+  'uncollected': 'Removed from favorites',
+  'collection_empty':
+      'No favorites yet\nLong-press a message or swipe a transfer to favorite',
+  'collection_hint': 'Saved messages and files',
 
   // ---- zip preview page ----
   'zip_read_fail': 'Cannot read the archive',

@@ -18,6 +18,7 @@ import 'ui/chat_search_page.dart';
 import 'ui/blocklist_page.dart';
 import 'ui/clip_exts_page.dart';
 import 'ui/clipboard_page.dart';
+import 'ui/collection_page.dart';
 import 'ui/devices_page.dart';
 import 'ui/file_preview_page.dart';
 import 'ui/log_page.dart';
@@ -645,6 +646,7 @@ class _CloudSendAppState extends State<CloudSendApp> {
           '/remote_fs': (_) => const RemoteFsPage(),
           '/remote_file': (_) => const RemoteFilePage(),
           '/remote_image': (_) => const RemoteImagePage(),
+          '/collection': (_) => const CollectionPage(),
           '/settings_conn': (_) => const ConnSettingsPage(),
           '/settings_general': (_) => const GeneralSettingsPage(),
           '/settings_clip': (_) => const ClipSettingsPage(),

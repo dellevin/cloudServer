@@ -621,6 +621,7 @@ class RelayClient extends ChangeNotifier {
       for (final t in transfers) {
         _transferIdx[t.transferId] = t;
       }
+      collection.addAll(await ChatDb.loadCollection());
       // 恢复失败接收传输的已收字节: .part/分片还在就可以断点续传
       for (final t in transfers) {
         if (!t.outgoing &&
@@ -2702,34 +2703,127 @@ class RelayClient extends ChangeNotifier {
     return Directory('${dir.path}${Platform.pathSeparator}cloudSend');
   }
 
-  /// 缓存总大小 (字节)
-  Future<int> cacheSize() async {
+  /// 缓存分类: 预览临时文件 (preview/ + streams/, 重启本就会自动清);
+  /// 发送文件副本 (file_picker/ 选择器复制 + compressed/ 压缩图 — 聊天里
+  /// 打开/重发已发文件要用, 清了那些气泡的文件会打不开);
+  /// 其他 (失败残留的 zip 临时包等)
+  static const cacheCatPreview = 'preview';
+  static const cacheCatPicker = 'picker';
+  static const cacheCatOther = 'other';
+
+  static String _cacheCategory(String name) => switch (name) {
+    'preview' || 'streams' => cacheCatPreview,
+    'file_picker' || 'compressed' => cacheCatPicker,
+    _ => cacheCatOther,
+  };
+
+  /// 各分类缓存大小 (字节): key = cacheCat*
+  Future<Map<String, int>> cacheSizeByCategory() async {
+    final map = {cacheCatPreview: 0, cacheCatPicker: 0, cacheCatOther: 0};
     try {
       final dir = await _cacheDir();
-      if (!await dir.exists()) return 0;
-      var total = 0;
-      await for (final e in dir.list(recursive: true, followLinks: false)) {
-        if (e is File) total += await e.length();
+      if (!await dir.exists()) return map;
+      await for (final e in dir.list(followLinks: false)) {
+        final name = e.path.split(Platform.pathSeparator).last;
+        final cat = _cacheCategory(name);
+        map[cat] = map[cat]! + await _entitySize(e);
       }
-      return total;
-    } catch (_) {
-      return 0;
-    }
+    } catch (_) {}
+    return map;
   }
 
-  /// 清空缓存内容 (不影响下载目录中已接收的文件)
-  Future<void> clearCache() async {
+  static Future<int> _entitySize(FileSystemEntity e) async {
+    try {
+      if (e is File) return await e.length();
+      if (e is Directory) {
+        var total = 0;
+        await for (final f in e.list(recursive: true, followLinks: false)) {
+          if (f is File) total += await f.length();
+        }
+        return total;
+      }
+    } catch (_) {}
+    return 0;
+  }
+
+  /// 正在使用中的缓存文件 (清除时跳过, 防清掉正在读写的文件毁掉传输/播放):
+  /// 活跃流式会话的稀疏缓存 + 未终结且落在缓存里的传输目标文件
+  Set<String> _busyCachePaths(String cacheRoot) {
+    final busy = <String>{};
+    for (final s in _streamRecv.values) {
+      busy.add(s.file.path);
+    }
+    for (final t in transfers) {
+      final p = t.savePath;
+      if (p == null || !p.startsWith(cacheRoot)) continue;
+      if (t.status == TransferStatus.waiting ||
+          t.status == TransferStatus.accepted ||
+          t.status == TransferStatus.transferring ||
+          t.status == TransferStatus.verifying) {
+        busy.add(p);
+      }
+    }
+    return busy;
+  }
+
+  /// path 是否命中使用中集合 (含 .part 临时与 .segN/.seghash 分片后缀)
+  static bool _isBusyPath(String path, Set<String> busy) {
+    for (final b in busy) {
+      if (path == b || path.startsWith('$b.part') || path.startsWith('$b.seg')) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /// 清空缓存 (categories 指定分类, null = 全部), 不影响下载目录中已接收的
+  /// 文件; 跳过使用中文件。返回 false = 有文件因正在使用被保留
+  Future<bool> clearCache({Set<String>? categories}) async {
+    var allCleared = true;
     try {
       final dir = await _cacheDir();
-      if (await dir.exists()) {
-        await for (final e in dir.list(followLinks: false)) {
+      if (!await dir.exists()) return true;
+      final busy = _busyCachePaths(dir.path);
+      await for (final e in dir.list(followLinks: false)) {
+        final name = e.path.split(Platform.pathSeparator).last;
+        if (categories != null && !categories.contains(_cacheCategory(name))) {
+          continue;
+        }
+        if (_isBusyPath(e.path, busy)) {
+          allCleared = false;
+          continue;
+        }
+        if (e is Directory) {
+          if (!await _deleteDirUnbusy(e, busy)) allCleared = false;
+        } else {
           try {
-            await e.delete(recursive: true);
+            await e.delete();
           } catch (_) {}
         }
       }
     } catch (_) {}
     notifyListeners();
+    return allCleared;
+  }
+
+  /// 删目录内非使用中条目; 全部删光才删目录本身。返回 false = 有跳过
+  Future<bool> _deleteDirUnbusy(Directory dir, Set<String> busy) async {
+    var all = true;
+    await for (final e in dir.list(followLinks: false)) {
+      if (_isBusyPath(e.path, busy)) {
+        all = false;
+        continue;
+      }
+      try {
+        await e.delete(recursive: true);
+      } catch (_) {}
+    }
+    if (all) {
+      try {
+        await dir.delete();
+      } catch (_) {}
+    }
+    return all;
   }
 
   /// 预览临时文件的存放目录 (缓存子目录, 重启清空; 与下载目录隔离,
@@ -2742,17 +2836,24 @@ class RelayClient extends ChangeNotifier {
     return dir;
   }
 
-  /// 启动时清空上次的预览临时文件 (含没收完的 .part 与流式稀疏缓存)
+  /// 启动时清空上次的预览临时文件 (含没收完的 .part 与流式稀疏缓存),
+  /// 顺带删缓存根目录超过 7 天的 zip 残留 (发送失败的文件夹临时包:
+  /// 没有重试入口, 留着只会越积越多; 刚建的正常包 mtime 很新不受影响)
   Future<void> _purgePreviewCache() async {
     try {
-      final dir = Directory(
-        '${(await _cacheDir()).path}${Platform.pathSeparator}preview',
-      );
-      if (await dir.exists()) await dir.delete(recursive: true);
-      final sdir = Directory(
-        '${(await _cacheDir()).path}${Platform.pathSeparator}streams',
-      );
-      if (await sdir.exists()) await sdir.delete(recursive: true);
+      final cache = await _cacheDir();
+      for (final sub in const ['preview', 'streams']) {
+        final dir = Directory('${cache.path}${Platform.pathSeparator}$sub');
+        if (await dir.exists()) await dir.delete(recursive: true);
+      }
+      if (!await cache.exists()) return;
+      final cutoff = DateTime.now().subtract(const Duration(days: 7));
+      await for (final e in cache.list(followLinks: false)) {
+        if (e is! File || !e.path.endsWith('.zip')) continue;
+        try {
+          if ((await e.lastModified()).isBefore(cutoff)) await e.delete();
+        } catch (_) {}
+      }
     } catch (_) {}
   }
 
@@ -3082,6 +3183,146 @@ class RelayClient extends ChangeNotifier {
     );
     await dir.create(recursive: true);
     return dir.path;
+  }
+
+  // ---------- 收藏 (文本/文件, 文件复制进收藏目录) ----------
+
+  /// 收藏条目列表 (时间倒序, 启动时从 DB 恢复)
+  final List<CollectionItem> collection = [];
+
+  /// 收藏文件的保存目录: 下载目录/cloudSend/collection
+  Future<String> collectionDir() async {
+    final dir = Directory(
+      '${await downloadDir()}${Platform.pathSeparator}collection',
+    );
+    await dir.create(recursive: true);
+    return dir.path;
+  }
+
+  /// 收藏一条文本消息
+  Future<void> collectText(
+    String text,
+    String fromName, {
+    String peerId = '',
+    bool fromMe = true,
+  }) async {
+    if (text.isEmpty) return;
+    final item = CollectionItem(
+      kind: 'text',
+      content: text,
+      fromName: fromName,
+      peerId: peerId,
+      fromMe: fromMe,
+      ts: DateTime.now().millisecondsSinceEpoch,
+    );
+    final id = await ChatDb.insertCollection(item);
+    collection.insert(
+      0,
+      CollectionItem(
+        id: id,
+        kind: item.kind,
+        content: item.content,
+        fromName: item.fromName,
+        peerId: item.peerId,
+        fromMe: item.fromMe,
+        ts: item.ts,
+      ),
+    );
+    notifyListeners();
+  }
+
+  /// 收藏一个文件: 复制到收藏目录 (重名自动加序号), 返回是否成功
+  /// (源文件不存在 — 比如已被清理 — 返回 false)
+  Future<bool> collectTransfer(
+    FileTransfer t,
+    String fromName, {
+    String peerId = '',
+    bool fromMe = true,
+  }) async {
+    final src = t.savePath;
+    if (src == null || !await File(src).exists()) return false;
+    return _collectFileCore(
+      src,
+      t.fileName,
+      t.fileSize,
+      fromName,
+      peerId,
+      fromMe,
+    );
+  }
+
+  /// 收藏页 + 号直接添加本地文件
+  Future<bool> collectFile(String path, String fromName) async {
+    final f = File(path);
+    if (!await f.exists()) return false;
+    final name = path.split(RegExp(r'[\\/]')).last;
+    return _collectFileCore(path, name, await f.length(), fromName, '', true);
+  }
+
+  /// 收藏文件的核心: 复制进收藏目录 (重名自动加序号) 并入库
+  Future<bool> _collectFileCore(
+    String srcPath,
+    String fileName,
+    int fileSize,
+    String fromName,
+    String peerId,
+    bool fromMe,
+  ) async {
+    final dir = await collectionDir();
+    var name = fileName;
+    final dot = name.lastIndexOf('.');
+    final stem = dot > 0 ? name.substring(0, dot) : name;
+    final ext = dot > 0 ? name.substring(dot) : '';
+    var dest = '$dir${Platform.pathSeparator}$name';
+    for (var i = 1; await File(dest).exists(); i++) {
+      name = '$stem ($i)$ext';
+      dest = '$dir${Platform.pathSeparator}$name';
+    }
+    try {
+      await File(srcPath).copy(dest);
+    } catch (_) {
+      return false;
+    }
+    final item = CollectionItem(
+      kind: 'file',
+      content: dest,
+      fileName: name,
+      fileSize: fileSize,
+      fromName: fromName,
+      peerId: peerId,
+      fromMe: fromMe,
+      ts: DateTime.now().millisecondsSinceEpoch,
+    );
+    final id = await ChatDb.insertCollection(item);
+    collection.insert(
+      0,
+      CollectionItem(
+        id: id,
+        kind: item.kind,
+        content: item.content,
+        fileName: item.fileName,
+        fileSize: item.fileSize,
+        fromName: item.fromName,
+        peerId: item.peerId,
+        fromMe: item.fromMe,
+        ts: item.ts,
+      ),
+    );
+    notifyListeners();
+    return true;
+  }
+
+  /// 取消收藏: 删 DB 记录; 文件类连收藏目录里的副本一起删
+  Future<void> deleteCollectionItem(CollectionItem item) async {
+    if (item.id != null) await ChatDb.deleteCollection(item.id!);
+    if (item.kind == 'file') {
+      try {
+        final f = File(item.content);
+        if (await f.exists()) await f.delete();
+      } catch (_) {}
+    }
+    collection.removeWhere((e) => e.id == item.id);
+    notifyListeners();
   }
 
   /// 收到对端剪贴板文本: 仅信任设备; 默认只进列表,

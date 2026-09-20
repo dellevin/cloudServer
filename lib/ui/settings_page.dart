@@ -677,7 +677,8 @@ class _ServerStatusTile extends StatelessWidget {
   }
 }
 
-/// 清除缓存条目: 显示缓存大小, 点击弹确认后清空
+/// 清除缓存条目: 显示缓存总大小, 点击弹分类管理面板 (各分类大小 +
+/// 分别清理 + 全部清理); 确认弹窗带大小; 使用中文件自动跳过
 /// (Android 上 file_picker 会把选中的文件复制到缓存目录, 发文件后缓存会变大)
 class _ClearCacheTile extends StatefulWidget {
   const _ClearCacheTile();
@@ -687,7 +688,7 @@ class _ClearCacheTile extends StatefulWidget {
 }
 
 class _ClearCacheTileState extends State<_ClearCacheTile> {
-  int? _bytes;
+  Map<String, int>? _sizes;
 
   @override
   void initState() {
@@ -696,8 +697,8 @@ class _ClearCacheTileState extends State<_ClearCacheTile> {
   }
 
   Future<void> _load() async {
-    final b = await context.read<RelayClient>().cacheSize();
-    if (mounted) setState(() => _bytes = b);
+    final s = await context.read<RelayClient>().cacheSizeByCategory();
+    if (mounted) setState(() => _sizes = s);
   }
 
   static String _fmt(int b) {
@@ -709,21 +710,202 @@ class _ClearCacheTileState extends State<_ClearCacheTile> {
     return '${(b / 1024 / 1024 / 1024).toStringAsFixed(2)} GB';
   }
 
-  Future<void> _confirmClear(RelayClient c) async {
+  int get _total => _sizes?.values.fold<int>(0, (a, b) => a + b) ?? 0;
+
+  /// 确认 (弹窗带大小) → 清理 → 刷新; 有使用中文件被跳过时提示
+  Future<void> _clear(
+    RelayClient c,
+    Set<String>? categories,
+    int size,
+  ) async {
     final ok = await AppDialog.confirm(
       context,
       title: tr('clear_cache'),
-      message: tr('clear_cache_msg'),
+      message: trf('clear_cache_msg', {'size': _fmt(size)}),
       okLabel: tr('clear'),
       danger: true,
     );
-    if (ok) {
-      await c.clearCache();
-      await _load();
-      if (mounted) {
-        AppToast.show(context, tr('cache_cleared'));
-      }
+    if (!ok) return;
+    final all = await c.clearCache(categories: categories);
+    await _load();
+    if (mounted) {
+      AppToast.show(context, tr(all ? 'cache_cleared' : 'cache_partial'));
     }
+  }
+
+  /// 分类管理面板: 各分类大小 + 分别清理, 底部全部清理
+  void _showSheet(RelayClient c) {
+    AppDialog.custom(
+      context,
+      title: tr('clear_cache'),
+      child: StatefulBuilder(
+        builder: (ctx, setSheet) {
+          final s = _sizes;
+          if (s == null) {
+            return const Padding(
+              padding: EdgeInsets.all(24),
+              child: Center(
+                child: SizedBox(
+                  width: 22,
+                  height: 22,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+              ),
+            );
+          }
+          Future<void> clearAndRefresh(Set<String>? cats, int size) async {
+            await _clear(c, cats, size);
+            setSheet(() {}); // _sizes 已刷新, 重画面板
+          }
+
+          return Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 14),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  tr('cache_sheet_hint'),
+                  style: const TextStyle(
+                    fontSize: 11.5,
+                    color: AppTheme.grey,
+                    height: 1.5,
+                  ),
+                ),
+                const SizedBox(height: 10),
+                _catRow(
+                  ctx,
+                  label: tr('cache_cat_preview'),
+                  size: s[RelayClient.cacheCatPreview]!,
+                  onClear: () => clearAndRefresh({
+                    RelayClient.cacheCatPreview,
+                  }, s[RelayClient.cacheCatPreview]!),
+                ),
+                const SizedBox(height: 6),
+                _catRow(
+                  ctx,
+                  label: tr('cache_cat_picker'),
+                  size: s[RelayClient.cacheCatPicker]!,
+                  onClear: () => clearAndRefresh({
+                    RelayClient.cacheCatPicker,
+                  }, s[RelayClient.cacheCatPicker]!),
+                ),
+                const SizedBox(height: 6),
+                _catRow(
+                  ctx,
+                  label: tr('cache_cat_other'),
+                  size: s[RelayClient.cacheCatOther]!,
+                  onClear: () => clearAndRefresh({
+                    RelayClient.cacheCatOther,
+                  }, s[RelayClient.cacheCatOther]!),
+                ),
+                const SizedBox(height: 10),
+                // 全部清理 (浅红块, 与删除设备同款)
+                Material(
+                  color: AppTheme.red.withValues(alpha: 0.08),
+                  borderRadius: BorderRadius.circular(10),
+                  clipBehavior: Clip.antiAlias,
+                  child: InkWell(
+                    onTap: _total == 0
+                        ? null
+                        : () => clearAndRefresh(null, _total),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        vertical: 12,
+                        horizontal: 14,
+                      ),
+                      child: Row(
+                        children: [
+                          Expanded(
+                            child: Text(
+                              '${tr('clear_all')} (${_fmt(_total)})',
+                              style: const TextStyle(
+                                fontSize: 14.5,
+                                fontWeight: FontWeight.w500,
+                                color: AppTheme.red,
+                              ),
+                            ),
+                          ),
+                          const Icon(
+                            Icons.delete_outline,
+                            size: 18,
+                            color: AppTheme.red,
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  /// 分类行: 圆角灰块, 左名称+大小, 右清除胶囊 (0 字节置灰)
+  Widget _catRow(
+    BuildContext ctx, {
+    required String label,
+    required int size,
+    required VoidCallback onClear,
+  }) {
+    return Material(
+      color: AppTheme.softOf(ctx),
+      borderRadius: BorderRadius.circular(10),
+      clipBehavior: Clip.antiAlias,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 14),
+        child: Row(
+          children: [
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    label,
+                    style: TextStyle(
+                      fontSize: 14.5,
+                      fontWeight: FontWeight.w500,
+                      color: AppTheme.inkOf(ctx),
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    _fmt(size),
+                    style: const TextStyle(fontSize: 11.5, color: AppTheme.grey),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 10),
+            GestureDetector(
+              onTap: size == 0 ? null : onClear,
+              child: Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 5,
+                ),
+                decoration: BoxDecoration(
+                  color: size == 0
+                      ? AppTheme.grey.withValues(alpha: 0.15)
+                      : AppTheme.green.withValues(alpha: 0.12),
+                  borderRadius: BorderRadius.circular(13),
+                ),
+                child: Text(
+                  tr('clear'),
+                  style: TextStyle(
+                    fontSize: 12.5,
+                    fontWeight: FontWeight.w500,
+                    color: size == 0 ? AppTheme.grey : AppTheme.green,
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   @override
@@ -731,8 +913,8 @@ class _ClearCacheTileState extends State<_ClearCacheTile> {
     final c = context.read<RelayClient>();
     return _Tile(
       title: tr('clear_cache'),
-      value: _bytes == null ? '…' : _fmt(_bytes!),
-      onTap: () => _confirmClear(c),
+      value: _sizes == null ? '…' : _fmt(_total),
+      onTap: () => _showSheet(c),
     );
   }
 }

@@ -204,6 +204,55 @@ class _QrPairPageState extends State<QrPairPage> {
     );
   }
 
+  /// 网段选择胶囊卡: 选中绿底白字 (IP 等宽字体 + 网卡名小字),
+  /// 未选卡片底色描边, 与 _segTab 同一套视觉
+  Widget _lanChip(int i) {
+    final (ip, ifname) = _lanAddrs[i];
+    final selected = _lanSel.clamp(0, _lanAddrs.length - 1) == i;
+    return Material(
+      color: selected ? AppTheme.green : AppTheme.softOf(context),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(10),
+        side: BorderSide(
+          color: selected ? AppTheme.green : AppTheme.lineOf(context),
+        ),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: () => setState(() => _lanSel = i),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                ip,
+                style: TextStyle(
+                  fontSize: 12.5,
+                  fontFamily: 'monospace',
+                  fontWeight: FontWeight.w600,
+                  color: selected ? Colors.white : AppTheme.inkOf(context),
+                ),
+              ),
+              if (ifname.isNotEmpty) ...[
+                const SizedBox(height: 1),
+                Text(
+                  ifname,
+                  style: TextStyle(
+                    fontSize: 10,
+                    color: selected
+                        ? Colors.white.withValues(alpha: 0.75)
+                        : AppTheme.grey,
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _qrCard(
     BuildContext context,
     ({
@@ -236,45 +285,20 @@ class _QrPairPageState extends State<QrPairPage> {
             ),
             const SizedBox(height: 12),
           ],
-          // 多网卡/多网段: 下拉选对方所在网段, 二维码跟随切换
+          // 多网卡/多网段: 胶囊选择卡切换网段 (与页签同风格), 二维码跟随切换
           if (item.isLan && _lanAddrs.length > 1) ...[
             Text(
               tr('qr_pick_lan'),
               style: const TextStyle(fontSize: 11, color: AppTheme.grey),
             ),
-            const SizedBox(height: 6),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 10),
-              decoration: BoxDecoration(
-                color: AppTheme.softOf(context),
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: DropdownButtonHideUnderline(
-                child: DropdownButton<int>(
-                  value: _lanSel.clamp(0, _lanAddrs.length - 1),
-                  isDense: true,
-                  dropdownColor: AppTheme.cardOf(context),
-                  items: [
-                    for (var i = 0; i < _lanAddrs.length; i++)
-                      DropdownMenuItem(
-                        value: i,
-                        child: Text(
-                          _lanAddrs[i].$2.isNotEmpty
-                              ? '${_lanAddrs[i].$1} · ${_lanAddrs[i].$2}'
-                              : _lanAddrs[i].$1,
-                          style: TextStyle(
-                            fontSize: 12.5,
-                            fontFamily: 'monospace',
-                            color: AppTheme.inkOf(context),
-                          ),
-                        ),
-                      ),
-                  ],
-                  onChanged: (v) {
-                    if (v != null) setState(() => _lanSel = v);
-                  },
-                ),
-              ),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              alignment: WrapAlignment.center,
+              children: [
+                for (var i = 0; i < _lanAddrs.length; i++) _lanChip(i),
+              ],
             ),
             const SizedBox(height: 12),
           ],

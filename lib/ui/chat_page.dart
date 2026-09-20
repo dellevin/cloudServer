@@ -1,5 +1,4 @@
 import 'dart:io';
-import 'dart:math' as math;
 
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
@@ -20,15 +19,10 @@ import '../main.dart';
 import '../models.dart';
 import 'app_dialog.dart';
 import 'app_toast.dart';
+import 'bubble_menu.dart';
 import 'file_preview_page.dart';
 import 'slidable_close.dart';
 import 'video_thumbs.dart';
-
-/// 取 widget 在屏幕上的全局矩形 (长按菜单定位用)
-Rect _rectOf(BuildContext ctx) {
-  final box = ctx.findRenderObject() as RenderBox;
-  return box.localToGlobal(Offset.zero) & box.size;
-}
 
 /// 聊天标签页: 显示有会话记录的对端列表 (微信风格通栏列表)
 class ChatsTabPage extends StatelessWidget {
@@ -100,16 +94,26 @@ class ChatsTabPage extends StatelessWidget {
     final lastTs = _lastTsMap(c);
     final lastFiles = _lastFileByPeer(c);
     final ids = lastTs.keys.toList()
-      ..sort((a, b) => lastTs[b]!.compareTo(lastTs[a]!));
+      // 在线的排前面, 组内再按最后活动时间倒序 (上下线变化会触发重排)
+      ..sort((a, b) {
+        final onlineA = c.isOnline(a);
+        final onlineB = c.isOnline(b);
+        if (onlineA != onlineB) return onlineA ? -1 : 1;
+        return lastTs[b]!.compareTo(lastTs[a]!);
+      });
     return RefreshIndicator(
       color: AppTheme.green,
       onRefresh: () => c.refreshPeers(),
       child: ids.isEmpty
-          // 空态用可滚动容器包一层, 否则无法下拉
+          // 空态用可滚动容器包一层, 否则无法下拉; 收藏入口固定在最上面
           ? ListView(
               physics: const AlwaysScrollableScrollPhysics(),
               children: [
-                SizedBox(height: MediaQuery.of(context).size.height * 0.25),
+                Material(
+                  color: AppTheme.cardOf(context),
+                  child: const _CollectionEntry(),
+                ),
+                SizedBox(height: MediaQuery.of(context).size.height * 0.2),
                 _Empty(icon: Icons.forum_outlined, text: tr('no_chats')),
               ],
             )
@@ -119,7 +123,8 @@ class ChatsTabPage extends StatelessWidget {
                 child: ListView.separated(
                   // 列表不足一屏时也能下拉
                   physics: const AlwaysScrollableScrollPhysics(),
-                  itemCount: ids.length,
+                  // 第 0 项是固定的「收藏」入口 (不可滑动/删除), 后面才是会话
+                  itemCount: ids.length + 1,
                   // 分隔线从名字左缘开始 (16 边距 + 48 头像 + 12 间距)
                   separatorBuilder: (_, _) => Divider(
                     height: 1,
@@ -127,7 +132,8 @@ class ChatsTabPage extends StatelessWidget {
                     color: AppTheme.lineOf(context),
                   ),
                   itemBuilder: (_, i) {
-                    final id = ids[i];
+                    if (i == 0) return const _CollectionEntry();
+                    final id = ids[i - 1];
                     final msgs = c.chats[id]!;
                     final last = _lastPreview(id, msgs, lastFiles[id]);
                     final n = c.unread[id] ?? 0;
@@ -348,11 +354,79 @@ class _ConversationAvatar extends StatelessWidget {
   }
 }
 
+/// 会话列表顶部固定的「收藏」入口: 不可滑动/删除, 星星图标 + 最新收藏预览
+class _CollectionEntry extends StatelessWidget {
+  const _CollectionEntry();
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.watch<RelayClient>();
+    // 最新一条收藏做副标题预览; 没有收藏时显示提示语
+    final latest = c.collection.isNotEmpty ? c.collection.first : null;
+    final preview = latest == null
+        ? tr('collection_hint')
+        : latest.kind == 'text'
+            ? latest.content
+            : latest.fileName;
+    return InkWell(
+      onTap: () => Navigator.pushNamed(context, '/collection'),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // 图标用 assets/collection.png, 底色统一中性灰 (不用多彩底色)
+            Container(
+              width: 48,
+              height: 48,
+              alignment: Alignment.center,
+              decoration: BoxDecoration(
+                color: AppTheme.softOf(context),
+                borderRadius: BorderRadius.circular(4),
+              ),
+              child: Image.asset(
+                'assets/collection.png',
+                width: 26,
+                height: 26,
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const SizedBox(height: 1),
+                  Text(
+                    tr('collection'),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.w500,
+                      color: AppTheme.inkOf(context),
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    preview,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontSize: 14, color: AppTheme.grey),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class _Empty extends StatelessWidget {
   final IconData icon;
   final String text;
   const _Empty({required this.icon, required this.text});
-
   @override
   Widget build(BuildContext context) {
     return Center(
@@ -668,6 +742,8 @@ class _ChatPageState extends State<ChatPage> {
   /// 桌面端: 拖文件进窗口直接发送
   Widget _buildDropTarget(Widget child) {
     if (!_dropEnabled) return child;
+    // 离线不能传文件: 整个拖放目标不启用 (系统直接显示禁止光标)
+    if (!context.read<RelayClient>().isOnline(peerId!)) return child;
     return DropTarget(
       onDragEntered: (_) => setState(() => _dragging = true),
       onDragExited: (_) => setState(() => _dragging = false),
@@ -740,6 +816,8 @@ class _ChatPageState extends State<ChatPage> {
     // 有更早历史时, 顶部多一行加载指示 (reverse 列表的最后一个 index)
     final itemCount = items.length + (c.hasMoreHistory[peerId] == true ? 1 : 0);
     _scheduleBadgeUpdate(itemCount);
+    // 离线: 文本可发 (排队补发), + 号文件面板禁用
+    final online = c.isOnline(peerId!);
     return Container(
       color: AppTheme.chatBgOf(context),
       child: Column(
@@ -852,9 +930,9 @@ class _ChatPageState extends State<ChatPage> {
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  // 任一通道可达 (中继或局域网直连) 即可发送
-                  c.isOnline(peerId!)
-                      ? Padding(
+                  // 文本消息离线也能发 (本地留存, 对方上线自动重发);
+                  // 只有 + 号文件面板必须在线 (文件传输无法排队补发)
+                  Padding(
                           padding: const EdgeInsets.fromLTRB(8, 8, 8, 8),
                           child: Row(
                             crossAxisAlignment: CrossAxisAlignment.end,
@@ -925,18 +1003,28 @@ class _ChatPageState extends State<ChatPage> {
                                 padding: const EdgeInsets.only(bottom: 2),
                                 child: InkWell(
                                   borderRadius: BorderRadius.circular(20),
-                                  onTap: () {
-                                    FocusScope.of(context).unfocus();
-                                    setState(() => _showPanel = !_showPanel);
-                                  },
+                                  // 离线时 + 号不可点: 文件传输不能排队,
+                                  // 面板开着也会被收起 (下面 panel 构建处)
+                                  onTap: online
+                                      ? () {
+                                          FocusScope.of(context).unfocus();
+                                          setState(
+                                            () => _showPanel = !_showPanel,
+                                          );
+                                        }
+                                      : null,
                                   child: Padding(
                                     padding: const EdgeInsets.all(4),
                                     child: Icon(
-                                      _showPanel
+                                      _showPanel && online
                                           ? Icons.cancel_outlined
                                           : Icons.add_circle_outline,
                                       size: 30,
-                                      color: AppTheme.isDark(context)
+                                      color: !online
+                                          ? AppTheme.grey.withValues(
+                                              alpha: 0.35,
+                                            )
+                                          : AppTheme.isDark(context)
                                           ? AppTheme.grey
                                           : const Color(0xFF555555),
                                     ),
@@ -971,18 +1059,6 @@ class _ChatPageState extends State<ChatPage> {
                               ),
                             ],
                           ),
-                        )
-                      : Container(
-                          width: double.infinity,
-                          padding: const EdgeInsets.symmetric(vertical: 14),
-                          alignment: Alignment.center,
-                          child: Text(
-                            tr('offline_cant_send'),
-                            style: const TextStyle(
-                              fontSize: 13,
-                              color: AppTheme.grey,
-                            ),
-                          ),
                         ),
                   // + 号面板: 展开/收起带高度+淡入动画
                   AnimatedSwitcher(
@@ -994,7 +1070,8 @@ class _ChatPageState extends State<ChatPage> {
                       axisAlignment: -1,
                       child: FadeTransition(opacity: anim, child: child),
                     ),
-                    child: _showPanel
+                    // 离线时 + 号不可点, 已展开的面板也一并收起
+                    child: _showPanel && online
                         ? KeyedSubtree(
                             key: const ValueKey('panel'),
                             child: _buildPanel(),
@@ -1314,7 +1391,23 @@ class _ChatPageState extends State<ChatPage> {
         t.status == TransferStatus.accepted ||
         t.status == TransferStatus.transferring ||
         t.status == TransferStatus.verifying;
-    _showBubbleMenu(anchor, [
+    showBubbleMenu(context, anchor, [
+      // 收藏: 已完成的文件复制进收藏目录 (源文件没了会提示失败)
+      if (t.status == TransferStatus.done && t.savePath != null)
+        (
+          label: tr('collect'),
+          onTap: () async {
+            final ok = await c.collectTransfer(
+              t,
+              t.outgoing ? tr('me') : c.peerName(t.peerId),
+              peerId: t.outgoing ? '' : t.peerId,
+              fromMe: t.outgoing,
+            );
+            if (context.mounted) {
+              AppToast.show(context, tr(ok ? 'collected' : 'collect_fail'));
+            }
+          },
+        ),
       if (!busy)
         (
           label: t.status == TransferStatus.waiting
@@ -1331,12 +1424,24 @@ class _ChatPageState extends State<ChatPage> {
     ChatMessage m,
     Rect anchor,
   ) {
-    _showBubbleMenu(anchor, [
+    showBubbleMenu(context, anchor, [
       (
         label: tr('copy'),
         onTap: () {
           Clipboard.setData(ClipboardData(text: m.text));
           AppToast.show(context, tr('copied'));
+        },
+      ),
+      (
+        label: tr('collect'),
+        onTap: () async {
+          await c.collectText(
+            m.text,
+            m.fromMe ? tr('me') : c.peerName(m.peerId),
+            peerId: m.fromMe ? '' : m.peerId,
+            fromMe: m.fromMe,
+          );
+          if (context.mounted) AppToast.show(context, tr('collected'));
         },
       ),
       // 撤回: 仅我方 2 分钟内的消息 (与微信一致)
@@ -1352,100 +1457,6 @@ class _ChatPageState extends State<ChatPage> {
         ),
       (label: tr('delete'), onTap: () => c.deleteMessage(peerId!, m)),
     ]);
-  }
-
-  /// 微信风格: 长按气泡后菜单浮在气泡正上方 (上方空间不够时放下面),
-  /// 深色圆角横排, 带指向气泡的小三角; 点外部/返回键关闭
-  void _showBubbleMenu(
-    Rect anchor,
-    List<({String label, VoidCallback onTap})> actions,
-  ) {
-    if (actions.isEmpty) return;
-    // Windows 自定义标题栏把导航区压低 38px: localToGlobal 是相对窗口的,
-    // 换算成 Overlay (弹窗绘制区) 的坐标, 否则菜单整体偏低
-    final overlayBox =
-        Overlay.of(context).context.findRenderObject()! as RenderBox;
-    final overlayOrigin = overlayBox.localToGlobal(Offset.zero);
-    anchor = anchor.shift(-overlayOrigin);
-    final mq = MediaQuery.of(context);
-    const menuH = 44.0;
-    // 估算宽度仅用于把菜单钳制在屏幕内, 实际居中由 FractionalTranslation 保证
-    final estW = actions.fold<double>(
-      0,
-      (s, a) => s + a.label.length * 14.0 + 28,
-    );
-    final cx = anchor.center.dx.clamp(
-      estW / 2 + 8,
-      mq.size.width - estW / 2 - 8,
-    );
-    final above = anchor.top - mq.padding.top > menuH + 24;
-    showGeneralDialog(
-      context: context,
-      barrierDismissible: true,
-      barrierLabel: tr('close'),
-      barrierColor: Colors.transparent,
-      pageBuilder: (dlgCtx, _, _) => Stack(
-        children: [
-          // 指向气泡的小三角
-          Positioned(
-            left: cx - 5,
-            top: above ? anchor.top - 13 : anchor.bottom + 3,
-            child: Transform.rotate(
-              angle: math.pi / 4,
-              child: Container(
-                width: 10,
-                height: 10,
-                color: const Color(0xFF4C4C4C),
-              ),
-            ),
-          ),
-          Positioned(
-            left: cx,
-            top: above ? anchor.top - menuH - 8 : anchor.bottom + 8,
-            child: FractionalTranslation(
-              translation: const Offset(-0.5, 0),
-              child: Material(
-                color: const Color(0xFF4C4C4C),
-                borderRadius: BorderRadius.circular(8),
-                clipBehavior: Clip.antiAlias,
-                child: SizedBox(
-                  height: menuH,
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      for (var i = 0; i < actions.length; i++) ...[
-                        if (i > 0)
-                          Container(
-                            width: 0.5,
-                            height: 18,
-                            color: Colors.white24,
-                          ),
-                        InkWell(
-                          onTap: () {
-                            Navigator.pop(dlgCtx);
-                            actions[i].onTap();
-                          },
-                          child: Padding(
-                            padding: const EdgeInsets.symmetric(horizontal: 14),
-                            child: Text(
-                              actions[i].label,
-                              style: const TextStyle(
-                                fontSize: 13,
-                                color: Colors.white,
-                              ),
-                            ),
-                          ),
-                        ),
-                      ],
-                    ],
-                  ),
-                ),
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
   }
 }
 
@@ -1761,7 +1772,7 @@ class _FileBubble extends StatelessWidget {
             builder: (bubbleCtx) => GestureDetector(
               onLongPress: onLongPress == null
                   ? null
-                  : () => onLongPress!(_rectOf(bubbleCtx)),
+                  : () => onLongPress!(rectOf(bubbleCtx)),
               // 发出的文件本地本来就有, 任何状态都可打开; 收到的要等完成
               onTap: (t.outgoing || t.status == TransferStatus.done)
                   ? () => openTransfer(context, t)
@@ -1926,7 +1937,7 @@ class _BubbleState extends State<_Bubble> {
           Flexible(
             child: Builder(
               builder: (bubbleCtx) => GestureDetector(
-                onLongPress: () => widget.onLongPress(_rectOf(bubbleCtx)),
+                onLongPress: () => widget.onLongPress(rectOf(bubbleCtx)),
                 child: Container(
                   padding: const EdgeInsets.symmetric(
                     horizontal: 12,

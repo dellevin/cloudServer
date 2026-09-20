@@ -99,6 +99,55 @@ class ClipItem {
   );
 }
 
+/// 收藏条目: 文本存内容, 文件存复制后的路径 (kind = text/file)
+class CollectionItem {
+  final int? id;
+  final String kind; // text / file
+  final String content; // 文本内容 或 收藏目录里的文件路径
+  final String fileName; // 文件名 (文本为空串)
+  final int fileSize; // 文件大小 (文本为 0)
+  final String fromName; // 来源设备名
+  final String peerId; // 来源设备 id (查头像用; 自己发的为空串)
+  final bool fromMe; // 收藏的是不是自己发出的消息 (决定气泡方向)
+  final int ts;
+
+  CollectionItem({
+    this.id,
+    required this.kind,
+    required this.content,
+    this.fileName = '',
+    this.fileSize = 0,
+    this.fromName = '',
+    this.peerId = '',
+    this.fromMe = true,
+    required this.ts,
+  });
+
+  Map<String, dynamic> toMap() => {
+    'id': id,
+    'kind': kind,
+    'content': content,
+    'fileName': fileName,
+    'fileSize': fileSize,
+    'fromName': fromName,
+    'peerId': peerId,
+    'fromMe': fromMe ? 1 : 0,
+    'ts': ts,
+  };
+
+  factory CollectionItem.fromMap(Map<String, dynamic> m) => CollectionItem(
+    id: m['id'] as int?,
+    kind: m['kind'] as String,
+    content: m['content'] as String,
+    fileName: m['fileName'] as String? ?? '',
+    fileSize: m['fileSize'] as int? ?? 0,
+    fromName: m['fromName'] as String? ?? '',
+    peerId: m['peerId'] as String? ?? '',
+    fromMe: (m['fromMe'] as int? ?? 1) == 1,
+    ts: m['ts'] as int,
+  );
+}
+
 class ChatDb {
   static Database? _db;
   // 缓存打开中的 Future: 并发调用方共享同一次 openDatabase,
@@ -118,7 +167,7 @@ class ChatDb {
     final base = await getDatabasesPath();
     _db = await openDatabase(
       p.join(base, 'cloudsend_chat.db'),
-      version: 8,
+      version: 12,
       onCreate: (d, v) async {
         await d.execute(
           'CREATE TABLE messages(id INTEGER PRIMARY KEY AUTOINCREMENT, peerId TEXT NOT NULL, fromMe INTEGER NOT NULL, text TEXT NOT NULL, ts INTEGER NOT NULL, delivered INTEGER NOT NULL DEFAULT 1, rejected INTEGER NOT NULL DEFAULT 0, recalled INTEGER NOT NULL DEFAULT 0, readFlag INTEGER NOT NULL DEFAULT 0)',
@@ -133,6 +182,9 @@ class ChatDb {
         );
         await d.execute(
           'CREATE TABLE clip_items(id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, content TEXT NOT NULL, ts INTEGER NOT NULL, fromMe INTEGER NOT NULL, peerId TEXT NOT NULL)',
+        );
+        await d.execute(
+          'CREATE TABLE collection_items(id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, content TEXT NOT NULL, fileName TEXT NOT NULL DEFAULT \'\', fileSize INTEGER NOT NULL DEFAULT 0, fromName TEXT NOT NULL DEFAULT \'\', peerId TEXT NOT NULL DEFAULT \'\', fromMe INTEGER NOT NULL DEFAULT 1, ts INTEGER NOT NULL)',
         );
       },
       onUpgrade: (d, oldV, newV) async {
@@ -174,6 +226,41 @@ class ChatDb {
           await d.execute(
             'ALTER TABLE transfers ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0',
           );
+        }
+        if (oldV < 9) {
+          // 收藏: 文本/文件收藏, 文件复制进收藏目录后存路径
+          await d.execute(
+            'CREATE TABLE collection_items(id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, content TEXT NOT NULL, fileName TEXT NOT NULL DEFAULT \'\', fileSize INTEGER NOT NULL DEFAULT 0, fromName TEXT NOT NULL DEFAULT \'\', ts INTEGER NOT NULL)',
+          );
+        }
+        if (oldV < 10) {
+          // 收藏页改聊天式布局: 记住来源方向 (左/右气泡)
+          await d.execute(
+            'ALTER TABLE collection_items ADD COLUMN fromMe INTEGER NOT NULL DEFAULT 1',
+          );
+        }
+        if (oldV < 11) {
+          // 收藏气泡显示对方头像: 记住来源设备 id
+          await d.execute(
+            'ALTER TABLE collection_items ADD COLUMN peerId TEXT NOT NULL DEFAULT \'\'',
+          );
+        }
+        if (oldV < 12) {
+          // 修复开发期热重载留下的半成品 schema (版本号已写但列没加):
+          // 按 PRAGMA 实际缺失的列补, 幂等 — 正常文件两列都在, 空转
+          final cols = (await d.rawQuery('PRAGMA table_info(collection_items)'))
+              .map((c) => c['name'] as String)
+              .toSet();
+          if (!cols.contains('fromMe')) {
+            await d.execute(
+              'ALTER TABLE collection_items ADD COLUMN fromMe INTEGER NOT NULL DEFAULT 1',
+            );
+          }
+          if (!cols.contains('peerId')) {
+            await d.execute(
+              'ALTER TABLE collection_items ADD COLUMN peerId TEXT NOT NULL DEFAULT \'\'',
+            );
+          }
         }
       },
     );
@@ -390,6 +477,22 @@ class ChatDb {
 
   static Future<int> clearClips() async =>
       (await db).delete('clip_items');
+
+  // ---------- 收藏 ----------
+
+  static Future<int> insertCollection(CollectionItem c) async =>
+      (await db).insert('collection_items', c.toMap());
+
+  static Future<List<CollectionItem>> loadCollection() async {
+    final rows = await (await db).query(
+      'collection_items',
+      orderBy: 'ts DESC, id DESC',
+    );
+    return rows.map(CollectionItem.fromMap).toList();
+  }
+
+  static Future<int> deleteCollection(int id) async =>
+      (await db).delete('collection_items', where: 'id = ?', whereArgs: [id]);
 
   // ---------- 传输记录持久化 ----------
 

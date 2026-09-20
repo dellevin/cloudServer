@@ -239,7 +239,7 @@ class _TransfersPageState extends State<TransfersPage> {
                         t.savePath != null &&
                         _fileExists(t.savePath!, t.status, t.bytesDone) &&
                         (t.outgoing || t.status == TransferStatus.done);
-                    final n = 1 + (openable ? 1 : 0);
+                    final n = 1 + (openable ? 2 : 0);
                     final sw = MediaQuery.of(context).size.width;
                     final ratio = (n * 76.0) / sw;
                     return Slidable(
@@ -257,6 +257,40 @@ class _TransfersPageState extends State<TransfersPage> {
                                 color: const Color(0xFF4C8DFF),
                                 icon: Icons.visibility_outlined,
                                 label: tr('open'),
+                              ),
+                            ),
+                          // 收藏: 文件复制进收藏目录 (条件同「打开」— 文件得在)
+                          if (openable)
+                            CustomSlidableAction(
+                              onPressed: (_) async {
+                                final ok = await c.collectTransfer(
+                                  t,
+                                  t.outgoing
+                                      ? tr('me')
+                                      : c.peerName(t.peerId),
+                                  peerId: t.outgoing ? '' : t.peerId,
+                                  fromMe: t.outgoing,
+                                );
+                                if (context.mounted) {
+                                  AppToast.show(
+                                    context,
+                                    tr(ok ? 'collected' : 'collect_fail'),
+                                  );
+                                }
+                              },
+                              backgroundColor: Colors.transparent,
+                              padding: EdgeInsets.zero,
+                              child: _SquareAction(
+                                color: const Color(0xFFF5A623),
+                                // PNG 图标按白色剪影渲染, 与其他按钮的白色图标一致
+                                iconWidget: Image.asset(
+                                  'assets/collection.png',
+                                  width: 18,
+                                  height: 18,
+                                  color: Colors.white,
+                                  colorBlendMode: BlendMode.srcIn,
+                                ),
+                                label: tr('collect'),
                               ),
                             ),
                           CustomSlidableAction(
@@ -475,11 +509,15 @@ class _RetryButton extends StatelessWidget {
 /// 左滑操作按钮: 通高纯色块 (微信样式)
 class _SquareAction extends StatelessWidget {
   final Color color;
-  final IconData icon;
+  final IconData? icon;
+
+  /// 自定义图标 widget (如 PNG 资产); 给了就忽略 icon
+  final Widget? iconWidget;
   final String label;
   const _SquareAction({
     required this.color,
-    required this.icon,
+    this.icon,
+    this.iconWidget,
     required this.label,
   });
 
@@ -493,7 +531,7 @@ class _SquareAction extends StatelessWidget {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(icon, size: 18, color: Colors.white),
+            iconWidget ?? Icon(icon, size: 18, color: Colors.white),
             const SizedBox(height: 2),
             Text(
               label,
