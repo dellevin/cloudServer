@@ -562,6 +562,7 @@ class _ChatPageState extends State<ChatPage> {
       final c = _client!;
       c.activePeerId = peerId; // 正在查看此会话: 新消息不计未读
       c.loadHistory(peerId!).then((_) {
+        if (!mounted) return; // 加载期间已退出页面 (跳转定位更不能跑)
         _prevNewestTs = _newestTsOf(c); // 已有历史不计入「新消息」角标
         _jumpToHighlight();
         c.sendReadReceipt(peerId!); // 打开会话即回已读 (以对方最新消息 ts 为已读位置)
@@ -1584,10 +1585,17 @@ class _FileBubble extends StatelessWidget {
     if (_existsCache.length > 500) _existsCache.clear(); // 兜底上限 (静态存活期长)
     final key = '$path|${st.name}';
     final hit = _existsCache[key];
-    if (hit != null) return hit;
+    if (hit != null) {
+      // 命中也后台复核: 文件可能后来被手动删掉, 翻回 false 下次重建生效
+      File(path).exists().then((v) {
+        if (_existsCache[key] != v) _existsCache[key] = v;
+      });
+      return hit;
+    }
     _existsCache[key] = false;
     File(path).exists().then((v) {
-      if (_existsCache[key] == false && v) _existsCache[key] = v;
+      // 双向更新: 文件后来被删掉也要翻回 false, 否则气泡永远显示可打开
+      if (_existsCache[key] != v) _existsCache[key] = v;
     });
     return false;
   }
@@ -1847,8 +1855,9 @@ class _FileBubble extends StatelessWidget {
   String _fmt(int b) {
     if (b < 1024) return '$b B';
     if (b < 1024 * 1024) return '${(b / 1024).toStringAsFixed(1)} KB';
-    if (b < 1024 * 1024 * 1024)
+    if (b < 1024 * 1024 * 1024) {
       return '${(b / 1024 / 1024).toStringAsFixed(1)} MB';
+    }
     return '${(b / 1024 / 1024 / 1024).toStringAsFixed(2)} GB';
   }
 }
@@ -2011,8 +2020,9 @@ class _BubbleState extends State<_Bubble> {
     final spans = <TextSpan>[];
     var pos = 0;
     for (final match in _urlRe.allMatches(text)) {
-      if (match.start > pos)
+      if (match.start > pos) {
         spans.add(TextSpan(text: text.substring(pos, match.start)));
+      }
       final url = match.group(0)!;
       final rec = TapGestureRecognizer()
         ..onTap = () =>

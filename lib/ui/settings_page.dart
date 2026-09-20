@@ -755,7 +755,8 @@ class _ClearCacheTileState extends State<_ClearCacheTile> {
           }
           Future<void> clearAndRefresh(Set<String>? cats, int size) async {
             await _clear(c, cats, size);
-            setSheet(() {}); // _sizes 已刷新, 重画面板
+            // 清理期间弹窗可能已被关掉, StatefulBuilder 已卸载不能再 setState
+            if (ctx.mounted) setSheet(() {}); // _sizes 已刷新, 重画面板
           }
 
           return Padding(

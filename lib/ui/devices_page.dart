@@ -60,7 +60,7 @@ class _DevicesPageState extends State<DevicesPage> {
         ),
       ],
     );
-    if (v != null) setState(() => _filter = v);
+    if (v != null && mounted) setState(() => _filter = v);
   }
 
   @override

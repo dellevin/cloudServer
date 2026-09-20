@@ -7,13 +7,17 @@ import 'package:video_thumbnail/video_thumbnail.dart';
 /// 视频缩略图工具:
 /// - Android/iOS/macOS: video_thumbnail 插件
 /// - Windows: 尝试调用系统 ffmpeg 抽帧 (无 ffmpeg 则返回 null, 调用方回退到占位图标)
-/// 结果按文件路径缓存; 缓存的是 Future, 同一路径的并发请求只抽一次帧
+/// 结果按 路径+大小+修改时间 缓存 (同路径同名新文件不会错用旧帧);
+/// 缓存的是 Future, 同一文件的并发请求只抽一次帧
 class VideoThumbs {
   static final Map<String, Future<Uint8List?>> _cache = {};
 
-  static Future<Uint8List?> get(String path) {
+  static Future<Uint8List?> get(String path) async {
     if (_cache.length > 200) _cache.clear(); // 兜底上限, 防常驻内存无限涨
-    return _cache.putIfAbsent(path, () => _load(path));
+    final st = await FileStat.stat(path);
+    if (st.type != FileSystemEntityType.file) return null;
+    final key = '$path|${st.size}|${st.modified.millisecondsSinceEpoch}';
+    return _cache.putIfAbsent(key, () => _load(path));
   }
 
   static Future<Uint8List?> _load(String path) async {
@@ -43,11 +47,11 @@ class VideoThumbs {
   /// Windows: ffmpeg 抽第 1 秒帧
   static Future<Uint8List?> _ffmpegFrame(String path) async {
     final dir = await getTemporaryDirectory();
-    // 临时名带 路径hash+文件长度: 纯 hashCode 碰撞时会错用他文件的帧
-    final len = await File(path).length().catchError((_) => -1);
-    if (len < 0) return null;
+    // 临时名带 路径hash+长度+mtime: 同路径同名新文件不会错用旧帧
+    final st = await FileStat.stat(path);
+    if (st.type != FileSystemEntityType.file) return null;
     final out =
-        '${dir.path}${Platform.pathSeparator}cs_thumb_${path.hashCode.abs()}_$len.png';
+        '${dir.path}${Platform.pathSeparator}cs_thumb_${path.hashCode.abs()}_${st.size}_${st.modified.millisecondsSinceEpoch}.png';
     final f = File(out);
     if (await f.exists() && await f.length() > 0) return await f.readAsBytes();
     final r = await Process.run('ffmpeg', [

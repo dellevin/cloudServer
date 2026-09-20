@@ -1132,8 +1132,11 @@ class _RefreshActionState extends State<_RefreshAction>
     try {
       await context.read<RelayClient>().refreshPeers();
     } finally {
-      _spin.stop();
-      _spin.reset();
+      // 刷新期间页面可能已退出, controller 已 dispose 不能再动
+      if (mounted) {
+        _spin.stop();
+        _spin.reset();
+      }
     }
   }
 

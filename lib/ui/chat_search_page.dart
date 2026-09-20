@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -26,6 +27,7 @@ class _ChatSearchPageState extends State<ChatSearchPage> {
   int _filter = 0; // 0=全部 1=聊天 2=文件
   List<ChatMessage> _msgResults = []; // DB 全文搜索结果 (聊天记录分页加载,不能只在内存搜)
   int _searchToken = 0; // 防止异步结果乱序覆盖
+  Timer? _debounce; // 输入防抖, 停笔 300ms 后才查库
 
   @override
   void didChangeDependencies() {
@@ -38,6 +40,7 @@ class _ChatSearchPageState extends State<ChatSearchPage> {
 
   @override
   void dispose() {
+    _debounce?.cancel();
     _ctrl.dispose();
     super.dispose();
   }
@@ -129,7 +132,12 @@ class _ChatSearchPageState extends State<ChatSearchPage> {
                   ),
                   onChanged: (v) {
                     setState(() => _query = v);
-                    _refreshMessages();
+                    // 防抖: 每敲一个字都 LIKE 查库会连续排队 IO
+                    _debounce?.cancel();
+                    _debounce = Timer(
+                      const Duration(milliseconds: 300),
+                      _refreshMessages,
+                    );
                   },
                 ),
               ),
@@ -138,6 +146,7 @@ class _ChatSearchPageState extends State<ChatSearchPage> {
                   onTap: () {
                     _ctrl.clear();
                     setState(() => _query = '');
+                    _debounce?.cancel(); // 丢掉待执行的旧搜索
                     _refreshMessages();
                   },
                   child: const Padding(
