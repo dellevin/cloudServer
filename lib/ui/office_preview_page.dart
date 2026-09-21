@@ -13,6 +13,13 @@ import 'file_preview_page.dart';
 /// docx/xlsx 都是 zip 包: 解开读里面的 xml 提取内容。
 /// 注意仅支持新格式 (.docx/.xlsx); 老格式 (.doc/.xls) 是 OLE2 二进制,
 /// 无法这样解析, 路由层不会进这里。
+///
+/// 预览文件大小上限: decodeBytes 会把整个 zip 读入内存并同时解压全部条目,
+/// 内嵌图片的大文档可致 OOM, 超过上限直接拒绝预览
+const _maxPreviewBytes = 50 * 1024 * 1024; // 50MB
+
+Future<bool> _officeTooLarge(String path) async =>
+    await File(path).length() > _maxPreviewBytes;
 Uint8List _zipEntryBytes(Archive archive, String name) {
   final f = archive.findFile(name);
   if (f == null) throw StateError('missing $name');
@@ -56,6 +63,10 @@ class _DocxViewPageState extends State<DocxViewPage> {
 
   Future<void> _load() async {
     try {
+      if (await _officeTooLarge(_args.$1)) {
+        if (mounted) setState(() => _error = tr('office_too_large'));
+        return;
+      }
       final archive = ZipDecoder().decodeBytes(
         await File(_args.$1).readAsBytes(),
       );
@@ -198,6 +209,10 @@ class _XlsxViewPageState extends State<XlsxViewPage> {
 
   Future<void> _load() async {
     try {
+      if (await _officeTooLarge(_args.$1)) {
+        if (mounted) setState(() => _error = tr('office_too_large'));
+        return;
+      }
       final archive = ZipDecoder().decodeBytes(
         await File(_args.$1).readAsBytes(),
       );

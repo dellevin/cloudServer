@@ -156,7 +156,9 @@ class ChatDb {
 
   static Future<Database> get db {
     if (_db != null) return Future.value(_db!);
-    return _opening ??= _open();
+    // whenComplete 清缓存: 打开失败时下次调用能重试,
+    // 否则首次失败 (锁/IO 异常) 后所有访问会永久重抛同一错误
+    return _opening ??= _open().whenComplete(() => _opening = null);
   }
 
   static Future<Database> _open() async {

@@ -930,7 +930,9 @@ class RelayClient extends ChangeNotifier {
               )
               .toList()) {
         _canceled.add(t.transferId);
-        _closeIncoming(t.transferId, deletePart: true);
+        // 必须 await: sink 未关闭前文件仍被锁 (Windows),
+        // 否则 upsert/取消通知与清理会跟写盘竞态
+        await _closeIncoming(t.transferId, deletePart: true);
         t.status = TransferStatus.canceled;
         ChatDb.upsertTransfer(t);
         _send({
@@ -1670,6 +1672,17 @@ class RelayClient extends ChangeNotifier {
           _resendUndelivered();
           _abortTransfersWithOfflinePeers();
           break;
+        case 'peer_offline':
+          // 服务器转发时发现目标已掉线 (peers 广播有延迟, 这是即时通知):
+          // 立刻移出在线列表并中止相关传输, 避免干等 60s offer 超时
+          final pid = m['peer'];
+          if (pid is String && pid.isNotEmpty) {
+            _relayPeers.removeWhere((p) => p.id == pid);
+            _relayIds.remove(pid);
+            _rebuildPeers();
+            _abortTransfersWithOfflinePeers();
+          }
+          break;
         case 'chat':
           final from = m['from'] as String;
           final ts = m['ts'];
@@ -1827,7 +1840,7 @@ class RelayClient extends ChangeNotifier {
           if (nameRaw is! String ||
               nameRaw.isEmpty ||
               sizeRaw is! int ||
-              sizeRaw <= 0) {
+              sizeRaw < 0) {
             // 畸形请求: 回拒绝, 别让对方挂满 60s 超时
             _send({'type': 'file_reject', 'to': m['from'], 'transferId': tid});
             break;
@@ -2378,6 +2391,14 @@ class RelayClient extends ChangeNotifier {
           ChatDb.upsertTransfer(t);
           _autoRetry(t);
         }
+        changed = true;
+      } else if (t.outgoing && t.status == TransferStatus.waiting) {
+        // 外发 offer 等不到确认而对端已掉线: 立即判失败,
+        // 不必干等 60s offer 超时; 对端回来后自动重发 (不消耗重试次数)
+        _offerTimers.remove(t.transferId)?.cancel();
+        t.status = TransferStatus.failed;
+        ChatDb.upsertTransfer(t);
+        _autoRetry(t);
         changed = true;
       } else if (t.outgoing &&
           t.status == TransferStatus.done &&

@@ -590,11 +590,13 @@ async def broadcast_peers():
 
 async def forward(to, data):
     c = clients.get(to)
-    if c:
-        try:
-            await c["ws"].send(data)
-        except Exception:
-            pass
+    if not c:
+        return False
+    try:
+        await c["ws"].send(data)
+        return True
+    except Exception:
+        return False
 
 
 async def sweep_routes():
@@ -850,8 +852,11 @@ async def handle(ws):
                         if my_id is None or not isinstance(tid, str) or not tid \
                                 or not isinstance(to, str) or not to:
                             continue
-                        # 发送方必须在线: 否则路由+带宽桶空转到 TTL 才被清扫
+                        # 发送方必须在线: 否则路由+带宽桶空转到 TTL 才被清扫;
+                        # 同时告知接收方, 免得 accepted 状态干等看门狗
                         if to not in clients:
+                            await forward(my_id, json.dumps(
+                                {"type": "peer_offline", "peer": to, "to": my_id}))
                             continue
                         r = routes.get(tid)
                         if r is not None and r["to"] != my_id:
@@ -886,7 +891,13 @@ async def handle(ws):
                         if isinstance(to, str) and to:
                             stats.add("text_bytes", len(data))
                             stats.add("messages")
-                            await forward(to, json.dumps(m))
+                            ok = await forward(to, json.dumps(m))
+                            if not ok:
+                                # 目标已掉线但发送方还不知情 (peers 广播有延迟):
+                                # 立即告知, 客户端据此把等待中的 offer 判失败,
+                                # 否则发送方要干等 60s offer 超时
+                                await forward(my_id, json.dumps(
+                                    {"type": "peer_offline", "peer": to, "to": my_id}))
                 else:
                     # 二进制: 前36字节为 transferId
                     if len(data) > MAX_BIN_FRAME:
@@ -1736,8 +1747,11 @@ async def main():
     asyncio.create_task(periodic_maintenance(loop))
     asyncio.create_task(sse_tick())
     # max_size 交给库在帧组装过程中拒收, 防攻击者用数 GB 帧头耗尽内存;
-    # MAX_BIN_FRAME (1MB+64) > MAX_TEXT_FRAME (512KB), 不影响任何合法帧
-    async with websockets.serve(handle, "0.0.0.0", args.port, max_size=MAX_BIN_FRAME):
+    # MAX_BIN_FRAME (1MB+64) > MAX_TEXT_FRAME (512KB), 不影响任何合法帧。
+    # ping 保活: 15s 一问 10s 超时应答不上即断开 → 掉线设备 ≤25s 被清理并
+    # 广播 peers, 其他客户端的在线列表及时刷新 (默认 20+20 太慢)
+    async with websockets.serve(handle, "0.0.0.0", args.port, max_size=MAX_BIN_FRAME,
+                                ping_interval=15, ping_timeout=10):
         print(f"cloudSend relay listening on ws://0.0.0.0:{args.port}")
         await asyncio.Future()  # run forever
 

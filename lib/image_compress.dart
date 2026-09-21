@@ -135,7 +135,11 @@ List<int> _compressJpg(img.Image im, int? targetSizeKb) {
 LubanResult? _lubanEntry((String inputPath, String outDir) args) {
   final (inputPath, outDir) = args;
   try {
-    final origBytes = File(inputPath).readAsBytesSync();
+    // 超过 100MB 放弃: 整文件读入内存 + 解码会 OOM
+    // (与 client.dart _imageThumbJob 的守卫一致), 调用方回退发原文件
+    final input = File(inputPath);
+    if (input.lengthSync() > 100 * 1024 * 1024) return null;
+    final origBytes = input.readAsBytesSync();
     var im = img.decodeImage(origBytes);
     if (im == null) return null;
     // 相机 JPEG 常带 EXIF 旋转标记, 先按标记转正再缩放

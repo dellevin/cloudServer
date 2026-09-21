@@ -396,6 +396,7 @@ const Map<String, String> _zh = {
   // ---- Word/Excel 预览页 ----
   'docx_read_fail': '无法读取文档 (可能已损坏或不是 .docx 格式)',
   'xlsx_read_fail': '无法读取表格 (可能已损坏或不是 .xlsx 格式)',
+  'office_too_large': '文件过大, 无法预览',
   'content_empty': '没有可显示的内容',
   'rows_cap': '内容过多，仅显示前 {n} 行',
 
@@ -818,6 +819,7 @@ const Map<String, String> _en = {
   // ---- Word/Excel preview page ----
   'docx_read_fail': 'Cannot read document (corrupted or not a .docx file)',
   'xlsx_read_fail': 'Cannot read spreadsheet (corrupted or not a .xlsx file)',
+  'office_too_large': 'File too large to preview',
   'content_empty': 'Nothing to display',
   'rows_cap': 'Too much content, only first {n} rows shown',
 

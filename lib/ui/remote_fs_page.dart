@@ -118,7 +118,12 @@ class _RemoteFsPageState extends State<RemoteFsPage> {
       _previewHandled = true; // 流式不起整文件传输, 不走 _watchPreview 检测
     });
     final sess = await c.fsStreamOpen(peerId!, _child(name), name);
-    if (!mounted) return;
+    if (!mounted) {
+      // 等待期间页面已退出: 会话无人接管 (视频页不会打开),
+      // 必须立刻关闭, 否则对端文件句柄/本地 HTTP 映射/缓存永久泄漏
+      if (sess != null) unawaited(c.fsStreamClose(sess.tid));
+      return;
+    }
     setState(() => _previewName = null);
     if (sess == null) {
       Navigator.pushNamed(
