@@ -10,7 +10,7 @@ import '../main.dart';
 import 'app_dialog.dart';
 import 'app_toast.dart';
 
-/// 运行日志查看页: 显示日志尾部, 可刷新/导出到下载目录/清空
+/// 运行日志查看页: 最新日志在最前, 可刷新/导出到下载目录/清空
 class LogPage extends StatefulWidget {
   const LogPage({super.key});
 
@@ -29,7 +29,10 @@ class _LogPageState extends State<LogPage> {
   }
 
   Future<void> _reload() async {
-    final text = await Log.readTail();
+    var text = await Log.readTail();
+    // 日志文件是时间追加序: 行倒序展示, 打开页面先看到最新一条
+    final lines = text.trimRight().split('\n');
+    if (lines.length > 1) text = lines.reversed.join('\n');
     if (mounted) setState(() => _text = text);
   }
 

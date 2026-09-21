@@ -221,8 +221,10 @@ class ChatDb {
           );
         }
         if (oldV < 7) {
+          // IF NOT EXISTS: 开发期热重载可能留下「索引已建但版本号没写」的
+          // 半成品 schema (同 v12 的列修复), 重复执行不应让 open 失败
           await d.execute(
-            'CREATE INDEX idx_messages_peer_ts ON messages(peerId, ts)',
+            'CREATE INDEX IF NOT EXISTS idx_messages_peer_ts ON messages(peerId, ts)',
           );
         }
         if (oldV < 8) {
@@ -268,7 +270,7 @@ class ChatDb {
         }
         if (oldV < 13) {
           // 剪贴板按日期筛选/排序走索引 (原来全表扫描+排序)
-          await d.execute('CREATE INDEX idx_clip_ts ON clip_items(ts)');
+          await d.execute('CREATE INDEX IF NOT EXISTS idx_clip_ts ON clip_items(ts)');
         }
       },
     );

@@ -62,15 +62,20 @@ class SponsorPage extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 24),
-          // 收款码: 微信 / 支付宝 双卡片
+          // 收款码: 微信 / 支付宝 双卡片。
+          // 两张图宽高比不同 (wx 1283x1748≈0.734, zfb 1182x1772≈0.667):
+          // 按各自比例分配宽度 (flex 与宽高比成正比), 卡片内再用相同比例框,
+          // 两卡自然等高、图各自填满, 不留白边不裁切
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 16),
             child: Row(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Expanded(
+                  flex: 734,
                   child: _QrCard(
                     asset: 'assets/wx.jpg',
+                    aspectRatio: 1283 / 1748,
                     label: tr('sponsor_wx'),
                     color: AppTheme.green,
                     icon: Icons.chat_bubble_rounded,
@@ -78,8 +83,10 @@ class SponsorPage extends StatelessWidget {
                 ),
                 const SizedBox(width: 12),
                 Expanded(
+                  flex: 667,
                   child: _QrCard(
                     asset: 'assets/zfb.jpg',
+                    aspectRatio: 1182 / 1772,
                     label: tr('sponsor_zfb'),
                     color: const Color(0xFF1677FF),
                     icon: Icons.currency_yen_rounded,
@@ -105,11 +112,13 @@ class SponsorPage extends StatelessWidget {
 /// 单个收款码卡片: 白卡 + 二维码图 + 带色标签; 点图全屏放大 (方便扫码)
 class _QrCard extends StatelessWidget {
   final String asset;
+  final double aspectRatio; // 图片原始宽高比, 框与图一致 → 完整填满不变形
   final String label;
   final Color color;
   final IconData icon;
   const _QrCard({
     required this.asset,
+    required this.aspectRatio,
     required this.label,
     required this.color,
     required this.icon,
@@ -132,14 +141,14 @@ class _QrCard extends StatelessWidget {
               padding: const EdgeInsets.all(10),
               child: ClipRRect(
                 borderRadius: BorderRadius.circular(8),
-                // 两张收款码宽高比不同: 统一 2:3 框 + contain 居中,
-                // 卡片等高, 多余区域白底补齐 (收款码本身带白边, 无感)
                 child: AspectRatio(
-                  aspectRatio: 2 / 3,
-                  child: Container(
-                    color: Colors.white,
-                    alignment: Alignment.center,
-                    child: Image.asset(asset, fit: BoxFit.contain),
+                  aspectRatio: aspectRatio,
+                  // 原图 ~1200px 宽, 卡片仅显示 ~200px: 限解码宽度省内存
+                  // (全屏放大页不限, 保留双指放大后的清晰度)
+                  child: Image.asset(
+                    asset,
+                    fit: BoxFit.cover,
+                    cacheWidth: 800,
                   ),
                 ),
               ),

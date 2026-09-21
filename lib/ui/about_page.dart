@@ -8,11 +8,12 @@ import '../models.dart';
 class AboutPage extends StatelessWidget {
   const AboutPage({super.key});
 
-  // 功能条目的图标与配色 (与 about_feat_1..6 一一对应)
+  // 功能条目的图标与配色 (与 about_feat_1..7 一一对应)
   static const _featMeta = [
     (Icons.swap_horiz_rounded, Color(0xFF10AEFF)), // 文件互传
     (Icons.chat_bubble_outline_rounded, Color(0xFF07C160)), // 即时消息
     (Icons.content_paste_rounded, Color(0xFFFA9D3B)), // 剪贴板同步
+    (Icons.star_rounded, Color(0xFFF7B500)), // 收藏
     (Icons.folder_open_rounded, Color(0xFF6467F0)), // 远程浏览
     (Icons.lock_outline_rounded, Color(0xFFC9A227)), // 端到端加密
     (Icons.qr_code_scanner_rounded, Color(0xFF1485EE)), // 扫码配对

@@ -166,12 +166,13 @@ const Map<String, String> _zh = {
   'about_desc':
       'cloudSend 让你在 Windows / Android 设备之间互传文件、收发消息、同步剪贴板，还能像文件管理器一样远程浏览对方设备。局域网直连、公网中继、P2P 打洞自动选择最优链路。',
   'about_features_title': '主要功能',
-  'about_feat_1': '文件互传：多文件/文件夹批量传输，断点续传不重来',
-  'about_feat_2': '即时消息：设备间文字聊天，支持已读回执',
+  'about_feat_1': '文件互传：多文件/文件夹批量传输，断点续传、秒传不重来',
+  'about_feat_2': '即时消息：设备间文字聊天，支持已读回执与消息撤回',
   'about_feat_3': '剪贴板同步：文本、图片、文件在互相信任的设备间自动同步',
-  'about_feat_4': '远程浏览：浏览对端设备文件，图片/视频/Word/Excel 在线预览',
-  'about_feat_5': '端到端加密：接入密码派生密钥，消息加密传输防窃听',
-  'about_feat_6': '扫码配对：扫二维码快速建立信任连接',
+  'about_feat_4': '收藏：重要的消息与文件一键收藏，随时回看',
+  'about_feat_5': '远程浏览：浏览对端设备文件，图片/视频/Word/Excel/压缩包在线预览，视频免下载直接播',
+  'about_feat_6': '端到端加密：接入密码派生密钥，消息加密传输防窃听',
+  'about_feat_7': '扫码配对：扫二维码快速建立信任连接',
   'username': '用户名',
   'username_hint': '输入用户名',
   'id_copied': '设备 ID 已复制',
@@ -570,15 +571,16 @@ const Map<String, String> _en = {
   'about_desc':
       'cloudSend transfers files, messages and clipboard content between your Windows and Android devices, and lets you browse a remote device like a file manager. It picks the best link automatically: LAN direct, public relay or P2P.',
   'about_features_title': 'Features',
-  'about_feat_1': 'File transfer: batch files & folders with resume support',
-  'about_feat_2': 'Messaging: text chat between devices with read receipts',
+  'about_feat_1': 'File transfer: batch files & folders with resume and instant resend',
+  'about_feat_2': 'Messaging: text chat between devices with read receipts and recall',
   'about_feat_3':
       'Clipboard sync: text, images and files synced between mutually trusted devices',
-  'about_feat_4':
-      'Remote browse: explore peer files with online preview for images/videos/Office docs',
+  'about_feat_4': 'Favorites: save important messages and files for later',
   'about_feat_5':
+      'Remote browse: explore peer files with online preview for images/videos/Office/zip, stream videos without downloading',
+  'about_feat_6':
       'End-to-end encryption: messages encrypted with a key derived from your access key',
-  'about_feat_6': 'QR pairing: scan a code to build a trusted connection',
+  'about_feat_7': 'QR pairing: scan a code to build a trusted connection',
   'username': 'Username',
   'username_hint': 'Enter a username',
   'id_copied': 'Device ID copied',
