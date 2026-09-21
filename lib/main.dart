@@ -162,7 +162,7 @@ Future<void> _requestAllFilesAccess() async {
 }
 
 /// 应用版本号 (与 pubspec.yaml 保持一致)
-const kAppVersion = '0.1.9';
+const kAppVersion = '0.2.0';
 
 /// 微信风格主题
 class AppTheme {

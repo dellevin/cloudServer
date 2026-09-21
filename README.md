@@ -4,18 +4,27 @@
 
 ## 功能
 
-- **文件互传**:多文件/文件夹批量传输,断点续传,SHA-256 完整性校验
-- **即时消息**:设备间文字聊天,已读回执,消息漫游(本地 SQLite)
-- **剪贴板同步**:文本/图片/文件在互相信任的设备间自动同步(可按类型开关)
-- **远程浏览**:像文件管理器一样浏览对端设备,图片/视频/zip/Word/Excel/txt 在线预览
+- **文件互传**:多文件/文件夹批量传输,断点续传,SHA-256 完整性校验;同名同大小文件秒传,大文件自动并行分片加速
+- **即时消息**:设备间文字聊天,已读回执,消息撤回,会话内搜索
+- **剪贴板同步**:文本/图片/文件在互相信任的设备间自动同步(可按类型开关、按扩展名黑名单过滤)
+- **收藏**:重要的消息与文件一键收藏,聊天式布局随时回看
+- **远程浏览**:像文件管理器一样浏览对端设备,图片/视频/zip/Word/Excel/txt 在线预览;视频支持流式播放(免下载整文件,协议 v5+)
 - **端到端加密**:接入密码经 PBKDF2 派生 AES-256-GCM 密钥,消息加密传输(协议 v3+)
 - **多链路自动选择**:局域网直连 → P2P 打洞 → 公网中继,自动选最优通道
 - **设备管理**:在线/历史设备列表,信任(自动收文件)/拉黑,扫码配对
+- **运行日志**:应用内查看(最新在前)、导出、清空,关键路径(连接/传输/协议异常)全记录
 
 ## 结构
 
 - `lib/` — Flutter 客户端(Windows / Android)
-- `server/` — Python 中继服务器(WebSocket,纯流量中转)
+  - `main.dart` — 应用入口/路由/主题/托盘/窗口管理
+  - `client.dart` — 核心:中继连接、传输引擎、剪贴板同步、收藏、流式预览
+  - `lan.dart` — 局域网 UDP 发现 + TCP 直连;`stream_server.dart` — 流式预览的本地 HTTP 映射
+  - `db.dart` — SQLite(聊天/传输/剪贴板/收藏);`e2ee.dart` — 端到端加密
+  - `transfer_service.dart` — Android 前台传输服务;`image_compress.dart` — Luban 图片压缩
+  - `ui/` — 页面(聊天/传输/剪贴板/收藏/远程浏览/预览/设置等)
+- `server/` — Python 中继服务器(WebSocket,纯流量中转 + 管理后台)
+- `tool/` — 开发调试脚本(冒烟/复现,非发布内容)
 
 ## 中继服务器
 
@@ -27,6 +36,15 @@ pip install -r requirements.txt
 python server.py 8787            # 默认端口 8787
 python server.py 8787 --access-key <密码>   # 启用接入密码(同时用于 E2EE 派生密钥)
 ```
+
+**管理后台**(独立 HTTP 端口,默认 8788):在线设备/踢人/黑白名单/带宽限速/流量统计。
+
+```bash
+python server.py 8787 --admin-port 8788 --admin-token <密码>
+# 未指定 token 时每次启动随机生成并打印免登录链接
+```
+
+服务器内置防护:帧大小上限、单 IP 连接数与 register 限流、密码错误封禁、路由防劫持、传输带宽桶;15s ping 保活,掉线设备 25 秒内清理并广播最新在线列表;转发目标不在线时立即回 `peer_offline` 通知发送方。
 
 ## 客户端
 
@@ -51,13 +69,16 @@ flutter build apk --release
 
 ## 协议 (WebSocket)
 
-- 文本帧 JSON:`register` / `peers` / `chat` / `chat_ack` / `chat_reject` / `chat_recall` / `chat_read` / `clip_text` / `file_offer` / `file_accept` / `file_reject` / `file_done` / `file_progress` / `file_result` / `file_cancel` / `fs_list` / `fs_get` / `fs_thumb` / `enc` (E2EE 信封) / `p2p_*` (打洞信令)
+- 文本帧 JSON:`register` / `peers` / `peer_offline` / `chat` / `chat_ack` / `chat_reject` / `chat_recall` / `chat_read` / `clip_text` / `file_offer` / `file_accept` / `file_reject` / `file_done` / `file_progress` / `file_result` / `file_cancel` / `file_parallel` / `file_seg_hash` / `file_seg_reset` / `file_accept_pending` / `file_instant` / `file_instant_nack` / `fs_list` / `fs_get` / `fs_thumb` / `fs_stream_*` (流式预览) / `enc` (E2EE 信封) / `p2p_*` (打洞信令)
 - 二进制帧:前 36 字节为 transferId,其余为文件数据块,服务器按 transferId 路由(校验发送方身份)
 
 ## 传输可靠性
 
 - **断点续传**:接收端先写 `<文件名>.part` 临时文件;`file_accept` 携带 `offset`,发送端从偏移处续传,中断后点"续传/重发"即可接着传
+- **秒传**:接收端发现已有同名同大小文件时,双方比对 SHA-256,一致则免传直接完成
+- **并行分片**:大文件(协议 v2+)自动切分片走并行车道,分片哈希校验,提速且可独立重传
 - **完整性校验**:发送端边发边算 SHA-256,`file_done` 携带哈希;接收端校验通过才把 `.part` 改名为正式文件,并回 `file_result`
+- **自动重试**:网络类失败指数退避自动重试(最多 3 次),对端暂离线的排期等待其回来重发
 - **取消**:任意一方可随时取消(`file_cancel`),半成品自动清理
 - **掉线中止**:传输中对端掉线即判失败——发送侧中断发送循环(可重发),接收侧保留 `.part`(可续传);已发完但未收到校验结果的(小文件)在 30 秒窗口期内对端掉线同样改判失败,防止误判完成
 - **背压**:接收端每收 2MB 回执 `file_progress`,发送端未确认字节超过 8MB 即暂停等待,防止缓冲爆炸
@@ -68,15 +89,16 @@ flutter build apk --release
 点击传输记录或远程浏览打开文件:
 
 - **文本 / 图片 / 视频 / zip / Word(docx) / Excel(xlsx)** 走应用内预览
-  - 视频播放基于 media_kit(Windows / Android),支持播放/暂停、进度拖拽
+  - 视频播放基于 media_kit(Windows / Android),支持播放/暂停、进度拖拽;远程视频走流式预览(对端按需拉取字节区间,本地 HTTP 映射给播放器,不起整文件传输)
   - zip 可查看内容列表,支持解压单个文件或全部解压到下载目录(重名自动追加 `(1)` `(2)`…)
-  - docx/xlsx 为纯 Dart 解析(只读),旧版 .doc/.xls 不支持
+  - docx/xlsx 为纯 Dart 解析(只读,50MB 上限),旧版 .doc/.xls 不支持
 - 其他类型(音频 / 旧版文档等)调系统默认程序打开
 
 ## 数据位置
 
 - 聊天记录:本地 SQLite(`cloudsend_chat.db`)
-- 收到的文件:`Download/cloudSend/`
+- 收到的文件:`Download/cloudSend/`;收藏的文件副本:`Download/cloudSend/collection/`
+- 运行日志:应用文档目录 `logs/cloudsend.log`(单文件滚动,超 5MB 截断)
 - 设备 ID:首次启动生成,持久保存不变
 - 历史设备(名字/头像/平台/最后在线):SharedPreferences,清理缓存不影响
 
